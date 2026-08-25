@@ -10,6 +10,15 @@
 namespace cell
 {
     std::filesystem::path root = ".cell";
+    namespace box
+    {
+        bool exec(const std::string &cmd, std::string &output) {}
+        bool read(const std::string &path, std::string &output) {}
+        bool write(const std::string &path, const std::string &input) {}
+        bool exist(const std::string &path) {}
+        bool remove(const std::string &path) {}
+        bool mkdir(const std::string &dirpath) {}
+    } // namespace box
     namespace net
     {
         void CURL_proxy(CURL *__handle__, const char *proxy, bool ssl = false)
@@ -299,5 +308,28 @@ namespace cell
             void &remove(const std::string &session_id) {}
         };
     } // namespace chat
-
 } // namespace cell
+
+int main(int argc, char const *argv[])
+{
+    // args parse
+    for (size_t i = 0; i < argc; i++)
+    {
+        /* code */
+    }
+
+    // agent loop
+    try
+    {
+        while (true)
+        {
+            /* code */
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << e.what() << '\n';
+    }
+
+    return 0;
+}
