@@ -463,7 +463,7 @@ namespace cell
                 return false;
             curl_easy_reset(curl);
             curl_easy_setopt(curl, CURLOPT_URL, url);
-            curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
+            curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // local endpoints bypass the system proxy
             if (proxy && *proxy)
             {
                 curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
@@ -771,41 +771,26 @@ namespace cell
 
         namespace detail
         {
-            // set asynchronously by signal handlers (0 = none, else the signal number); polled by the main loop
-            inline std::atomic<int> interrupt_signal{0};
-            inline void interrupt_handler(int sig)
-            {
-                interrupt_signal.store(sig); // async-signal-safe: only set a flag, no IO
-            }
+            // state-persistence callback invoked by the signal handler before exit; set by main
+            inline std::function<void()> on_exit_signal;
         } // namespace detail
 
-        // true when the user asked to stop (Ctrl+C / Ctrl+Break / SIGINT / SIGTERM)
-        inline bool interrupted() { return detail::interrupt_signal.load() != 0; }
-        inline int interrupt_signal() { return detail::interrupt_signal.load(); }
-        // human-readable reason for a recorded interrupt signal
-        inline std::string interrupt_reason(int sig)
+        // signal handler registered via std::signal (example style): report the interrupt,
+        // persist state, then terminate
+        inline void signal_handler(int signum)
         {
-            switch (sig)
-            {
-                case SIGINT:
-                    return "SIGINT (Ctrl+C)";
-                case SIGTERM:
-                    return "SIGTERM";
-#ifdef _WIN32
-                case SIGBREAK:
-                    return "SIGBREAK (Ctrl+Break)";
-#endif
-                default:
-                    return std::format("signal {}", sig);
-            }
+            eprintln(color::red, "Interrupt signal ({}) received.", signum);
+            if (detail::on_exit_signal)
+                detail::on_exit_signal();
+            std::exit(signum);
         }
         inline void install_interrupt_handler()
         {
-            std::signal(SIGINT, detail::interrupt_handler);
+            std::signal(SIGINT, signal_handler);
 #ifdef _WIN32
-            std::signal(SIGBREAK, detail::interrupt_handler);
+            std::signal(SIGBREAK, signal_handler);
 #else
-            std::signal(SIGTERM, detail::interrupt_handler);
+            std::signal(SIGTERM, signal_handler);
 #endif
         }
     } // namespace sys
@@ -2971,41 +2956,23 @@ auto list_models = [&]()
     // agent loop
     try
     {
-        // service termination method: invoked when an interrupt is detected. It persists
-        // the session + config, reports the reason, then falls through to the normal
-        // exit path where the RAII guard releases the remaining resources.
-        bool shutting_down = false;
-        auto shutdown = [&]()
+        // the signal handler (sys::signal_handler) persists state through this callback
+        // before terminating the process (example style: cleanup, then exit)
+        cell::sys::detail::on_exit_signal = [&]()
         {
-            if (shutting_down)
-                return;
-            shutting_down = true;
-            cell::sys::println();
             s->unload();
             cfg.session_id = s->id();
             cell::config::save(cfg);
-            std::string reason = cell::sys::interrupt_reason(cell::sys::interrupt_signal());
-            log.info("core", std::format("程序中断退出 by {}", reason));
-            cell::sys::println("程序中断退出 by {}", reason);
         };
         bool running = true;
         while (running)
         {
-            if (cell::sys::interrupted())
-            {
-                shutdown();
-                break;
-            }
             std::string input;
             if (interactive)
             {
                 cell::sys::print("> ");
                 if (!std::getline(std::cin, input))
-                {
-                    if (cell::sys::interrupted())
-                        shutdown();
                     break;
-                }
             }
             else
             {
@@ -3013,11 +2980,6 @@ auto list_models = [&]()
                 pending.clear();
                 if (input.empty())
                     break;
-            }
-            if (cell::sys::interrupted())
-            {
-                shutdown();
-                break;
             }
             if (input.size() >= 3 && (unsigned char)input[0] == 0xEF && (unsigned char)input[1] == 0xBB && (unsigned char)input[2] == 0xBF)
                 input.erase(0, 3);
@@ -3365,8 +3327,6 @@ auto list_models = [&]()
                         if (_getwch() == 27)
                             u->cancelled = true;
 #endif
-                    if (cell::sys::interrupted())
-                        return 1; // abort the transfer so the main loop can save and exit
                     if (!u->got && cell::sys::detail::color_enabled)
                     {
                         long long ms = cell::sys::elapsed_ms(u->t0);
@@ -3435,17 +3395,6 @@ auto list_models = [&]()
                     }
                     ui.timer_line = false;
                     ui.tok_line = false;
-                }
-                if (cell::sys::interrupted())
-                {
-                    // keep whatever partial reply already streamed in before exiting
-                    if (reply_text_len(reply) > 0 || !tool_calls.empty())
-                        s->msg().push_back(reply);
-                    log.warn("llm", std::format("interrupted model={} round={} partial_chars={}", e->label(), rounds, reply_text_len(reply)));
-                    cell::sys::error("[interrupted]");
-                    shutdown();
-                    done = true;
-                    break;
                 }
                 if (ui.cancelled)
                 {
