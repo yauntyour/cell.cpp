@@ -2992,15 +2992,15 @@ int main(int argc, char const *argv[])
                 total_llm_requests++;
                 if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage, err))
                 {
-                    long long ms = cell::sys::elapsed_ms(t0);
+                    double sec = cell::sys::elapsed_ms(t0) / 1000.0;
                     cell::sys::println();
                     summary = reply_text(reply);
                     if (summary.empty())
                         summary = "(empty summary)";
                     auto in_tok = usage_in(usage);
                     auto out_tok = usage_out(usage);
-                    log.info("ctx", std::format("summary chars={} time={}ms tok_in={} tok_out={}",
-                                                summary.size(), ms,
+                    log.info("ctx", std::format("summary chars={} time={:.2f}s tok_in={} tok_out={}",
+                                                summary.size(), sec,
                                                 in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                                 out_tok.has_value() ? std::to_string(*out_tok) : "n/a"));
                     cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
@@ -3482,8 +3482,8 @@ int main(int argc, char const *argv[])
                 total_llm_requests++;
                 std::string err;
                 bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, err, xfer_cb, &ui);
-                long long total_ms = cell::sys::elapsed_ms(t0);
-                long long ttf_ms = !ui.got ? -1 : cell::sys::diff_ms(t0, ui.tok0);
+                double total_sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                double ttf_sec = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
                 if (ui.timer_line || ui.tok_line)
                 {
                     if (cell::sys::detail::color_enabled)
@@ -3507,7 +3507,7 @@ int main(int argc, char const *argv[])
                 }
                 if (!ok)
                 {
-                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={}ms err={}", e->label(), rounds, (long long)s->msg().size(), total_ms, err.empty() ? "n/a" : err));
+                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={}", e->label(), rounds, (long long)s->msg().size(), total_sec, err.empty() ? "n/a" : err));
                     cell::sys::println();
                     cell::sys::error("[llm error] {}", err.empty() ? "request failed" : err);
                     done = true;
@@ -3517,11 +3517,11 @@ int main(int argc, char const *argv[])
                 long long out_chars = reply_text_len(reply);
                 auto in_tok = usage_in(usage);
                 auto out_tok = usage_out(usage);
-                log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} time={}ms ttf={} tools={}",
+                log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} time={:.2f}s ttf={} tools={}",
                                             rounds, e->label(), (long long)s->msg().size(),
                                             in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                             out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
-                                            total_ms, ttf_ms < 0 ? "n/a" : std::format("{}ms", ttf_ms),
+                                            total_sec, ttf_sec < 0 ? "n/a" : std::format("{:.2f}s", ttf_sec),
                                             tool_calls.size()));
                 s->msg().push_back(reply);
                 if (!tool_calls.empty())
@@ -3561,9 +3561,9 @@ int main(int argc, char const *argv[])
                                 status = "denied";
                             }
                         }
-                        long long tool_ms = cell::sys::elapsed_ms(t_tool);
-                        log.info("tool", std::format("#{} {} policy={} status={} time={}ms out_chars={} args={}",
-                                                     tc_seq, name, policy, status, tool_ms,
+                        double tool_sec = cell::sys::elapsed_ms(t_tool) / 1000.0;
+                        log.info("tool", std::format("#{} {} policy={} status={} time={:.2f}s out_chars={} args={}",
+                                                     tc_seq, name, policy, status, tool_sec,
                                                      (long long)output.size(), trunc(args, 200)));
                         if (e->provider == "openai")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", output}});
@@ -3597,7 +3597,7 @@ int main(int argc, char const *argv[])
         return 1;
     }
 
-    log.info("exit", std::format("uptime={}ms llm_requests={} tool_calls={}",
-                                 cell::sys::elapsed_ms(t_start), total_llm_requests, total_tool_calls));
+    log.info("exit", std::format("uptime={:.2f}s llm_requests={} tool_calls={}",
+                                 cell::sys::elapsed_ms(t_start) / 1000.0, total_llm_requests, total_tool_calls));
     return 0;
 }
