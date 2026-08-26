@@ -381,6 +381,31 @@ namespace cell
             return n;
         }
 
+        // extract a human-readable message from an OpenAI-compatible error body
+        static std::string error_message(const std::string &body)
+        {
+            try
+            {
+                auto j = nlohmann::json::parse(body, nullptr, false);
+                if (!j.is_object())
+                    return "";
+                if (j.contains("error"))
+                {
+                    auto &e = j["error"];
+                    if (e.is_object() && e.contains("message") && e["message"].is_string())
+                        return e["message"].get<std::string>();
+                    if (e.is_string())
+                        return e.get<std::string>();
+                }
+                if (j.contains("message") && j["message"].is_string())
+                    return j["message"].get<std::string>();
+            }
+            catch (const std::exception &)
+            {
+            }
+            return "";
+        }
+
         bool CURL_get(CURL *__handle__, const char *URL, std::string &buf, std::string header = "")
         {
             if (!__handle__)
@@ -437,7 +462,7 @@ namespace cell
             return true;
         }
 
-        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, std::string header = "")
+        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, std::string header = "", std::string *err = nullptr)
         {
             if (!__handle__)
                 return false;
@@ -459,17 +484,30 @@ namespace cell
             curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
 
             CURLcode res = curl_easy_perform(__handle__);
+            long code = 0;
+            curl_easy_getinfo(__handle__, CURLINFO_RESPONSE_CODE, &code);
             if (headers)
                 curl_slist_free_all(headers);
             if (res != CURLE_OK)
             {
-                std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
+                if (err)
+                    *err = curl_easy_strerror(res);
+                return false;
+            }
+            if (code >= 400)
+            {
+                if (err)
+                {
+                    *err = error_message(buf);
+                    if (err->empty())
+                        *err = std::format("HTTP error {}", code);
+                }
                 return false;
             }
             return true;
         }
 
-        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, const std::vector<std::string> &header_list)
+        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, const std::vector<std::string> &header_list, std::string *err = nullptr)
         {
             if (!__handle__)
                 return false;
@@ -491,11 +529,24 @@ namespace cell
             curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
 
             CURLcode res = curl_easy_perform(__handle__);
+            long code = 0;
+            curl_easy_getinfo(__handle__, CURLINFO_RESPONSE_CODE, &code);
             if (headers)
                 curl_slist_free_all(headers);
             if (res != CURLE_OK)
             {
-                std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
+                if (err)
+                    *err = curl_easy_strerror(res);
+                return false;
+            }
+            if (code >= 400)
+            {
+                if (err)
+                {
+                    *err = error_message(buf);
+                    if (err->empty())
+                        *err = std::format("HTTP error {}", code);
+                }
                 return false;
             }
             return true;
@@ -521,7 +572,7 @@ namespace cell
             return n;
         }
 
-        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::string &header, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::string &header, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr)
         {
             if (!curl || !url)
                 return false;
@@ -554,11 +605,15 @@ namespace cell
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
 
             CURLcode res = curl_easy_perform(curl);
+            long code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            if (http_code)
+                *http_code = code;
             curl_slist_free_all(header_list);
             return (res == CURLE_OK);
         }
 
-        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::vector<std::string> &header_list_in, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::vector<std::string> &header_list_in, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr)
         {
             if (!curl || !url)
                 return false;
@@ -592,6 +647,10 @@ namespace cell
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
             CURLcode res = curl_easy_perform(curl);
+            long code = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            if (http_code)
+                *http_code = code;
             curl_slist_free_all(headers);
             return (res == CURLE_OK);
         }
@@ -1113,99 +1172,184 @@ namespace cell
             friend class crypt;
         };
 
+        // vault: AES-256-GCM (authenticated encryption) + Argon2id (key derivation).
+        // key material: CELL_VAULT_PASSPHRASE env var if set, otherwise the .key master file
+        // (32 random bytes, auto-generated). Argon2id derives the AEAD key from that material
+        // plus a random salt persisted in the vault; the derived key is cached in memory.
         class crypt
         {
         private:
-            // crypt_map[key] = apikey_encrypted
-            std::unordered_map<std::string, std::string> crypt_map;
+            // map_key -> {"nonce": b64, "ct": b64(ciphertext||tag)}
+            std::unordered_map<std::string, nlohmann::json> vault;
             std::filesystem::path key_file = root / ".key";
 
-            bool load_key(unsigned char key[crypto_secretbox_KEYBYTES])
+            std::string salt; // raw crypto_pwhash_SALTBYTES bytes
+            bool has_salt = false;
+            unsigned char aead_key[crypto_aead_aes256gcm_KEYBYTES] = {};
+            bool key_ready = false;
+            int aead = 0; // 0=unset, 1=aes256gcm, 2=xchacha20poly1305_ietf (fallback)
+
+            // load (or generate) the master secret that feeds Argon2id
+            bool load_master(std::string &master)
             {
+                if (const char *p = std::getenv("CELL_VAULT_PASSPHRASE"); p && *p)
+                {
+                    master = p;
+                    return true;
+                }
                 std::ifstream f(key_file);
                 if (f.is_open())
                 {
                     std::string raw = b64_decode(std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()));
-                    if (raw.size() == crypto_secretbox_KEYBYTES)
+                    if (raw.size() == crypto_aead_aes256gcm_KEYBYTES)
                     {
-                        std::memcpy(key, raw.data(), crypto_secretbox_KEYBYTES);
-                        sodium_memzero(raw.data(), raw.size());
+                        master = std::move(raw);
                         return true;
                     }
                 }
-                randombytes_buf(key, crypto_secretbox_KEYBYTES);
+                unsigned char k[crypto_aead_aes256gcm_KEYBYTES];
+                randombytes_buf(k, sizeof k);
+                master.assign((char *)k, sizeof k);
+                sodium_memzero(k, sizeof k);
                 std::error_code ec;
                 std::filesystem::create_directories(root, ec);
                 std::ofstream out(key_file, std::ios::trunc);
                 if (!out.is_open())
+                {
+                    sodium_memzero(master.data(), master.size());
+                    master.clear();
                     return false;
-                out << b64_encode(std::string((char *)key, crypto_secretbox_KEYBYTES));
+                }
+                out << b64_encode(master);
+                return out.good();
+            }
+
+            // Argon2id: derive the 32-byte AEAD key from master + salt (memoized)
+            bool derive_key()
+            {
+                if (key_ready)
+                    return true;
+                std::string master;
+                if (!load_master(master))
+                    return false;
+                if (!has_salt)
+                {
+                    salt.resize(crypto_pwhash_SALTBYTES);
+                    randombytes_buf(salt.data(), salt.size());
+                    has_salt = true;
+                }
+                unsigned char key[crypto_aead_aes256gcm_KEYBYTES];
+                int rc = crypto_pwhash(key, sizeof key,
+                                       master.data(), master.size(),
+                                       (const unsigned char *)salt.data(),
+                                       crypto_pwhash_OPSLIMIT_MODERATE,
+                                       crypto_pwhash_MEMLIMIT_MODERATE,
+                                       crypto_pwhash_ALG_ARGON2ID13);
+                sodium_memzero(master.data(), master.size());
+                master.clear();
+                if (rc != 0)
+                    return false;
+                std::memcpy(aead_key, key, sizeof aead_key);
+                sodium_memzero(key, sizeof key);
+                key_ready = true;
                 return true;
             }
 
-            bool save()
+            void ensure_aead()
             {
-                std::error_code ec;
-                std::filesystem::create_directories(root, ec);
-                nlohmann::json j = nlohmann::json::object();
-                for (auto &[k, v] : crypt_map)
-                    j[k] = v;
-                std::ofstream f(credentials(), std::ios::trunc);
-                if (!f.is_open())
-                    return false;
-                f << j.dump(2);
-                return f.good();
+                if (aead)
+                    return;
+                aead = crypto_aead_aes256gcm_is_available() ? 1 : 2;
             }
 
-            std::string encrypt(const char *data, size_t len)
+            size_t npub_bytes() const
             {
-                unsigned char key[crypto_secretbox_KEYBYTES];
-                if (!load_key(key))
-                    return "";
-                unsigned char nonce[crypto_secretbox_NONCEBYTES];
-                randombytes_buf(nonce, sizeof nonce);
-                std::string cipher;
-                cipher.resize(len + crypto_secretbox_MACBYTES);
-                if (crypto_secretbox_easy((unsigned char *)cipher.data(), (const unsigned char *)data, len, nonce, key) != 0)
-                {
-                    sodium_memzero(key, sizeof key);
-                    return "";
-                }
-                sodium_memzero(key, sizeof key);
-                std::string out((char *)nonce, sizeof nonce);
-                out += cipher;
-                return b64_encode(out);
+                return aead == 1 ? crypto_aead_aes256gcm_NPUBBYTES : crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
             }
-            secure_string decrypt(const std::string &map_value)
+            size_t abytes() const
             {
-                unsigned char key[crypto_secretbox_KEYBYTES];
-                if (!load_key(key))
+                return aead == 1 ? crypto_aead_aes256gcm_ABYTES : crypto_aead_xchacha20poly1305_ietf_ABYTES;
+            }
+
+            nlohmann::json encrypt(const char *data, size_t len)
+            {
+                nlohmann::json empty;
+                if (!derive_key())
+                    return empty;
+                ensure_aead();
+                std::vector<unsigned char> nonce(npub_bytes());
+                randombytes_buf(nonce.data(), nonce.size());
+                std::vector<unsigned char> ct(len + abytes());
+                unsigned long long ctlen = 0;
+                int rc;
+                if (aead == 1)
+                    rc = crypto_aead_aes256gcm_encrypt(ct.data(), &ctlen, (const unsigned char *)data, len, nullptr, 0, nullptr, nonce.data(), aead_key);
+                else
+                    rc = crypto_aead_xchacha20poly1305_ietf_encrypt(ct.data(), &ctlen, (const unsigned char *)data, len, nullptr, 0, nullptr, nonce.data(), aead_key);
+                if (rc != 0)
+                    return empty;
+                nlohmann::json e;
+                e["nonce"] = b64_encode(std::string((char *)nonce.data(), nonce.size()));
+                e["ct"] = b64_encode(std::string((char *)ct.data(), (size_t)ctlen));
+                return e;
+            }
+
+            secure_string decrypt(const nlohmann::json &e)
+            {
+                if (!derive_key())
                     return secure_string();
-                std::string raw = b64_decode(map_value);
-                if (raw.size() <= crypto_secretbox_NONCEBYTES + crypto_secretbox_MACBYTES)
-                {
-                    sodium_memzero(key, sizeof key);
+                ensure_aead();
+                if (!e.is_object() || !e.contains("nonce") || !e.contains("ct"))
                     return secure_string();
-                }
-                const unsigned char *nonce = (const unsigned char *)raw.data();
-                size_t clen = raw.size() - crypto_secretbox_NONCEBYTES;
-                size_t plen = clen - crypto_secretbox_MACBYTES;
+                std::string nonce = b64_decode(e.value("nonce", ""));
+                std::string ct = b64_decode(e.value("ct", ""));
+                if (nonce.size() != npub_bytes() || ct.size() < abytes())
+                    return secure_string();
+                size_t plen = ct.size() - abytes();
                 unsigned char *plain = (unsigned char *)sodium_malloc(plen ? plen : 1);
                 if (!plain)
-                {
-                    sodium_memzero(key, sizeof key);
                     return secure_string();
-                }
-                int rc = crypto_secretbox_open_easy(plain, (const unsigned char *)raw.data() + crypto_secretbox_NONCEBYTES, clen, nonce, key);
-                sodium_memzero(key, sizeof key);
+                unsigned long long mlen = 0;
+                int rc;
+                if (aead == 1)
+                    rc = crypto_aead_aes256gcm_decrypt(plain, &mlen, nullptr, (const unsigned char *)ct.data(), ct.size(), nullptr, 0, (const unsigned char *)nonce.data(), aead_key);
+                else
+                    rc = crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &mlen, nullptr, (const unsigned char *)ct.data(), ct.size(), nullptr, 0, (const unsigned char *)nonce.data(), aead_key);
                 if (rc != 0)
                 {
                     sodium_free(plain);
                     return secure_string();
                 }
                 secure_string out;
-                out.adopt((char *)plain, plen);
+                out.adopt((char *)plain, (size_t)mlen);
                 return out;
+            }
+
+            bool save()
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(root, ec);
+                if (!has_salt)
+                {
+                    salt.resize(crypto_pwhash_SALTBYTES);
+                    randombytes_buf(salt.data(), salt.size());
+                    has_salt = true;
+                }
+                ensure_aead();
+                nlohmann::json j;
+                j["version"] = 2;
+                j["kdf"] = "argon2id";
+                j["aead"] = (aead == 1) ? "aes256gcm" : "xchacha20poly1305";
+                j["salt"] = b64_encode(salt);
+                nlohmann::json secrets = nlohmann::json::object();
+                for (auto &[k, v] : vault)
+                    secrets[k] = v;
+                j["secrets"] = secrets;
+                std::ofstream f(credentials(), std::ios::trunc);
+                if (!f.is_open())
+                    return false;
+                f << j.dump(2);
+                return f.good();
             }
 
         public:
@@ -1219,64 +1363,68 @@ namespace cell
                     auto j = nlohmann::json::parse(f, nullptr, false);
                     if (!j.is_object())
                         return;
-                    for (auto &[k, v] : j.items())
-                        crypt_map[k] = v.get<std::string>();
+                    aead = 0;
+                    if (j.contains("aead") && j["aead"].is_string())
+                    {
+                        std::string name = j["aead"].get<std::string>();
+                        if (name == "aes256gcm")
+                            aead = 1;
+                        else if (name == "xchacha20poly1305")
+                            aead = 2;
+                    }
+                    if (j.contains("salt") && j["salt"].is_string())
+                    {
+                        salt = b64_decode(j["salt"].get<std::string>());
+                        has_salt = !salt.empty();
+                    }
+                    if (j.contains("secrets") && j["secrets"].is_object())
+                        for (auto &[k, v] : j["secrets"].items())
+                            vault[k] = v;
                 }
                 catch (const std::exception &)
                 {
                 }
             }
-            ~crypt() {}
+            ~crypt() { sodium_memzero(aead_key, sizeof aead_key); }
             secure_string get(const std::string &map_key)
             {
-                if (crypt_map.find(map_key) != crypt_map.end())
-                {
-                    return decrypt(crypt_map[map_key]);
-                }
+                auto it = vault.find(map_key);
+                if (it != vault.end())
+                    return decrypt(it->second);
                 return secure_string();
             }
             bool add(const std::string &map_key, const std::string &raw_value)
             {
-                if (crypt_map.find(map_key) != crypt_map.end())
-                {
+                if (vault.find(map_key) != vault.end())
                     return false;
-                }
-                std::string enc = encrypt(raw_value.data(), raw_value.size());
-                if (enc.empty())
+                nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
+                if (!e.is_object())
                     return false;
-                crypt_map[map_key] = enc;
+                vault[map_key] = e;
                 return save();
             }
             bool add(const std::string &map_key, const secure_string &raw_value)
             {
-                if (crypt_map.find(map_key) != crypt_map.end())
-                {
-                    return false;
-                }
-                std::string enc = encrypt(raw_value.data(), raw_value.size());
-                if (enc.empty())
-                    return false;
-                crypt_map[map_key] = enc;
-                return save();
+                return add(map_key, raw_value.str());
             }
             size_t remove(const std::string &map_key)
             {
-                size_t n = crypt_map.erase(map_key);
+                size_t n = vault.erase(map_key);
                 if (n)
                     save();
                 return n;
             }
             bool has(const std::string &map_key) const
             {
-                return crypt_map.find(map_key) != crypt_map.end();
+                return vault.find(map_key) != vault.end();
             }
             // add or overwrite an existing entry
             bool set(const std::string &map_key, const std::string &raw_value)
             {
-                std::string enc = encrypt(raw_value.data(), raw_value.size());
-                if (enc.empty())
+                nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
+                if (!e.is_object())
                     return false;
-                crypt_map[map_key] = enc;
+                vault[map_key] = e;
                 return save();
             }
             bool set(const std::string &map_key, const secure_string &raw_value)
@@ -1506,14 +1654,14 @@ namespace cell
             OpenAI(const std::string &api_base) : api_base(api_base) {}
             ~OpenAI() { curl_easy_cleanup(curl); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs);
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -1532,12 +1680,12 @@ namespace cell
                 }
                 catch (const std::exception &e)
                 {
-                    std::cerr << "openai parse error: " << e.what() << std::endl;
+                    err = std::format("response parse error: {}", e.what());
                     return false;
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
@@ -1594,9 +1742,19 @@ namespace cell
                         sse_buf.erase(0, consumed);
                 };
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data);
+                long http = 0;
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
+                if (ok && http >= 400)
+                {
+                    ok = false;
+                    err = net::error_message(sse_buf);
+                    if (err.empty())
+                        err = std::format("HTTP error {}", http);
+                }
+                if (!ok && err.empty())
+                    err = "stream request failed";
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 if (text.empty())
@@ -1647,14 +1805,14 @@ namespace cell
             Anthropic(const std::string &api_base) : api_base(api_base) {}
             ~Anthropic() { curl_easy_cleanup(curl); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs);
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -1681,13 +1839,14 @@ namespace cell
                     }
                     return true;
                 }
-                catch (const std::exception &)
+                catch (const std::exception &e)
                 {
+                    err = std::format("response parse error: {}", e.what());
                     return false;
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
@@ -1745,9 +1904,19 @@ namespace cell
                         sse_buf.erase(0, consumed);
                 };
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data);
+                long http = 0;
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
+                if (ok && http >= 400)
+                {
+                    ok = false;
+                    err = net::error_message(sse_buf);
+                    if (err.empty())
+                        err = std::format("HTTP error {}", http);
+                }
+                if (!ok && err.empty())
+                    err = "stream request failed";
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 reply["content"] = blocks.empty() ? nlohmann::json::array() : nlohmann::json(blocks);
@@ -2072,6 +2241,7 @@ namespace cell
         static void add(const std::string &session_id, const std::string &model,
                         long long input_chars, long long output_chars,
                         std::optional<long long> input_tokens, std::optional<long long> output_tokens,
+                        std::optional<long long> total_tokens,
                         long long messages = 0)
         {
             nlohmann::json j = load();
@@ -2085,6 +2255,8 @@ namespace cell
                     rec["input_tokens"] = rec.value("input_tokens", 0LL) + *input_tokens;
                 if (output_tokens)
                     rec["output_tokens"] = rec.value("output_tokens", 0LL) + *output_tokens;
+                if (total_tokens)
+                    rec["total_tokens"] = rec.value("total_tokens", 0LL) + *total_tokens;
             };
             auto &sess = j["sessions"][session_id];
             if (!sess.is_object())
@@ -2099,10 +2271,11 @@ namespace cell
         }
         static std::string fmt(const nlohmann::json &rec)
         {
-            return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={}",
+            return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={} total_tok={}",
                                rec.value("requests", 0LL), rec.value("messages", 0LL),
                                rec.value("input_chars", 0LL), rec.value("output_chars", 0LL),
-                               rec.value("input_tokens", 0LL), rec.value("output_tokens", 0LL));
+                               rec.value("input_tokens", 0LL), rec.value("output_tokens", 0LL),
+                               rec.value("total_tokens", 0LL));
         }
         static std::string summarize()
         {
@@ -2395,6 +2568,10 @@ static int run_selftest()
     std::string vault_file;
     expect(cell::box::read((cell::root / ".crypt").string(), vault_file), "read vault file");
     expect(vault_file.find("keep-me") == std::string::npos, "vault stores ciphertext only");
+    expect(vault_file.find("\"version\": 2") != std::string::npos, "vault uses v2 format");
+    expect(vault_file.find("argon2id") != std::string::npos, "vault uses argon2id kdf");
+    expect(vault_file.find("aes256gcm") != std::string::npos || vault_file.find("xchacha20poly1305") != std::string::npos, "vault records aead mode");
+    expect(vault_file.find("\"nonce\"") != std::string::npos && vault_file.find("\"ct\"") != std::string::npos, "vault entries carry nonce + ct");
 
     cell::config::settings cfg;
     cell::config::model_entry a;
@@ -2442,14 +2619,16 @@ static int run_selftest()
     std::string meta = cell::skills::metadata_prompt(skills);
     expect(meta.find("build-helper") != std::string::npos, "skill metadata prompt");
 
-    cell::stats::add("sess-A", "openai:gpt-4o", 100, 50, 10, 5, 2);
-    cell::stats::add("sess-A", "openai:gpt-4o", 50, 20, std::nullopt, std::nullopt, 1);
-    cell::stats::add("sess-B", "anthropic:claude-x", 30, 10, 3, 1, 1);
+    cell::stats::add("sess-A", "openai:gpt-4o", 100, 50, 10, 5, 15, 2);
+    cell::stats::add("sess-A", "openai:gpt-4o", 50, 20, std::nullopt, std::nullopt, std::nullopt, 1);
+    cell::stats::add("sess-B", "anthropic:claude-x", 30, 10, 3, 1, 4, 1);
     auto stats_json = cell::stats::load();
     expect(stats_json["models"]["openai:gpt-4o"].value("requests", 0LL) == 2, "stats per-model requests");
     expect(stats_json["models"]["openai:gpt-4o"].value("input_chars", 0LL) == 150, "stats per-model input_chars");
     expect(stats_json["sessions"]["sess-A"].value("messages", 0LL) == 3, "stats per-session messages");
     expect(stats_json["models"]["anthropic:claude-x"].value("input_tokens", 0LL) == 3, "stats tokens");
+    expect(stats_json["models"]["openai:gpt-4o"].value("total_tokens", 0LL) == 15, "stats total_tokens recorded");
+    expect(stats_json["sessions"]["sess-A"].value("total_tokens", 0LL) == 15, "stats session total_tokens recorded");
     expect(cell::stats::summarize().find("openai:gpt-4o") != std::string::npos, "stats summarize");
 
     cell::sys::logger::instance().close();
@@ -2617,7 +2796,7 @@ int main(int argc, char const *argv[])
     // unified request dispatch: picks the right client + tool schema for any model entry
     auto do_chat = [&](const cell::config::model_entry &e, const cell::encrypt::secure_string &key,
                        const nlohmann::json &msgs, bool stream, cell::net::StreamCallback on_tok,
-                       nlohmann::json &reply, nlohmann::json &tc, nlohmann::json &usage,
+                       nlohmann::json &reply, nlohmann::json &tc, nlohmann::json &usage, std::string &err,
                        cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
         bool ap = e.provider == "anthropic";
@@ -2625,12 +2804,12 @@ int main(int argc, char const *argv[])
         if (ap)
         {
             if (stream)
-                return cache.a(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, on_xfer, xfer_data);
-            return cache.a(e.base).chat(key, e.model, msgs, tools, reply, tc, usage);
+                return cache.a(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
+            return cache.a(e.base).chat(key, e.model, msgs, tools, reply, tc, usage, err);
         }
         if (stream)
-            return cache.o(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, on_xfer, xfer_data);
-        return cache.o(e.base).chat(key, e.model, msgs, tools, reply, tc, usage);
+            return cache.o(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
+        return cache.o(e.base).chat(key, e.model, msgs, tools, reply, tc, usage, err);
     };
 
     auto on_token = [](std::span<const char> data)
@@ -2698,6 +2877,18 @@ int main(int argc, char const *argv[])
                 return u["completion_tokens"].get<long long>();
             if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
                 return u["output_tokens"].get<long long>();
+        }
+        return std::nullopt;
+    };
+    auto usage_total = [&](const nlohmann::json &u) -> std::optional<long long>
+    {
+        if (u.is_object())
+        {
+            if (u.contains("total_tokens") && u["total_tokens"].is_number_integer())
+                return u["total_tokens"].get<long long>();
+            auto in = usage_in(u), out = usage_out(u);
+            if (in && out)
+                return *in + *out;
         }
         return std::nullopt;
     };
@@ -2806,11 +2997,12 @@ int main(int argc, char const *argv[])
                 prompt.push_back({{"role", "user"},
                                   {"content", std::format("Summarize the following removed part of a coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
                 nlohmann::json reply, tc, usage;
+                std::string err;
                 log.info("ctx", std::format("compacting removed_msgs={} via={} head_keep=2 tail_keep=6", middle.size(), e->label()));
                 cell::sys::print("summary> ");
                 auto t0 = cell::sys::detail::clock::now();
                 total_llm_requests++;
-                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage))
+                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage, err))
                 {
                     long long ms = cell::sys::elapsed_ms(t0);
                     cell::sys::println();
@@ -2823,12 +3015,12 @@ int main(int argc, char const *argv[])
                                                 summary.size(), ms,
                                                 in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                                 out_tok.has_value() ? std::to_string(*out_tok) : "n/a"));
-                    cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), 0);
+                    cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
                 }
                 else
                 {
                     cell::sys::println();
-                    log.warn("ctx", "summarization_failed fallback=truncation");
+                    log.warn("ctx", std::format("summarization_failed fallback=truncation err={}", err.empty() ? "n/a" : err));
                 }
             }
         }
@@ -3284,7 +3476,8 @@ int main(int argc, char const *argv[])
                     std::fflush(stdout);
                 };
                 total_llm_requests++;
-                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, xfer_cb, &ui);
+                std::string err;
+                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, err, xfer_cb, &ui);
                 long long total_ms = cell::sys::elapsed_ms(t0);
                 long long ttf_ms = !ui.got ? -1 : cell::sys::diff_ms(t0, ui.tok0);
                 if (ui.timer_line || ui.tok_line)
@@ -3310,9 +3503,9 @@ int main(int argc, char const *argv[])
                 }
                 if (!ok)
                 {
-                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={}ms", e->label(), rounds, (long long)s->msg().size(), total_ms));
+                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={}ms err={}", e->label(), rounds, (long long)s->msg().size(), total_ms, err.empty() ? "n/a" : err));
                     cell::sys::println();
-                    cell::sys::error("[llm request failed]");
+                    cell::sys::error("[llm error] {}", err.empty() ? "request failed" : err);
                     done = true;
                     break;
                 }
@@ -3373,11 +3566,11 @@ int main(int argc, char const *argv[])
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", output}}})}});
                     }
-                    cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), (long long)(s->msg().size() - before));
+                    cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
                     continue;
                 }
                 done = true;
-                cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), (long long)(s->msg().size() - before));
+                cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
             }
             s->unload();
             log.debug("sess", std::format("persisted id={} msgs={}", s->id(), s->msg().size()));
