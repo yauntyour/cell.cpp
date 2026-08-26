@@ -21,12 +21,12 @@
 #include <format>
 #include <optional>
 #include <concepts>
-#include <atomic>
 #include <csignal>
 #include <generator>
 #include <expected>
 #include <source_location>
 #include <exception>
+#include <typeinfo>
 #include <new>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -38,14 +38,115 @@
 #else
 #include <unistd.h>
 #include <termios.h>
-#include <sys/select.h>
-#endif
-#ifdef __GNUG__
-#include <cxxabi.h>
 #endif
 
 namespace cell
 {
+    // platform layer: the only place in this file that knows about OS-specific
+    // APIs. everything else in the code base calls these portable shims and is
+    // free of #ifdef.
+    namespace plat
+    {
+        // subprocess pipe: read the command's stdout stream
+        inline FILE *pipe_open(const char *cmd)
+        {
+#ifdef _WIN32
+            return _popen(cmd, "r");
+#else
+            return popen(cmd, "r");
+#endif
+        }
+        inline int pipe_close(FILE *p)
+        {
+#ifdef _WIN32
+            return _pclose(p);
+#else
+            return pclose(p);
+#endif
+        }
+
+        // is this stream attached to a terminal?
+        inline bool is_tty(FILE *f)
+        {
+#ifdef _WIN32
+            return _isatty(_fileno(f)) != 0;
+#else
+            return ::isatty(fileno(f)) != 0;
+#endif
+        }
+
+        // human-readable exception type name: plain type_info::name() is the one
+        // API that works on every compiler without extra machinery
+        inline const char *exception_name(const std::type_info &ti) { return ti.name(); }
+
+#ifndef _WIN32
+        inline struct termios original_termios{};
+        inline bool termios_saved = false;
+#endif
+
+        // enable ANSI color output (and UTF-8 codepage on Windows); on POSIX also
+        // remembers the terminal state for raw key peeking. returns whether
+        // colors are usable on the console.
+        inline bool init_console(bool force)
+        {
+#ifdef _WIN32
+            SetConsoleOutputCP(CP_UTF8);
+            HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD mode = 0;
+            if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+            {
+                SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                return force;
+            }
+            return false;
+#else
+            if (::isatty(fileno(stdin)))
+            {
+                tcgetattr(fileno(stdin), &original_termios);
+                termios_saved = true;
+            }
+            return force && ::isatty(fileno(stdout)) != 0;
+#endif
+        }
+        inline void restore_console()
+        {
+#ifndef _WIN32
+            if (termios_saved)
+                tcsetattr(fileno(stdin), TCSANOW, &original_termios);
+#endif
+        }
+
+        // non-blocking key peek: drains pending input and returns 27 (Esc) if an
+        // Esc key is among it, otherwise 0. used to let the user cancel a
+        // streaming reply. POSIX side temporarily switches stdin to raw mode.
+        inline int peek_key()
+        {
+#ifdef _WIN32
+            while (_kbhit())
+                if (_getwch() == 27)
+                    return 27;
+            return 0;
+#else
+            if (!termios_saved || ::isatty(fileno(stdin)) == 0)
+                return 0;
+            struct termios raw{};
+            tcgetattr(fileno(stdin), &raw);
+            struct termios raw_noecho = raw;
+            raw_noecho.c_lflag &= ~(ICANON | ECHO);
+            raw_noecho.c_cc[VMIN] = 0;
+            raw_noecho.c_cc[VTIME] = 0;
+            tcsetattr(fileno(stdin), TCSANOW, &raw_noecho);
+            int key = 0;
+            char ch{};
+            while (read(fileno(stdin), &ch, 1) == 1)
+                if ((unsigned char)ch == 27)
+                    key = 27;
+            tcsetattr(fileno(stdin), TCSANOW, &raw);
+            return key;
+#endif
+        }
+    } // namespace plat
+
     std::filesystem::path root = ".cell";
     namespace text
     {
@@ -186,21 +287,13 @@ namespace cell
             if (!check(cmd))
                 return false;
             std::string cmd_s(cmd);
-#ifdef _WIN32
-            FILE *pipe = _popen(cmd_s.c_str(), "r");
-#else
-            FILE *pipe = popen(cmd_s.c_str(), "r");
-#endif
+            FILE *pipe = plat::pipe_open(cmd_s.c_str());
             if (!pipe)
                 return false;
             char buf[4096];
             while (fgets(buf, sizeof(buf), pipe))
                 output += buf;
-#ifdef _WIN32
-            int rc = _pclose(pipe);
-#else
-            int rc = pclose(pipe);
-#endif
+            int rc = plat::pipe_close(pipe);
             return rc == 0;
         }
         bool read(std::string_view path, std::string &output)
@@ -554,40 +647,11 @@ namespace cell
             inline bool color_enabled = false;
             inline bool verbose_enabled = false;
             using clock = std::chrono::steady_clock;
-#ifndef _WIN32
-            inline struct termios original_termios{};
-            inline bool termios_saved = false;
-#endif
 
             void init_console()
             {
-#ifdef _WIN32
-                SetConsoleOutputCP(CP_UTF8);
-                HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-                DWORD mode = 0;
-                if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
-                {
-                    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-                    color_enabled = color_force;
-                }
-                else
-                    color_enabled = false;
-#else
-                color_enabled = color_force && ::isatty(fileno(stdout)) != 0;
-                if (::isatty(fileno(stdin)))
-                {
-                    tcgetattr(fileno(stdin), &original_termios);
-                    termios_saved = true;
-                }
-#endif
+                color_enabled = plat::init_console(color_force);
             }
-#ifndef _WIN32
-            inline void restore_terminal()
-            {
-                if (termios_saved)
-                    tcsetattr(fileno(stdin), TCSANOW, &original_termios);
-            }
-#endif
         } // namespace detail
 
         enum class color : int
@@ -669,11 +733,8 @@ namespace cell
             {
                 std::time_t t = std::time(nullptr);
                 std::tm tm{};
-#ifdef _WIN32
-                localtime_s(&tm, &t);
-#else
-                localtime_r(&t, &tm);
-#endif
+                if (std::tm *g = std::gmtime(&t); g)
+                    tm = *g;
                 char stamp[32];
                 std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
                 std::string line = std::format("[{}] {:<5} [{:<5}] {}", stamp, level, cat, msg);
@@ -736,18 +797,20 @@ namespace cell
 
         inline void install_handlers()
         {
-            std::set_terminate([]
-                               {
+            std::set_terminate([]{
                 std::string type = "unknown";
-#ifdef __GNUG__
-                if (void *ex = __cxxabiv1::__cxa_current_exception_type(); ex)
+                try
                 {
-                    int status = 0;
-                    char *demangled = abi::__cxa_demangle(((const std::type_info *)ex)->name(), nullptr, nullptr, &status);
-                    type = demangled ? demangled : ((const std::type_info *)ex)->name();
-                    std::free(demangled);
+                    throw;
                 }
-#endif
+                catch (const std::exception &e)
+                {
+                    type = plat::exception_name(typeid(e));
+                }
+                catch (...)
+                {
+                    type = plat::exception_name(typeid(std::exception));
+                }
                 logger::instance().error("core", std::format("uncaught exception of type {}: terminate called", type));
                 std::fflush(stderr);
                 std::abort(); });
@@ -805,9 +868,7 @@ namespace cell
         {
             if (detail::on_exit_signal)
                 detail::on_exit_signal();
-#ifndef _WIN32
-            detail::restore_terminal();
-#endif
+            plat::restore_console();
             std::exit(signum);
         }
         inline void install_interrupt_handler()
@@ -2966,12 +3027,7 @@ int main(int argc, char const *argv[])
         return std::format("context compacted: removed {} message(s), {} remain", removed, new_msgs.size());
     };
 
-    bool interactive = true;
-#ifdef _WIN32
-    interactive = _isatty(_fileno(stdin)) != 0;
-#else
-    interactive = ::isatty(fileno(stdin)) != 0;
-#endif
+    bool interactive = cell::plat::is_tty(stdin);
     std::string pending;
     if (!interactive)
     {
@@ -3349,27 +3405,8 @@ int main(int argc, char const *argv[])
                 auto xfer_cb = +[](void *p, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
                 {
                     auto *u = (StreamUI *)p;
-#ifdef _WIN32
-                    while (_kbhit())
-                        if (_getwch() == 27)
-                            u->cancelled = true;
-#else
-                    if (cell::sys::detail::termios_saved && ::isatty(fileno(stdin)))
-                    {
-                        struct termios raw{};
-                        tcgetattr(fileno(stdin), &raw);
-                        struct termios raw_noecho = raw;
-                        raw_noecho.c_lflag &= ~(ICANON | ECHO);
-                        raw_noecho.c_cc[VMIN] = 0;
-                        raw_noecho.c_cc[VTIME] = 0;
-                        tcsetattr(fileno(stdin), TCSANOW, &raw_noecho);
-                        char ch{};
-                        while (read(fileno(stdin), &ch, 1) == 1)
-                            if (ch == 27)
-                                u->cancelled = true;
-                        tcsetattr(fileno(stdin), TCSANOW, &raw);
-                    }
-#endif
+                    if (cell::plat::peek_key() == 27)
+                        u->cancelled = true;
                     if (!u->got && cell::sys::detail::color_enabled)
                     {
                         long long ms = cell::sys::elapsed_ms(u->t0);
