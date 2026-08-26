@@ -864,8 +864,27 @@ namespace cell
         // std::exit() triggers atexit handlers and static destructors (logger close,
         // vault key zeroing). All five signals are synchronous and the process state
         // is well-defined at the point of delivery, so std::exit() is safe for all of them.
+        inline const char *signal_name(int signum)
+        {
+            switch (signum)
+            {
+            case SIGINT:
+                return "SIGINT";
+            case SIGABRT:
+                return "SIGABRT";
+            case SIGFPE:
+                return "SIGFPE";
+            case SIGILL:
+                return "SIGILL";
+            case SIGSEGV:
+                return "SIGSEGV";
+            default:
+                return "unknown";
+            }
+        }
         inline void signal_handler(int signum)
         {
+            logger::instance().error("core", std::format("Interruption caused by {} ({})", signal_name(signum), signum));
             if (detail::on_exit_signal)
                 detail::on_exit_signal();
             plat::restore_console();
