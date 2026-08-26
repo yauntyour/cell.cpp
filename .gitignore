@@ -1,2 +1,4 @@
 etc
 .vscode
+*.exe
+*cell
