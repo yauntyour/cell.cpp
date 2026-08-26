@@ -6,12 +6,16 @@
 #include <unordered_map>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <sodium.h>
 
 namespace cell
 {
     std::filesystem::path root = ".cell";
     namespace box
     {
+        // check the tool call is allowed and the call is safe
+        bool check(const std::string &call) {}
+        bool grep(const std::string &path, const std::string &pattern, std::string &output) {}
         bool exec(const std::string &cmd, std::string &output) {}
         bool read(const std::string &path, std::string &output) {}
         bool write(const std::string &path, const std::string &input) {}
@@ -222,15 +226,53 @@ namespace cell
         class logger
         {
         private:
-            /* data */
         public:
-            logger(/* args */) {}
+            logger() {}
             ~logger() {}
-            void error(/* args */) {}
-            void info(/* args */) {}
-            void warn(/* args */) {}
+            void error(const std::string &msg) {}
+            void info(const std::string &msg) {}
+            void warn(const std::string &msg) {}
         };
     } // namespace sys
+    namespace encrypt
+    {
+        std::filesystem::path credentials = root / ".crypt";
+
+        class crypt
+        {
+        private:
+            // crypt_map[key] = apikey_encrypted
+            std::unordered_map<std::string, std::string> crypt_map;
+            bool encrypt(const std::string &raw_value) {}
+            std::string decrypt(const std::string &map_value) {}
+
+        public:
+            crypt() {}
+            ~crypt() {}
+            std::string get(const std::string &map_key)
+            {
+                if (crypt_map.contains(map_key))
+                {
+                    return decrypt(crypt_map[map_key]);
+                }
+            }
+            bool add(const std::string &map_key, const std::string &raw_value)
+            {
+                if (crypt_map.contains(map_key))
+                {
+                    return false;
+                }
+                else
+                {
+                    return encrypt(raw_value);
+                }
+            }
+            size_t remove(const std::string &map_key)
+            {
+                return crypt_map.erase(map_key);
+            }
+        };
+    } // namespace encrypt
     namespace tools
     {
         enum class Policy : short
@@ -252,10 +294,23 @@ namespace cell
             ~tool() {}
             virtual bool execute(const std::string &input, std::string &output) {}
         };
-        std::pair<size_t, size_t> tools_call()
+        std::pair<size_t, size_t> tools_call(const std::vector<std::pair<std::string, std::string>> &call_list, std::unordered_map<std::string, std::shared_ptr<tool>> &tool_list)
         {
-            // [succeed,total]
-            return std::make_pair(0, 0);
+            size_t succeed = 0, total = 0;
+            for (auto &[call_tool, call_args] : call_list)
+            {
+                auto tool = tool_list.find(call_tool);
+                if (tool != tool_list.end())
+                {
+                    std::string output;
+                    if (tool->second->execute(call_args, output))
+                    {
+                        succeed += 1;
+                    }
+                    total += 1;
+                }
+            }
+            return std::make_pair(succeed, total);
         }
     } // namespace tools
     namespace llm
@@ -263,17 +318,21 @@ namespace cell
         class OpenAI
         {
         private:
-            /* data */
+            const std::string api_base;
+            CURL *curl = curl_easy_init();
+
         public:
-            OpenAI(/* args */) {}
+            OpenAI(const std::string &api_base) : api_base(api_base) {}
             ~OpenAI() {}
         };
         class Anthropic
         {
         private:
-            /* data */
+            const std::string api_base;
+            CURL *curl = curl_easy_init();
+
         public:
-            Anthropic(/* args */) {}
+            Anthropic(const std::string &api_base) : api_base(api_base) {}
             ~Anthropic() {}
         };
     } // namespace llm
@@ -289,7 +348,7 @@ namespace cell
         public:
             session() : session_id(std::to_string(std::time(nullptr)))
             {
-                file = root + "/sessions/" + session_id + ".json";
+                file = root / "sessions" / (session_id + ".json");
             }
             ~session() {}
             void load() {}
@@ -305,7 +364,7 @@ namespace cell
             ~history() {}
             session &now() {}
             session &get() {}
-            void &remove(const std::string &session_id) {}
+            void remove(const std::string &session_id) {}
         };
     } // namespace chat
 } // namespace cell
