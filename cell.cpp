@@ -23,12 +23,8 @@
 #include <concepts>
 #include <atomic>
 #include <csignal>
-#if defined(__cpp_lib_generator)
 #include <generator>
-#endif
-#if defined(__cpp_lib_expected)
 #include <expected>
-#endif
 #include <source_location>
 #include <exception>
 #include <new>
@@ -41,6 +37,8 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <termios.h>
+#include <sys/select.h>
 #endif
 #ifdef __GNUG__
 #include <cxxabi.h>
@@ -556,6 +554,10 @@ namespace cell
             inline bool color_enabled = false;
             inline bool verbose_enabled = false;
             using clock = std::chrono::steady_clock;
+#ifndef _WIN32
+            inline struct termios original_termios{};
+            inline bool termios_saved = false;
+#endif
 
             void init_console()
             {
@@ -572,8 +574,20 @@ namespace cell
                     color_enabled = false;
 #else
                 color_enabled = color_force && ::isatty(fileno(stdout)) != 0;
+                if (::isatty(fileno(stdin)))
+                {
+                    tcgetattr(fileno(stdin), &original_termios);
+                    termios_saved = true;
+                }
 #endif
             }
+#ifndef _WIN32
+            inline void restore_terminal()
+            {
+                if (termios_saved)
+                    tcsetattr(fileno(stdin), TCSANOW, &original_termios);
+            }
+#endif
         } // namespace detail
 
         enum class color : int
@@ -597,7 +611,11 @@ namespace cell
             std::fputc('\n', stdout);
             std::fflush(stdout);
         }
-        inline void println() { std::fputc('\n', stdout); std::fflush(stdout); }
+        inline void println()
+        {
+            std::fputc('\n', stdout);
+            std::fflush(stdout);
+        }
         // elapsed milliseconds since a steady-clock time point
         inline long long elapsed_ms(detail::clock::time_point t0)
         {
@@ -618,7 +636,11 @@ namespace cell
             std::fwrite(s.data(), 1, s.size(), stderr);
             std::fflush(stderr);
         }
-        inline void eprintln(color) { std::fputc('\n', stderr); std::fflush(stderr); }
+        inline void eprintln(color)
+        {
+            std::fputc('\n', stderr);
+            std::fflush(stderr);
+        }
         template <std::formattable<char>... Args>
         void error(std::format_string<Args...> fmt, Args &&...args)
         {
@@ -646,7 +668,7 @@ namespace cell
             void write(std::string_view level, std::string_view cat, std::string_view msg, color c, bool console = true)
             {
                 std::time_t t = std::time(nullptr);
-                std::tm tm;
+                std::tm tm{};
 #ifdef _WIN32
                 localtime_s(&tm, &t);
 #else
@@ -714,7 +736,8 @@ namespace cell
 
         inline void install_handlers()
         {
-            std::set_terminate([] {
+            std::set_terminate([]
+                               {
                 std::string type = "unknown";
 #ifdef __GNUG__
                 if (void *ex = __cxxabiv1::__cxa_current_exception_type(); ex)
@@ -727,13 +750,12 @@ namespace cell
 #endif
                 logger::instance().error("core", std::format("uncaught exception of type {}: terminate called", type));
                 std::fflush(stderr);
-                std::abort();
-            });
-            std::set_new_handler([] {
+                std::abort(); });
+            std::set_new_handler([]
+                                 {
                 logger::instance().error("core", "out of memory (operator new failed)");
                 std::fflush(stderr);
-                std::abort();
-            });
+                std::abort(); });
         }
 
         // scope guard: runs fn once when the guard goes out of scope (normal, exception, or return)
@@ -775,23 +797,26 @@ namespace cell
             inline std::function<void()> on_exit_signal;
         } // namespace detail
 
-        // signal handler registered via std::signal (example style): report the interrupt,
-        // persist state, then terminate
+        // signal handler registered via std::signal: persist state, then terminate.
+        // std::exit() triggers atexit handlers and static destructors (logger close,
+        // vault key zeroing). All five signals are synchronous and the process state
+        // is well-defined at the point of delivery, so std::exit() is safe for all of them.
         inline void signal_handler(int signum)
         {
-            eprintln(color::red, "Interrupt signal ({}) received.", signum);
             if (detail::on_exit_signal)
                 detail::on_exit_signal();
+#ifndef _WIN32
+            detail::restore_terminal();
+#endif
             std::exit(signum);
         }
         inline void install_interrupt_handler()
         {
             std::signal(SIGINT, signal_handler);
-#ifdef _WIN32
-            std::signal(SIGBREAK, signal_handler);
-#else
-            std::signal(SIGTERM, signal_handler);
-#endif
+            std::signal(SIGABRT, signal_handler);
+            std::signal(SIGFPE, signal_handler);
+            std::signal(SIGILL, signal_handler);
+            std::signal(SIGSEGV, signal_handler);
         }
     } // namespace sys
     namespace config
@@ -890,7 +915,7 @@ namespace cell
             return -1;
         }
 
-using config_result = std::expected<settings, std::string>;
+        using config_result = std::expected<settings, std::string>;
         config_result load()
         {
             settings s;
@@ -1390,8 +1415,7 @@ using config_result = std::expected<settings, std::string>;
             Policy policy() const { return permission; }
         };
         template <typename F>
-        concept tool_handler = requires(F f, const std::string &input, std::string &output)
-        {
+        concept tool_handler = requires(F f, const std::string &input, std::string &output) {
             { f(input, output) } -> std::convertible_to<bool>;
         };
 
@@ -1489,7 +1513,7 @@ using config_result = std::expected<settings, std::string>;
             }
             return std::string::npos;
         }
-// lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
+        // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
         static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
         {
             std::string_view payload;
@@ -1617,7 +1641,7 @@ using config_result = std::expected<settings, std::string>;
                             return;
                         auto &delta = j["choices"][0]["delta"];
                         if (delta.contains("content") && delta["content"].is_string())
-                        [[likely]]
+                            [[likely]]
                         {
                             std::string t = delta["content"].get<std::string>();
                             text += t;
@@ -1778,7 +1802,7 @@ using config_result = std::expected<settings, std::string>;
                             blocks[idx] = ev.value("content_block", nlohmann::json());
                         }
                         else if (type == "content_block_delta" && idx < blocks.size())
-                        [[likely]]
+                            [[likely]]
                         {
                             auto &delta = ev["delta"];
                             std::string dt = delta.value("type", "");
@@ -2053,7 +2077,8 @@ using config_result = std::expected<settings, std::string>;
                     continue;
                 out.push_back(std::move(s));
             }
-            std::sort(out.begin(), out.end(), [](const skill &a, const skill &b) { return a.name < b.name; });
+            std::sort(out.begin(), out.end(), [](const skill &a, const skill &b)
+                      { return a.name < b.name; });
             return out;
         }
         static const skill *find(const std::vector<skill> &all, const std::string &name)
@@ -2239,20 +2264,20 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                    std::function<bool(const nlohmann::json &, std::string &)> fn)
     {
         list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy,
-            [fn = std::move(fn)](const std::string &in, std::string &out) -> bool
-            {
-                nlohmann::json j;
-                if (!json_args(in, j))
-                    return false;
-                try
-                {
-                    return fn(j, out);
-                }
-                catch (const std::exception &)
-                {
-                    return false;
-                }
-            });
+                                                                  [fn = std::move(fn)](const std::string &in, std::string &out) -> bool
+                                                                  {
+                                                                      nlohmann::json j;
+                                                                      if (!json_args(in, j))
+                                                                          return false;
+                                                                      try
+                                                                      {
+                                                                          return fn(j, out);
+                                                                      }
+                                                                      catch (const std::exception &)
+                                                                      {
+                                                                          return false;
+                                                                      }
+                                                                  });
         nlohmann::json schema = {{"type", "object"}, {"properties", props}, {"required", required}};
         if (anthropic)
             defs.push_back({{"name", name}, {"description", desc}, {"input_schema", schema}});
@@ -2311,7 +2336,8 @@ static int run_selftest()
     cell::root = ".cell-selftest";
     std::error_code ec;
     std::filesystem::remove_all(cell::root, ec);
-    int sodium_rc = sodium_init(); (void)sodium_rc;
+    int sodium_rc = sodium_init();
+    (void)sodium_rc;
     auto expect = [&ok](bool cond, const char *what)
     {
         if (!cond)
@@ -2362,7 +2388,8 @@ static int run_selftest()
         auto feed = [&](const char *s)
         {
             cell::llm::sse_feed(sse_buf, sse_base, std::span<const char>(s, std::strlen(s)),
-                                [&](const nlohmann::json &j) { got.push_back(j.dump()); });
+                                [&](const nlohmann::json &j)
+                                { got.push_back(j.dump()); });
         };
         feed("data: {\"a\":1}\n\n");
         feed("data: {\"b\""); // partial line: must not be delivered yet
@@ -2555,7 +2582,8 @@ int main(int argc, char const *argv[])
         return run_selftest();
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    int sodium_rc = sodium_init(); (void)sodium_rc;
+    int sodium_rc = sodium_init();
+    (void)sodium_rc;
     cell::encrypt::crypt vault;
     auto &log = cell::sys::logger::instance();
     auto t_start = cell::sys::detail::clock::now();
@@ -2765,7 +2793,7 @@ int main(int argc, char const *argv[])
     // RAII exit guard: persists the session + config and cleans up libcurl no matter how
     // main leaves this scope (normal /exception / Ctrl+C graceful exit).
     auto on_exit = cell::sys::make_scoped_exit([&]
-    {
+                                               {
         try
         {
             s->unload();
@@ -2775,8 +2803,7 @@ int main(int argc, char const *argv[])
         }
         cfg.session_id = s->id();
         cell::config::save(cfg);
-        curl_global_cleanup();
-    });
+        curl_global_cleanup(); });
     auto skills_all = cell::skills::list();
     std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
     auto ensure_prompt = [&](cell::chat::session *sess)
@@ -2787,7 +2814,7 @@ int main(int argc, char const *argv[])
         if (!skills_prompt.empty())
             sess->msg().push_back({{"role", "system"}, {"content", skills_prompt}});
         log.debug("ctx", std::format("inject system_prompt={}chars{}", cfg.system_prompt.size(),
-                              skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
+                                     skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
     };
     ensure_prompt(s);
     if (const cell::config::model_entry *e = cfg.current_entry(); e)
@@ -2809,25 +2836,25 @@ int main(int argc, char const *argv[])
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
 
-auto list_models = [&]()
+    auto list_models = [&]()
+    {
+        if (cfg.models.empty())
         {
-            if (cfg.models.empty())
-            {
-                cell::sys::println("  (no models configured)");
-                return;
-            }
-            for (size_t i = 0; i < cfg.models.size(); i++)
-            {
-                auto &e = cfg.models[i];
-                cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
-                if (!e.base.empty())
-                    cell::sys::println("       base: {}", e.base);
-                if (!e.proxy.empty())
-                    cell::sys::println("       proxy: {}", e.proxy);
-                if (!e.key_id.empty())
-                    cell::sys::println("       key:  stored");
-            }
-        };
+            cell::sys::println("  (no models configured)");
+            return;
+        }
+        for (size_t i = 0; i < cfg.models.size(); i++)
+        {
+            auto &e = cfg.models[i];
+            cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
+            if (!e.base.empty())
+                cell::sys::println("       base: {}", e.base);
+            if (!e.proxy.empty())
+                cell::sys::println("       proxy: {}", e.proxy);
+            if (!e.key_id.empty())
+                cell::sys::println("       key:  stored");
+        }
+    };
 
     // context compaction: keep system messages + head/tail, summarize the middle via the llm
     auto compact = [&](cell::chat::session *sess) -> std::string
@@ -3326,6 +3353,22 @@ auto list_models = [&]()
                     while (_kbhit())
                         if (_getwch() == 27)
                             u->cancelled = true;
+#else
+                    if (cell::sys::detail::termios_saved && ::isatty(fileno(stdin)))
+                    {
+                        struct termios raw{};
+                        tcgetattr(fileno(stdin), &raw);
+                        struct termios raw_noecho = raw;
+                        raw_noecho.c_lflag &= ~(ICANON | ECHO);
+                        raw_noecho.c_cc[VMIN] = 0;
+                        raw_noecho.c_cc[VTIME] = 0;
+                        tcsetattr(fileno(stdin), TCSANOW, &raw_noecho);
+                        char ch{};
+                        while (read(fileno(stdin), &ch, 1) == 1)
+                            if (ch == 27)
+                                u->cancelled = true;
+                        tcsetattr(fileno(stdin), TCSANOW, &raw);
+                    }
 #endif
                     if (!u->got && cell::sys::detail::color_enabled)
                     {
@@ -3447,9 +3490,9 @@ auto list_models = [&]()
                         }
                         else
                         {
-                            policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny"
-                                   : (it->second->policy() == cell::tools::Policy::Ask) ? "ask"
-                                   : "allow";
+                            policy = (it->second->policy() == cell::tools::Policy::Deny)  ? "deny"
+                                     : (it->second->policy() == cell::tools::Policy::Ask) ? "ask"
+                                                                                          : "allow";
                             std::string o;
                             if (it->second->execute(args, o))
                             {
