@@ -505,6 +505,8 @@ namespace cell
         {
             inline bool color_force = true;
             inline bool color_enabled = false;
+            inline bool verbose_enabled = false;
+            using clock = std::chrono::steady_clock;
 
             void init_console()
             {
@@ -548,6 +550,16 @@ namespace cell
             std::fflush(stdout);
         }
         inline void println() { std::fputc('\n', stdout); std::fflush(stdout); }
+        // elapsed milliseconds since a steady-clock time point
+        inline long long elapsed_ms(detail::clock::time_point t0)
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(detail::clock::now() - t0).count();
+        }
+        // milliseconds between two steady-clock time points
+        inline long long diff_ms(detail::clock::time_point from, detail::clock::time_point to)
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+        }
         template <std::formattable<char>... Args>
         void eprintln(color c, std::format_string<Args...> fmt, Args &&...args)
         {
@@ -587,7 +599,7 @@ namespace cell
                 file.open(root / "logs" / "cell.log", std::ios::app);
             }
 
-            void write(std::string_view level, std::string_view msg, color c)
+            void write(std::string_view level, std::string_view msg, color c, bool console = true)
             {
                 std::time_t t = std::time(nullptr);
                 std::tm tm;
@@ -604,7 +616,8 @@ namespace cell
                     file << line << '\n';
                     file.flush();
                 }
-                eprintln(c, "{}", line);
+                if (console)
+                    eprintln(c, "{}", line);
             }
 
         public:
@@ -624,6 +637,8 @@ namespace cell
             void error(std::string_view msg) { write("ERROR", msg, color::red); }
             void info(std::string_view msg) { write("INFO", msg, color::green); }
             void warn(std::string_view msg) { write("WARN", msg, color::yellow); }
+            // DEBUG always goes to the log file; console output only with --verbose
+            void debug(std::string_view msg) { write("DEBUG", msg, color::yellow, detail::verbose_enabled); }
         };
 
         class exception : public std::runtime_error
@@ -1201,17 +1216,27 @@ namespace cell
             bool execute(const std::string &input, std::string &output) override
             {
                 if (policy() == Policy::Deny)
+                {
+                    cell::sys::logger::instance().warn(std::format("tool {} blocked by deny policy", name()));
                     return false;
+                }
                 if (policy() == Policy::Ask)
                 {
                     std::cout << "allow " << name() << "(" << input << ")? [y/N] " << std::flush;
                     std::string answer;
                     std::getline(std::cin, answer);
                     if (answer != "y" && answer != "Y")
+                    {
+                        cell::sys::logger::instance().warn(std::format("tool {} rejected by user", name()));
                         return false;
+                    }
+                    cell::sys::logger::instance().debug(std::format("tool {} approved by user", name()));
                 }
                 if (!box::check(input))
+                {
+                    cell::sys::logger::instance().warn(std::format("tool {} blocked by sandbox: {}", name(), input));
                     return false;
+                }
                 return handler_(input, output);
             }
         };
@@ -1601,20 +1626,30 @@ namespace cell
             void load()
             {
                 if (loaded)
+                {
+                    cell::sys::logger::instance().debug(std::format("session cache hit: {} (in memory)", session_id));
                     return;
+                }
                 loaded = true;
                 if (!std::filesystem::exists(file))
+                {
+                    cell::sys::logger::instance().debug(std::format("session created: {} (no file on disk)", session_id));
                     return;
+                }
                 std::ifstream f(file);
                 try
                 {
                     auto j = nlohmann::json::parse(f, nullptr, false);
                     if (j.contains("messages") && j["messages"].is_array())
+                    {
                         messages = j["messages"];
+                        cell::sys::logger::instance().info(std::format("session loaded from disk: {} ({} messages)", session_id, messages.size()));
+                    }
                 }
                 catch (const std::exception &)
                 {
                     messages = nlohmann::json::array();
+                    cell::sys::logger::instance().warn(std::format("session file corrupt, started empty: {}", session_id));
                 }
             }
             void unload()
@@ -1649,8 +1684,13 @@ namespace cell
                 auto it = session_list.find(current);
                 if (it == session_list.end())
                 {
+                    cell::sys::logger::instance().debug(std::format("session map miss: creating {}", current));
                     session s = (current == "current") ? session() : session(current);
                     it = session_list.emplace(current, std::move(s)).first;
+                }
+                else
+                {
+                    cell::sys::logger::instance().debug(std::format("session map hit: {}", current));
                 }
                 it->second.load();
                 return it->second;
@@ -1913,6 +1953,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --session ID                 resume an existing session");
     cell::sys::println("  --system TEXT                system prompt");
     cell::sys::println("  --no-color                   disable colored log output");
+    cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
     cell::sys::println("  --selftest                   run internal self tests");
 }
 
@@ -2128,7 +2169,9 @@ static int run_selftest()
     log.info("selftest info");
     log.warn("selftest warn");
     log.error("selftest error");
+    log.debug("selftest debug");
     expect(cell::box::exist((cell::root / "logs" / "cell.log").string()), "logger writes log file");
+    expect(cell::box::read((cell::root / "logs" / "cell.log").string(), out) && out.find("selftest debug") != std::string::npos, "logger debug writes to log file");
 
     bool threw = false;
     try
@@ -2239,6 +2282,7 @@ int main(int argc, char const *argv[])
     // args parse
     bool selftest = false;
     bool no_color = false;
+    bool verbose = false;
     std::string key_arg;
     std::string provider_arg, base_arg, model_arg;
     cell::config::settings cfg;
@@ -2261,19 +2305,21 @@ int main(int argc, char const *argv[])
             return argv[++i];
         };
         if (arg == "--provider")
-            provider_arg = value("--provider");
+            provider_arg = cell::skills::trim(value("--provider"));
         else if (arg == "--base")
-            base_arg = value("--base");
+            base_arg = cell::skills::trim(value("--base"));
         else if (arg == "--model")
-            model_arg = value("--model");
+            model_arg = cell::skills::trim(value("--model"));
         else if (arg == "--key")
-            key_arg = value("--key");
+            key_arg = cell::skills::trim(value("--key"));
         else if (arg == "--session")
             cfg.session_id = value("--session");
         else if (arg == "--system")
             cfg.system_prompt = value("--system");
         else if (arg == "--no-color")
             no_color = true;
+        else if (arg == "--verbose")
+            verbose = true;
         else if (arg == "--selftest")
             selftest = true;
         else
@@ -2284,6 +2330,7 @@ int main(int argc, char const *argv[])
         }
     }
     cell::sys::detail::color_force = !no_color;
+    cell::sys::detail::verbose_enabled = verbose;
     cell::sys::detail::init_console();
     cell::sys::install_handlers();
     if (selftest)
@@ -2327,7 +2374,11 @@ int main(int argc, char const *argv[])
         vault.set(kid, key_arg);
         sodium_memzero(key_arg.data(), key_arg.size());
     }
-    log.info(std::format("cell started, {} model(s) configured", cfg.models.size()));
+    if (const cell::config::model_entry *e = cfg.current_entry(); e)
+        log.info(std::format("cell started, {} model(s) configured, current: {} (provider={}, base={})",
+                             cfg.models.size(), e->label(), e->provider, e->base.empty() ? "(default)" : e->base));
+    else
+        log.info(std::format("cell started, {} model(s) configured, current: none", cfg.models.size()));
 
     // tool definitions for both API styles
     auto tools_o = build_tools(false);
@@ -2343,16 +2394,28 @@ int main(int argc, char const *argv[])
         std::unordered_map<std::string, std::unique_ptr<cell::llm::Anthropic>> anthropic;
         cell::llm::OpenAI &o(const std::string &base)
         {
+            auto it = openai.find(base);
+            if (it != openai.end())
+            {
+                cell::sys::logger::instance().debug(std::format("client cache hit: openai [{}]", base));
+                return *it->second;
+            }
+            cell::sys::logger::instance().debug(std::format("client cache miss: creating openai client [{}]", base));
             auto &p = openai[base];
-            if (!p)
-                p = std::make_unique<cell::llm::OpenAI>(base);
+            p = std::make_unique<cell::llm::OpenAI>(base);
             return *p;
         }
         cell::llm::Anthropic &a(const std::string &base)
         {
+            auto it = anthropic.find(base);
+            if (it != anthropic.end())
+            {
+                cell::sys::logger::instance().debug(std::format("client cache hit: anthropic [{}]", base));
+                return *it->second;
+            }
+            cell::sys::logger::instance().debug(std::format("client cache miss: creating anthropic client [{}]", base));
             auto &p = anthropic[base];
-            if (!p)
-                p = std::make_unique<cell::llm::Anthropic>(base);
+            p = std::make_unique<cell::llm::Anthropic>(base);
             return *p;
         }
     } cache;
@@ -2393,6 +2456,10 @@ int main(int argc, char const *argv[])
     {
         std::fwrite(data.data(), 1, data.size(), stdout);
         std::fflush(stdout);
+    };
+    auto trunc = [](const std::string &s, size_t n) -> std::string
+    {
+        return s.size() <= n ? s : s.substr(0, n) + "...";
     };
 
     auto content_chars = [](const nlohmann::json &msgs) -> long long
@@ -2468,6 +2535,8 @@ int main(int argc, char const *argv[])
         sess->msg().push_back({{"role", "system"}, {"content", cfg.system_prompt}});
         if (!skills_prompt.empty())
             sess->msg().push_back({{"role", "system"}, {"content", skills_prompt}});
+        log.debug(std::format("prompt injection: system prompt ({} chars){}", cfg.system_prompt.size(),
+                              skills_prompt.empty() ? "" : std::format(", skills metadata ({} chars)", skills_prompt.size())));
     };
     ensure_prompt(s);
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
@@ -2539,12 +2608,28 @@ int main(int argc, char const *argv[])
                 prompt.push_back({{"role", "user"},
                                   {"content", std::format("Summarize the following removed part of a coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
                 nlohmann::json reply, tc, usage;
-                if (do_chat(*e, key, prompt, false, on_token, reply, tc, usage))
+                log.info(std::format("compact: summarizing {} removed message(s) via {}", middle.size(), e->label()));
+                cell::sys::print("summary> ");
+                auto t0 = cell::sys::detail::clock::now();
+                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage))
                 {
+                    long long ms = cell::sys::elapsed_ms(t0);
+                    cell::sys::println();
                     summary = reply_text(reply);
                     if (summary.empty())
                         summary = "(empty summary)";
+                    auto in_tok = usage_in(usage);
+                    auto out_tok = usage_out(usage);
+                    log.info(std::format("compact summary: {} chars, {}ms, in_tok={}, out_tok={}",
+                                         summary.size(), ms,
+                                         in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
+                                         out_tok.has_value() ? std::to_string(*out_tok) : "n/a"));
                     cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), 0);
+                }
+                else
+                {
+                    cell::sys::println();
+                    log.warn("compact: llm summarization failed, falling back to truncation");
                 }
             }
         }
@@ -2631,6 +2716,7 @@ int main(int argc, char const *argv[])
                         toks.push_back(t);
                 }
                 std::string cmd = toks.empty() ? "" : toks[0];
+                log.info(std::format("command: {}", cmd));
                 if (cmd == "/exit" || cmd == "/quit")
                     break;
                 if (cmd == "/help")
@@ -2641,6 +2727,7 @@ int main(int argc, char const *argv[])
                 if (cmd == "/save")
                 {
                     s->unload();
+                    log.info(std::format("session saved: {}", s->id()));
                     cell::sys::println("session saved: {}", s->id());
                     continue;
                 }
@@ -2650,6 +2737,7 @@ int main(int argc, char const *argv[])
                     h.remove(old_id);
                     s = &h.now();
                     ensure_prompt(s);
+                    log.info(std::format("new session: {} (previous {} discarded)", s->id(), old_id));
                     cell::sys::println("new session: {}", s->id());
                     continue;
                 }
@@ -2700,17 +2788,27 @@ int main(int argc, char const *argv[])
                         auto &t = toks[i];
                         if (t.rfind("base:", 0) == 0)
                         {
-                            new_base = t.substr(5);
+                            // tolerant spaced form: "base: https://..." (value in the next token)
+                            if (t.size() > 5)
+                                new_base = t.substr(5);
+                            else if (i + 1 < toks.size())
+                                new_base = toks[++i];
                             has_opts = true;
                         }
                         else if (t.rfind("key:", 0) == 0)
                         {
-                            new_key = t.substr(4);
+                            // tolerant spaced form: "key: sk-..." (value in the next token)
+                            if (t.size() > 4)
+                                new_key = t.substr(4);
+                            else if (i + 1 < toks.size())
+                                new_key = toks[++i];
                             has_opts = true;
                         }
                         else
                             cell::sys::warn("ignoring token: {}", t);
                     }
+                    new_base = cell::skills::trim(new_base);
+                    new_key = cell::skills::trim(new_key);
                     if (has_opts)
                     {
                         // add or update a model
@@ -2738,6 +2836,7 @@ int main(int argc, char const *argv[])
                         cfg.current = (size_t)idx;
                         cell::config::save(cfg);
                         auto &reg = cfg.models[idx];
+                        log.info(std::format("model registered: {}", reg.label()));
                         cell::sys::println("model registered: {}", reg.label());
                         cell::sys::println("       provider: {}", reg.provider);
                         cell::sys::println("       model:    {}", reg.model);
@@ -2755,6 +2854,7 @@ int main(int argc, char const *argv[])
                     }
                     cfg.current = (size_t)idx;
                     cell::config::save(cfg);
+                    log.info(std::format("model switched: {}", cfg.models[idx].label()));
                     cell::sys::println("switched to {}", cfg.models[idx].label());
                     continue;
                 }
@@ -2854,6 +2954,7 @@ int main(int argc, char const *argv[])
                     s->msg().push_back({{"role", "system"},
                                         {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sk->name, body)}});
                     s->unload();
+                    log.info(std::format("prompt injection: skill {} ({} chars)", sk->name, body.size()));
                     cell::sys::println("skill loaded: {} ({} chars)", sk->name, body.size());
                     continue;
                 }
@@ -2887,10 +2988,24 @@ int main(int argc, char const *argv[])
                 size_t before = s->msg().size();
                 long long in_chars = content_chars(s->msg());
                 nlohmann::json reply, tool_calls, usage;
-                bool ok = do_chat(*e, key, s->msg(), true, on_token, reply, tool_calls, usage);
+                auto t0 = cell::sys::detail::clock::now();
+                bool first_token = true;
+                auto tok0 = t0;
+                cell::net::StreamCallback tok_cb = [&](std::span<const char> data)
+                {
+                    if (first_token && !data.empty())
+                    {
+                        first_token = false;
+                        tok0 = cell::sys::detail::clock::now();
+                    }
+                    on_token(data);
+                };
+                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage);
+                long long total_ms = cell::sys::elapsed_ms(t0);
+                long long ttf_ms = first_token ? -1 : cell::sys::diff_ms(t0, tok0);
                 if (!ok)
                 {
-                    log.error("llm request failed");
+                    log.error(std::format("llm request failed: {} ({}ms)", e->label(), total_ms));
                     cell::sys::println();
                     cell::sys::error("[llm request failed]");
                     done = true;
@@ -2898,6 +3013,13 @@ int main(int argc, char const *argv[])
                 }
                 cell::sys::println();
                 long long out_chars = reply_text_len(reply);
+                auto in_tok = usage_in(usage);
+                auto out_tok = usage_out(usage);
+                log.info(std::format("llm round {}: {} [stream] in_chars={} out_chars={} in_tok={} out_tok={} {}ms (ttf {})",
+                                     rounds, e->label(), in_chars, out_chars,
+                                     in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
+                                     out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
+                                     total_ms, ttf_ms < 0 ? "n/a" : std::format("{}ms", ttf_ms)));
                 s->msg().push_back(reply);
                 if (!tool_calls.empty())
                 {
@@ -2906,18 +3028,27 @@ int main(int argc, char const *argv[])
                         std::string name = tc["function"].value("name", "");
                         std::string args = tc["function"].value("arguments", "");
                         std::string output = "[tool failed]";
+                        auto t_tool = cell::sys::detail::clock::now();
+                        std::string policy = "?";
                         auto it = tool_list.find(name);
                         if (it == tool_list.end())
+                        {
                             output = std::format("[unknown tool: {}]", name);
+                            cell::sys::logger::instance().warn(std::format("tool call unknown: {} args={}", name, trunc(args, 200)));
+                        }
                         else
                         {
+                            policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny"
+                                   : (it->second->policy() == cell::tools::Policy::Ask) ? "ask"
+                                   : "allow";
                             std::string o;
                             if (it->second->execute(args, o))
                                 output = o;
                             else
                                 output = "[tool denied or failed]";
                         }
-                        log.info(std::format("tool {} -> {}", name, output.substr(0, 200)));
+                        long long tool_ms = cell::sys::elapsed_ms(t_tool);
+                        log.info(std::format("tool {} [policy={}, {}ms] args={} -> {}", name, policy, tool_ms, trunc(args, 200), trunc(output, 200)));
                         if (e->provider == "openai")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", output}});
                         else
@@ -2930,6 +3061,7 @@ int main(int argc, char const *argv[])
                 cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), (long long)(s->msg().size() - before));
             }
             s->unload();
+            log.debug(std::format("session persisted: {}", s->id()));
             cfg.session_id = s->id();
             cell::config::save(cfg);
             if (!interactive)
