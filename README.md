@@ -87,9 +87,18 @@ usage: cell [options]
 
 | Command | Description |
 |---------|-------------|
-| `/exit` | Exit the REPL |
+| `/models` | List configured models (first one in config is the default) |
+| `/model NAME` | Switch to a configured model (`NAME` or `provider:NAME`) |
+| `/model provider:NAME base:URL key:KEY` | Add/update a model, e.g. `/model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx` (key is stored in the encrypted vault) |
+| `/sessions` | List saved sessions |
+| `/usages` | Show per-model and per-session usage statistics |
+| `/compact` | Compress the current session context (LLM summary of the middle, with truncation fallback) |
+| `/skills` | List skills discovered in `.cell/skills/*.md` (metadata only) |
+| `/skill NAME` | Load a skill into the session |
 | `/save` | Save current session to disk |
 | `/new`  | Start a fresh session |
+| `/help` | Show all commands |
+| `/exit` | Exit the REPL |
 
 ## Architecture
 
@@ -128,9 +137,12 @@ The tool creates a `.cell/` directory in your working directory:
 
 ```
 .cell/
-├── config.json       # Provider, model, system prompt, session ID
+├── config.json       # Multi-model config: {"models":[{provider,base,model,key}...], "current_model":N}
 ├── .crypt            # Encrypted API key vault
 ├── .key              # Symmetric encryption key
+├── usages.json       # Per-model and per-session usage statistics
+├── skills/
+│   └── *.md          # Skills (front matter: name/description, body injected on /skill)
 ├── logs/
 │   └── cell.log      # Timestamped application logs
 └── sessions/

@@ -672,15 +672,96 @@ namespace cell
     } // namespace sys
     namespace config
     {
+        struct model_entry
+        {
+            std::string provider = "openai"; // openai | anthropic
+            std::string base;                // api base url
+            std::string model;               // model name
+            std::string key_id;              // vault map key for the api key (optional)
+
+            std::string label() const { return provider + ":" + model; }
+            nlohmann::json to_json() const
+            {
+                nlohmann::json j;
+                j["provider"] = provider;
+                if (!base.empty())
+                    j["base"] = base;
+                j["model"] = model;
+                if (!key_id.empty())
+                    j["key"] = key_id;
+                return j;
+            }
+            static model_entry from_json(const nlohmann::json &j)
+            {
+                model_entry e;
+                e.provider = j.value("provider", "openai");
+                e.base = j.value("base", "");
+                e.model = j.value("model", "");
+                e.key_id = j.value("key", "");
+                return e;
+            }
+        };
         struct settings
         {
-            std::string provider = "openai";
-            std::string base;
-            std::string model;
+            std::vector<model_entry> models;
+            size_t current = 0; // index of the active model (first entry is the default)
             std::string system_prompt = "You are a coding agent. Use the provided tools to read, search, write files and run commands when they help. When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
+
+            bool empty() const { return models.empty(); }
+            const model_entry *current_entry() const
+            {
+                if (models.empty())
+                    return nullptr;
+                return &models[(current < models.size()) ? current : 0];
+            }
+            model_entry *current_entry()
+            {
+                if (models.empty())
+                    return nullptr;
+                return &models[(current < models.size()) ? current : 0];
+            }
         };
         std::filesystem::path file() { return root / "config.json"; }
+
+        static model_entry default_model(const std::string &provider)
+        {
+            model_entry e;
+            if (provider == "anthropic")
+            {
+                e.provider = "anthropic";
+                e.base = "https://api.anthropic.com";
+                e.model = "claude-3-5-haiku-latest";
+            }
+            else
+            {
+                e.provider = "openai";
+                e.base = "https://api.openai.com/v1";
+                e.model = "gpt-4o-mini";
+            }
+            return e;
+        }
+        static settings defaults()
+        {
+            settings s;
+            s.models.push_back(default_model("openai"));
+            s.models.push_back(default_model("anthropic"));
+            return s;
+        }
+        // find a model by model-name or "provider:model" exact label
+        static int find(const settings &s, const std::string &name, const std::string &provider = "")
+        {
+            std::string label = provider.empty() ? "" : (provider + ":" + name);
+            for (size_t i = 0; i < s.models.size(); i++)
+            {
+                if (!provider.empty() && s.models[i].label() == label)
+                    return (int)i;
+                if (provider.empty() && s.models[i].model == name)
+                    return (int)i;
+            }
+            return -1;
+        }
+
 #if defined(__cpp_lib_expected)
         using config_result = std::expected<settings, std::string>;
 #else
@@ -711,9 +792,22 @@ namespace cell
                     return std::nullopt;
 #endif
                 }
-                s.provider = j.value("provider", s.provider);
-                s.base = j.value("base", s.base);
-                s.model = j.value("model", s.model);
+                if (j.contains("models") && j["models"].is_array())
+                {
+                    for (auto &mj : j["models"])
+                        s.models.push_back(model_entry::from_json(mj));
+                    s.current = j.value("current_model", (size_t)0);
+                }
+                else
+                {
+                    // legacy flat format -> synthesize a single model entry
+                    model_entry e;
+                    e.provider = j.value("provider", "openai");
+                    e.base = j.value("base", "");
+                    e.model = j.value("model", "");
+                    if (!e.model.empty())
+                        s.models.push_back(std::move(e));
+                }
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
             }
@@ -733,9 +827,11 @@ namespace cell
             std::error_code ec;
             std::filesystem::create_directories(root, ec);
             nlohmann::json j;
-            j["provider"] = s.provider;
-            j["base"] = s.base;
-            j["model"] = s.model;
+            nlohmann::json arr = nlohmann::json::array();
+            for (auto &e : s.models)
+                arr.push_back(e.to_json());
+            j["models"] = arr;
+            j["current_model"] = s.current;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
             std::ofstream f(file(), std::ios::trunc);
@@ -1037,6 +1133,23 @@ namespace cell
                     save();
                 return n;
             }
+            bool has(const std::string &map_key) const
+            {
+                return crypt_map.find(map_key) != crypt_map.end();
+            }
+            // add or overwrite an existing entry
+            bool set(const std::string &map_key, const std::string &raw_value)
+            {
+                std::string enc = encrypt(raw_value.data(), raw_value.size());
+                if (enc.empty())
+                    return false;
+                crypt_map[map_key] = enc;
+                return save();
+            }
+            bool set(const std::string &map_key, const secure_string &raw_value)
+            {
+                return set(map_key, raw_value.str());
+            }
         };
     } // namespace encrypt
     namespace tools
@@ -1206,9 +1319,10 @@ namespace cell
             OpenAI(const std::string &api_base) : api_base(api_base) {}
             ~OpenAI() { curl_easy_cleanup(curl); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
             {
                 tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
                 std::vector<std::string> hdrs = headers(api_key);
@@ -1225,6 +1339,8 @@ namespace cell
                     reply = j["choices"][0]["message"];
                     if (reply.contains("tool_calls"))
                         tool_calls = reply["tool_calls"];
+                    if (j.contains("usage") && j["usage"].is_object())
+                        usage = j["usage"];
                     return true;
                 }
                 catch (const std::exception &e)
@@ -1234,9 +1350,10 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
             {
                 tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
                 std::string text;
                 std::string sse_buf;
                 std::string url = api_base + "/chat/completions";
@@ -1245,6 +1362,8 @@ namespace cell
                     sse_buf.append(data.data(), data.size());
                     auto handle = [&](const nlohmann::json &j)
                     {
+                        if (j.contains("usage") && j["usage"].is_object())
+                            usage = j["usage"];
                         if (!j.contains("choices") || j["choices"].empty())
                             return;
                         auto &delta = j["choices"][0]["delta"];
@@ -1339,9 +1458,10 @@ namespace cell
             Anthropic(const std::string &api_base) : api_base(api_base) {}
             ~Anthropic() { curl_easy_cleanup(curl); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
             {
                 tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
                 std::vector<std::string> hdrs = headers(api_key);
@@ -1355,6 +1475,8 @@ namespace cell
                     auto j = nlohmann::json::parse(buf);
                     if (!j.contains("content") || !j["content"].is_array())
                         return false;
+                    if (j.contains("usage") && j["usage"].is_object())
+                        usage = j["usage"];
                     reply["role"] = "assistant";
                     reply["content"] = j["content"];
                     for (auto &block : j["content"])
@@ -1376,9 +1498,10 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
             {
                 tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
                 std::vector<nlohmann::json> blocks;
                 std::string sse_buf;
                 std::string url = api_base + "/v1/messages";
@@ -1388,6 +1511,10 @@ namespace cell
                     auto handle = [&](const nlohmann::json &ev)
                     {
                         std::string type = ev.value("type", "");
+                        if (type == "message_start" && ev.contains("message") && ev["message"].contains("usage"))
+                            usage["input_tokens"] = ev["message"]["usage"].value("input_tokens", 0);
+                        else if (type == "message_delta" && ev.contains("usage"))
+                            usage["output_tokens"] = ev["usage"].value("output_tokens", 0);
                         size_t idx = ev.value("index", (size_t)blocks.size());
                         if (type == "content_block_start")
                         {
@@ -1553,19 +1680,257 @@ namespace cell
             }
         };
     } // namespace chat
+    namespace skills
+    {
+        struct skill
+        {
+            std::string name;
+            std::string description;
+            std::string file; // filename under .cell/skills/
+        };
+        static std::string trim(std::string_view s)
+        {
+            size_t b = 0, e = s.size();
+            while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
+                b++;
+            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
+                e--;
+            return std::string(s.substr(b, e - b));
+        }
+        static std::string strip_bom(std::string s)
+        {
+            if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+                s.erase(0, 3);
+            return s;
+        }
+        static std::vector<std::string> lines(const std::string &text)
+        {
+            std::vector<std::string> out;
+            std::istringstream ss(text);
+            std::string line;
+            while (std::getline(ss, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                out.push_back(line);
+            }
+            return out;
+        }
+        // parse optional YAML-style front matter: "---\nname: x\ndescription: y\n---\n body"
+        static void parse_metadata(const std::string &raw, skill &s)
+        {
+            std::string text = strip_bom(raw);
+            std::string body = text;
+            if (text.rfind("---", 0) == 0)
+            {
+                size_t end = text.find("\n---");
+                if (end != std::string::npos)
+                {
+                    std::string meta = text.substr(3, end - 3);
+                    for (auto &line : lines(meta))
+                    {
+                        size_t colon = line.find(':');
+                        if (colon == std::string::npos)
+                            continue;
+                        std::string key = trim(std::string_view(line).substr(0, colon));
+                        std::string val = trim(std::string_view(line).substr(colon + 1));
+                        if (key == "name")
+                            s.name = val;
+                        else if (key == "description")
+                            s.description = val;
+                    }
+                    body = text.substr(end + 4);
+                }
+            }
+            if (s.name.empty())
+                s.name = std::filesystem::path(s.file).stem().string();
+            if (s.description.empty())
+            {
+                for (auto &line : lines(body))
+                {
+                    if (!trim(line).empty())
+                    {
+                        s.description = trim(line);
+                        if (s.description.size() > 120)
+                            s.description = s.description.substr(0, 117) + "...";
+                        break;
+                    }
+                }
+            }
+        }
+        static std::vector<skill> list()
+        {
+            std::vector<skill> out;
+            std::filesystem::path dir = root / "skills";
+            std::error_code ec;
+            if (!std::filesystem::exists(dir, ec))
+                return out;
+            for (auto &entry : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (ec)
+                    break;
+                if (!entry.is_regular_file(ec))
+                    continue;
+                if (entry.path().extension() != ".md")
+                    continue;
+                std::string text;
+                if (!box::read(entry.path().string(), text) || text.empty())
+                    continue;
+                skill s;
+                s.file = entry.path().filename().string();
+                parse_metadata(text, s);
+                out.push_back(std::move(s));
+            }
+            std::sort(out.begin(), out.end(), [](const skill &a, const skill &b) { return a.name < b.name; });
+            return out;
+        }
+        static const skill *find(const std::vector<skill> &all, const std::string &name)
+        {
+            for (auto &s : all)
+            {
+                if (s.name == name)
+                    return &s;
+            }
+            return nullptr;
+        }
+        // read the full body of a skill (front matter stripped)
+        static bool content(const skill &s, std::string &out)
+        {
+            std::string text;
+            if (!box::read((root / "skills" / s.file).string(), text))
+                return false;
+            text = strip_bom(std::move(text));
+            if (text.rfind("---", 0) == 0)
+            {
+                size_t end = text.find("\n---");
+                if (end != std::string::npos)
+                    text = text.substr(end + 4);
+            }
+            out = std::move(text);
+            return true;
+        }
+        // metadata-only prompt injection listing available skills
+        static std::string metadata_prompt(const std::vector<skill> &all)
+        {
+            if (all.empty())
+                return "";
+            std::string out = "The following skills are available in this workspace. Each can be loaded with the /skill command by the user. When a task matches a skill, suggest the user load it.\nAvailable skills:\n";
+            for (auto &s : all)
+                out += std::format("- {}{}\n", s.name, s.description.empty() ? "" : ": " + s.description);
+            return out;
+        }
+    } // namespace skills
+    namespace stats
+    {
+        static std::filesystem::path file() { return root / "usages.json"; }
+        static nlohmann::json load()
+        {
+            std::ifstream f(file());
+            if (!f.is_open())
+                return nlohmann::json{{"sessions", nlohmann::json::object()}, {"models", nlohmann::json::object()}};
+            try
+            {
+                auto j = nlohmann::json::parse(f, nullptr, false);
+                if (j.is_object() && j.contains("sessions") && j.contains("models"))
+                    return j;
+            }
+            catch (const std::exception &)
+            {
+            }
+            return nlohmann::json{{"sessions", nlohmann::json::object()}, {"models", nlohmann::json::object()}};
+        }
+        static bool save(const nlohmann::json &j)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(root, ec);
+            std::ofstream f(file(), std::ios::trunc);
+            if (!f.is_open())
+                return false;
+            f << j.dump(2);
+            return f.good();
+        }
+        // record one llm request against a session + model
+        static void add(const std::string &session_id, const std::string &model,
+                        long long input_chars, long long output_chars,
+                        std::optional<long long> input_tokens, std::optional<long long> output_tokens,
+                        long long messages = 0)
+        {
+            nlohmann::json j = load();
+            auto bump = [&](nlohmann::json &rec)
+            {
+                rec["requests"] = rec.value("requests", 0LL) + 1;
+                rec["messages"] = rec.value("messages", 0LL) + messages;
+                rec["input_chars"] = rec.value("input_chars", 0LL) + input_chars;
+                rec["output_chars"] = rec.value("output_chars", 0LL) + output_chars;
+                if (input_tokens)
+                    rec["input_tokens"] = rec.value("input_tokens", 0LL) + *input_tokens;
+                if (output_tokens)
+                    rec["output_tokens"] = rec.value("output_tokens", 0LL) + *output_tokens;
+            };
+            auto &sess = j["sessions"][session_id];
+            if (!sess.is_object())
+                sess = nlohmann::json::object();
+            sess["model"] = model;
+            bump(sess);
+            auto &m = j["models"][model];
+            if (!m.is_object())
+                m = nlohmann::json::object();
+            bump(m);
+            save(j);
+        }
+        static std::string fmt(const nlohmann::json &rec)
+        {
+            return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={}",
+                               rec.value("requests", 0LL), rec.value("messages", 0LL),
+                               rec.value("input_chars", 0LL), rec.value("output_chars", 0LL),
+                               rec.value("input_tokens", 0LL), rec.value("output_tokens", 0LL));
+        }
+        static std::string summarize()
+        {
+            nlohmann::json j = load();
+            std::string out = "usage statistics (.cell/usages.json)\n\nper model:\n";
+            if (j["models"].empty())
+                out += "  (none)\n";
+            for (auto &[k, v] : j["models"].items())
+                out += std::format("  {}  {}\n", k, fmt(v));
+            out += "\nper session:\n";
+            if (j["sessions"].empty())
+                out += "  (none)\n";
+            for (auto &[k, v] : j["sessions"].items())
+                out += std::format("  {}  model={}  {}\n", k, v.value("model", "?"), fmt(v));
+            return out;
+        }
+    } // namespace stats
 } // namespace cell
 
 static void print_usage(const char *prog)
 {
     cell::sys::println("usage: {} [options]", prog);
-    cell::sys::println("  --provider openai|anthropic  llm provider (default: openai)");
-    cell::sys::println("  --base URL                   api base url");
-    cell::sys::println("  --model MODEL                model name");
+    cell::sys::println("  --provider openai|anthropic  default llm provider");
+    cell::sys::println("  --base URL                   api base url for the default model");
+    cell::sys::println("  --model MODEL                default model name");
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session");
     cell::sys::println("  --system TEXT                system prompt");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --selftest                   run internal self tests");
+}
+
+static void print_help()
+{
+    cell::sys::println("commands:");
+    cell::sys::println("  /models                     list configured models");
+    cell::sys::println("  /model NAME                 switch to a configured model (NAME or provider:NAME)");
+    cell::sys::println("  /model provider:NAME base:URL key:KEY   add/update a model");
+    cell::sys::println("      e.g. /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx");
+    cell::sys::println("  /sessions                   list saved sessions");
+    cell::sys::println("  /usages                     show per-model and per-session usage statistics");
+    cell::sys::println("  /compact                    compress the current session context");
+    cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
+    cell::sys::println("  /skill NAME                 load a skill into the session");
+    cell::sys::println("  /save                       save the current session");
+    cell::sys::println("  /new                        start a fresh session");
+    cell::sys::println("  /exit | /quit               exit");
 }
 
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic)
@@ -1802,13 +2167,65 @@ static int run_selftest()
     expect(vault_file.find("keep-me") == std::string::npos, "vault stores ciphertext only");
 
     cell::config::settings cfg;
-    cfg.provider = "anthropic";
-    cfg.model = "test-model";
-    expect(cell::config::save(cfg), "config::save");
+    cell::config::model_entry a;
+    a.provider = "openai";
+    a.base = "http://x/v1";
+    a.model = "m1";
+    a.key_id = "k1";
+    cell::config::model_entry b;
+    b.provider = "anthropic";
+    b.base = "http://y";
+    b.model = "m2";
+    cfg.models = {a, b};
+    cfg.current = 1;
+    cfg.system_prompt = "sys";
+    expect(cell::config::save(cfg), "config::save multi-model");
     auto cfg_res = cell::config::load();
-    expect(cfg_res.has_value() && cfg_res->provider == "anthropic" && cfg_res->model == "test-model", "config::load roundtrip");
+    expect(cfg_res.has_value() && cfg_res->models.size() == 2, "config::load multi-model");
+    expect(cfg_res.has_value() && cfg_res->current == 1 && cfg_res->current_entry()->model == "m2", "config current entry");
+    expect(cfg_res.has_value() && cfg_res->models[0].label() == "openai:m1", "config model label");
+    expect(cell::config::find(*cfg_res, "m1") == 0 && cell::config::find(*cfg_res, "m2", "anthropic") == 1 && cell::config::find(*cfg_res, "nope") == -1, "config::find");
+    cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
+    auto legacy_res = cell::config::load();
+    expect(legacy_res.has_value() && legacy_res->models.size() == 1 && legacy_res->models[0].provider == "anthropic" && legacy_res->models[0].model == "legacy", "config legacy flat load");
+    expect(legacy_res.has_value() && legacy_res->session_id == "s1", "config legacy session");
     cell::box::write((cell::root / "config.json").string(), "{invalid");
     expect(!cell::config::load().has_value(), "config::load reports parse error");
+
+    expect(vault.set("overwrite_key", "v1") && vault.get("overwrite_key") == "v1", "crypt::set new");
+    expect(vault.set("overwrite_key", "v2") && vault.get("overwrite_key") == "v2", "crypt::set overwrite");
+    expect(vault.has("overwrite_key") && !vault.has("missing_key"), "crypt::has");
+
+    expect(cell::box::mkdir((cell::root / "skills").string()), "skills dir");
+    std::string skill_md = "---\nname: build-helper\ndescription: helpers for building cell\n---\n# Build Helper\nfull body instructions\n";
+    expect(cell::box::write((cell::root / "skills" / "build-helper.md").string(), skill_md), "skill file");
+    expect(cell::box::write((cell::root / "skills" / "plain.md").string(), "First line is the description.\nrest of body\n"), "skill plain file");
+    auto skills = cell::skills::list();
+    expect(skills.size() == 2, "skills::list");
+    const cell::skills::skill *found = nullptr;
+    for (auto &sk : skills)
+        if (sk.name == "build-helper")
+            found = &sk;
+    expect(found && found->description.find("helpers for building cell") != std::string::npos, "skill metadata parse");
+    bool plain_ok = false;
+    for (auto &sk : skills)
+        if (sk.name == "plain")
+            plain_ok = sk.description.find("First line") != std::string::npos;
+    expect(plain_ok, "skill fallback name+first line");
+    std::string skill_body;
+    expect(cell::skills::content(*found, skill_body) && skill_body.find("# Build Helper") != std::string::npos && skill_body.find("---") == std::string::npos, "skill content strips front matter");
+    std::string meta = cell::skills::metadata_prompt(skills);
+    expect(meta.find("build-helper") != std::string::npos && meta.find("plain") != std::string::npos, "skill metadata prompt");
+
+    cell::stats::add("sess-A", "openai:gpt-4o", 100, 50, 10, 5, 2);
+    cell::stats::add("sess-A", "openai:gpt-4o", 50, 20, std::nullopt, std::nullopt, 1);
+    cell::stats::add("sess-B", "anthropic:claude-x", 30, 10, 3, 1, 1);
+    auto stats_json = cell::stats::load();
+    expect(stats_json["models"]["openai:gpt-4o"].value("requests", 0LL) == 2, "stats per-model requests");
+    expect(stats_json["models"]["openai:gpt-4o"].value("input_chars", 0LL) == 150, "stats per-model input_chars");
+    expect(stats_json["sessions"]["sess-A"].value("messages", 0LL) == 3, "stats per-session messages");
+    expect(stats_json["models"]["anthropic:claude-x"].value("input_tokens", 0LL) == 3, "stats tokens");
+    expect(cell::stats::summarize().find("openai:gpt-4o") != std::string::npos, "stats summarize");
 
     cell::sys::logger::instance().close();
     std::filesystem::remove_all(cell::root, ec);
@@ -1821,7 +2238,9 @@ int main(int argc, char const *argv[])
 {
     // args parse
     bool selftest = false;
+    bool no_color = false;
     std::string key_arg;
+    std::string provider_arg, base_arg, model_arg;
     cell::config::settings cfg;
     if (auto res = cell::config::load(); res)
         cfg = *res;
@@ -1842,11 +2261,11 @@ int main(int argc, char const *argv[])
             return argv[++i];
         };
         if (arg == "--provider")
-            cfg.provider = value("--provider");
+            provider_arg = value("--provider");
         else if (arg == "--base")
-            cfg.base = value("--base");
+            base_arg = value("--base");
         else if (arg == "--model")
-            cfg.model = value("--model");
+            model_arg = value("--model");
         else if (arg == "--key")
             key_arg = value("--key");
         else if (arg == "--session")
@@ -1854,7 +2273,7 @@ int main(int argc, char const *argv[])
         else if (arg == "--system")
             cfg.system_prompt = value("--system");
         else if (arg == "--no-color")
-            cell::sys::detail::color_force = false;
+            no_color = true;
         else if (arg == "--selftest")
             selftest = true;
         else
@@ -1864,66 +2283,304 @@ int main(int argc, char const *argv[])
             return 1;
         }
     }
+    cell::sys::detail::color_force = !no_color;
     cell::sys::detail::init_console();
     cell::sys::install_handlers();
     if (selftest)
         return run_selftest();
 
-    if (cfg.provider != "openai" && cfg.provider != "anthropic")
-    {
-        cell::sys::error("unsupported provider: {}", cfg.provider);
-        return 1;
-    }
-    if (cfg.base.empty())
-        cfg.base = (cfg.provider == "openai") ? "https://api.openai.com/v1" : "https://api.anthropic.com";
-    if (cfg.model.empty())
-        cfg.model = (cfg.provider == "openai") ? "gpt-4o-mini" : "claude-3-5-haiku-latest";
-
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int sodium_rc = sodium_init(); (void)sodium_rc;
-
-    auto &log = cell::sys::logger::instance();
-    log.info(std::format("cell started, provider={}, model={}", cfg.provider, cfg.model));
-
     cell::encrypt::crypt vault;
-    cell::encrypt::secure_string api_key;
+    auto &log = cell::sys::logger::instance();
+
+    // make sure at least the default models exist (first entry is the default)
+    if (cfg.empty())
+        cfg = cell::config::defaults();
+    // apply CLI overrides onto the current model entry
+    if (!provider_arg.empty() || !model_arg.empty() || !base_arg.empty())
+    {
+        if (cell::config::model_entry *e = cfg.current_entry(); e)
+        {
+            if (!provider_arg.empty())
+                e->provider = provider_arg;
+            if (!model_arg.empty())
+                e->model = model_arg;
+            if (!base_arg.empty())
+                e->base = base_arg;
+        }
+        else
+        {
+            cell::config::model_entry ne;
+            ne.provider = provider_arg.empty() ? "openai" : provider_arg;
+            ne.model = model_arg;
+            ne.base = base_arg;
+            cfg.models.push_back(std::move(ne));
+            cfg.current = cfg.models.size() - 1;
+        }
+    }
     if (!key_arg.empty())
     {
-        api_key = cell::encrypt::secure_string(key_arg);
-        vault.add("api_key", api_key);
+        std::string kid = "model:" + (cfg.current_entry() ? cfg.current_entry()->label() : "default");
+        if (cell::config::model_entry *e = cfg.current_entry(); e)
+            e->key_id = kid;
+        vault.set(kid, key_arg);
         sodium_memzero(key_arg.data(), key_arg.size());
     }
-    else
+    log.info(std::format("cell started, {} model(s) configured", cfg.models.size()));
+
+    // tool definitions for both API styles
+    auto tools_o = build_tools(false);
+    auto tools_a = build_tools(true);
+    auto &tool_list = tools_o.first;
+    const nlohmann::json &tool_defs_openai = tools_o.second;
+    const nlohmann::json &tool_defs_anthropic = tools_a.second;
+
+    // per-(provider, base) client cache
+    struct client_cache
     {
-        const char *env = std::getenv(cfg.provider == "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY");
+        std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAI>> openai;
+        std::unordered_map<std::string, std::unique_ptr<cell::llm::Anthropic>> anthropic;
+        cell::llm::OpenAI &o(const std::string &base)
+        {
+            auto &p = openai[base];
+            if (!p)
+                p = std::make_unique<cell::llm::OpenAI>(base);
+            return *p;
+        }
+        cell::llm::Anthropic &a(const std::string &base)
+        {
+            auto &p = anthropic[base];
+            if (!p)
+                p = std::make_unique<cell::llm::Anthropic>(base);
+            return *p;
+        }
+    } cache;
+
+    auto resolve_key = [&](const cell::config::model_entry &e) -> cell::encrypt::secure_string
+    {
+        if (!e.key_id.empty())
+        {
+            auto k = vault.get(e.key_id);
+            if (!k.empty())
+                return k;
+        }
+        const char *env = std::getenv(e.provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
         if (env && *env)
-            api_key = cell::encrypt::secure_string(env);
-        else
-            api_key = vault.get("api_key");
-    }
-    if (api_key.empty())
+            return cell::encrypt::secure_string(env);
+        return vault.get("api_key");
+    };
+
+    // unified request dispatch: picks the right client + tool schema for any model entry
+    auto do_chat = [&](const cell::config::model_entry &e, const cell::encrypt::secure_string &key,
+                       const nlohmann::json &msgs, bool stream, cell::net::StreamCallback on_tok,
+                       nlohmann::json &reply, nlohmann::json &tc, nlohmann::json &usage) -> bool
     {
-        cell::sys::error("no api key: set the {} environment variable, or store one in the vault (.cell/.crypt)",
-                         cfg.provider == "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY");
-        return 1;
-    }
+        bool ap = e.provider == "anthropic";
+        const nlohmann::json &tools = ap ? tool_defs_anthropic : tool_defs_openai;
+        if (ap)
+        {
+            if (stream)
+                return cache.a(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage);
+            return cache.a(e.base).chat(key, e.model, msgs, tools, reply, tc, usage);
+        }
+        if (stream)
+            return cache.o(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage);
+        return cache.o(e.base).chat(key, e.model, msgs, tools, reply, tc, usage);
+    };
 
-    auto [tool_list, tool_defs] = build_tools(cfg.provider == "anthropic");
+    auto on_token = [](std::span<const char> data)
+    {
+        std::fwrite(data.data(), 1, data.size(), stdout);
+        std::fflush(stdout);
+    };
 
-    std::unique_ptr<cell::llm::OpenAI> openai;
-    std::unique_ptr<cell::llm::Anthropic> anthropic;
-    if (cfg.provider == "openai")
-        openai = std::make_unique<cell::llm::OpenAI>(cfg.base);
-    else
-        anthropic = std::make_unique<cell::llm::Anthropic>(cfg.base);
+    auto content_chars = [](const nlohmann::json &msgs) -> long long
+    {
+        long long n = 0;
+        for (auto &m : msgs)
+        {
+            auto it = m.find("content");
+            if (it == m.end())
+                continue;
+            if (it->is_string())
+                n += (long long)it->get_ref<const std::string &>().size();
+            else if (it->is_array())
+                n += (long long)it->dump().size();
+        }
+        return n;
+    };
+    auto reply_text = [](const nlohmann::json &reply) -> std::string
+    {
+        auto it = reply.find("content");
+        if (it == reply.end())
+            return "";
+        if (it->is_string())
+            return it->get<std::string>();
+        if (it->is_array())
+        {
+            std::string t;
+            for (auto &b : *it)
+                if (b.value("type", "") == "text" && b.contains("text"))
+                    t += b["text"].get<std::string>();
+            return t;
+        }
+        return "";
+    };
+    auto reply_text_len = [&](const nlohmann::json &reply) -> long long
+    {
+        return (long long)reply_text(reply).size();
+    };
+    auto usage_in = [](const nlohmann::json &u) -> std::optional<long long>
+    {
+        if (u.is_object())
+        {
+            if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                return u["prompt_tokens"].get<long long>();
+            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                return u["input_tokens"].get<long long>();
+        }
+        return std::nullopt;
+    };
+    auto usage_out = [](const nlohmann::json &u) -> std::optional<long long>
+    {
+        if (u.is_object())
+        {
+            if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
+                return u["completion_tokens"].get<long long>();
+            if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
+                return u["output_tokens"].get<long long>();
+        }
+        return std::nullopt;
+    };
 
+    // session + skills prompt injection
     cell::chat::history h;
     if (!cfg.session_id.empty())
         h.use(cfg.session_id);
     cell::chat::session *s = &h.now();
-    if (s->msg().empty())
-        s->msg().push_back({{"role", "system"}, {"content", cfg.system_prompt}});
-    cell::sys::println("cell: session={} provider={} model={}", s->id(), cfg.provider, cfg.model);
+    auto skills_all = cell::skills::list();
+    std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
+    auto ensure_prompt = [&](cell::chat::session *sess)
+    {
+        if (!sess->msg().empty())
+            return;
+        sess->msg().push_back({{"role", "system"}, {"content", cfg.system_prompt}});
+        if (!skills_prompt.empty())
+            sess->msg().push_back({{"role", "system"}, {"content", skills_prompt}});
+    };
+    ensure_prompt(s);
+    cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
+
+    auto list_models = [&]()
+    {
+        if (cfg.models.empty())
+        {
+            cell::sys::println("  (no models configured)");
+            return;
+        }
+        for (size_t i = 0; i < cfg.models.size(); i++)
+        {
+            auto &e = cfg.models[i];
+            cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
+            if (!e.base.empty())
+                cell::sys::println("       base: {}", e.base);
+            if (!e.key_id.empty())
+                cell::sys::println("       key:  stored");
+        }
+    };
+
+    // context compaction: keep system messages + head/tail, summarize the middle via the llm
+    auto compact = [&](cell::chat::session *sess) -> std::string
+    {
+        auto &msgs = sess->msg();
+        nlohmann::json sys = nlohmann::json::array();
+        nlohmann::json rest = nlohmann::json::array();
+        for (auto &m : msgs)
+        {
+            if (m.value("role", "") == "system")
+                sys.push_back(m);
+            else
+                rest.push_back(m);
+        }
+        if (rest.size() <= 12)
+            return std::format("context already small ({} non-system messages)", rest.size());
+        const size_t head_n = 2, tail_n = 6;
+        nlohmann::json keep_head(rest.begin(), rest.begin() + (ptrdiff_t)head_n);
+        nlohmann::json keep_tail(rest.end() - (ptrdiff_t)tail_n, rest.end());
+        nlohmann::json middle(rest.begin() + (ptrdiff_t)head_n, rest.end() - (ptrdiff_t)tail_n);
+        std::string mid_text;
+        for (auto &m : middle)
+        {
+            std::string role = m.value("role", "");
+            if (role == "tool")
+                continue;
+            std::string body;
+            auto it = m.find("content");
+            if (it != m.end())
+            {
+                if (it->is_string())
+                    body = it->get<std::string>();
+                else if (it->is_array())
+                    for (auto &b : *it)
+                        body += b.dump() + "\n";
+            }
+            if (body.size() > 400)
+                body = body.substr(0, 400) + "...";
+            mid_text += std::format("{}: {}\n", role, body);
+        }
+        std::string summary = "(llm summarization unavailable; messages truncated)";
+        if (const cell::config::model_entry *e = cfg.current_entry(); e)
+        {
+            cell::encrypt::secure_string key = resolve_key(*e);
+            if (!key.empty())
+            {
+                nlohmann::json prompt = nlohmann::json::array();
+                prompt.push_back({{"role", "user"},
+                                  {"content", std::format("Summarize the following removed part of a coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
+                nlohmann::json reply, tc, usage;
+                if (do_chat(*e, key, prompt, false, on_token, reply, tc, usage))
+                {
+                    summary = reply_text(reply);
+                    if (summary.empty())
+                        summary = "(empty summary)";
+                    cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), 0);
+                }
+            }
+        }
+        // rebuild kept messages as plain text to avoid orphaned tool_call_ids
+        auto plain = [](const nlohmann::json &m) -> nlohmann::json
+        {
+            nlohmann::json out;
+            out["role"] = m.value("role", "");
+            auto it = m.find("content");
+            if (it != m.end() && it->is_string())
+                out["content"] = *it;
+            else if (it != m.end() && it->is_array())
+            {
+                std::string t;
+                for (auto &b : *it)
+                    if (b.value("type", "") == "text" && b.contains("text"))
+                        t += b["text"].get<std::string>();
+                out["content"] = t;
+            }
+            else
+                out["content"] = "";
+            return out;
+        };
+        nlohmann::json new_msgs = nlohmann::json::array();
+        for (auto &m : sys)
+            new_msgs.push_back(m);
+        new_msgs.push_back({{"role", "system"},
+                            {"content", std::format("The middle part of this conversation was removed for length. Summary of the removed part:\n{}", summary)}});
+        for (auto &m : keep_head)
+            new_msgs.push_back(plain(m));
+        for (auto &m : keep_tail)
+            new_msgs.push_back(plain(m));
+        size_t removed = middle.size();
+        msgs = new_msgs;
+        return std::format("context compacted: removed {} message(s), {} remain", removed, new_msgs.size());
+    };
 
     bool interactive = true;
 #ifdef _WIN32
@@ -1938,12 +2595,6 @@ int main(int argc, char const *argv[])
         while (std::getline(std::cin, line))
             pending += line + "\n";
     }
-
-    auto on_token = [](std::span<const char> data)
-    {
-        std::fwrite(data.data(), 1, data.size(), stdout);
-        std::fflush(stdout);
-    };
 
     // agent loop
     try
@@ -1965,23 +2616,248 @@ int main(int argc, char const *argv[])
                 if (input.empty())
                     break;
             }
+            if (input.size() >= 3 && (unsigned char)input[0] == 0xEF && (unsigned char)input[1] == 0xBB && (unsigned char)input[2] == 0xBF)
+                input.erase(0, 3);
             if (input.empty())
                 continue;
-            if (input == "/exit" || input == "/quit")
-                break;
-            if (input == "/save")
+
+            if (input[0] == '/')
             {
-                s->unload();
-                cell::sys::println("session saved: {}", s->id());
-                continue;
-            }
-            if (input == "/new")
-            {
-                std::string old_id = s->id();
-                h.remove(old_id);
-                s = &h.now();
-                s->msg().push_back({{"role", "system"}, {"content", cfg.system_prompt}});
-                cell::sys::println("new session: {}", s->id());
+                std::vector<std::string> toks;
+                {
+                    std::istringstream ss(input);
+                    std::string t;
+                    while (ss >> t)
+                        toks.push_back(t);
+                }
+                std::string cmd = toks.empty() ? "" : toks[0];
+                if (cmd == "/exit" || cmd == "/quit")
+                    break;
+                if (cmd == "/help")
+                {
+                    print_help();
+                    continue;
+                }
+                if (cmd == "/save")
+                {
+                    s->unload();
+                    cell::sys::println("session saved: {}", s->id());
+                    continue;
+                }
+                if (cmd == "/new")
+                {
+                    std::string old_id = s->id();
+                    h.remove(old_id);
+                    s = &h.now();
+                    ensure_prompt(s);
+                    cell::sys::println("new session: {}", s->id());
+                    continue;
+                }
+                if (cmd == "/models")
+                {
+                    list_models();
+                    continue;
+                }
+                if (cmd == "/model")
+                {
+                    if (toks.size() < 2)
+                    {
+                        list_models();
+                        continue;
+                    }
+                    std::string target = toks[1];
+                    std::string p, m;
+                    bool spaced_form = false;
+                    size_t colon = target.find(':');
+                    if (colon != std::string::npos && colon != 0 && colon + 1 < target.size())
+                    {
+                        // "provider:model" in one token, e.g. anthropic:claude-opus4.8
+                        p = target.substr(0, colon);
+                        m = target.substr(colon + 1);
+                    }
+                    else if (colon != std::string::npos && colon != 0 && colon + 1 == target.size())
+                    {
+                        // tolerant spaced form "provider: model" (any number of separating spaces)
+                        if (toks.size() < 3)
+                        {
+                            cell::sys::error("missing model name after '{}'", target);
+                            continue;
+                        }
+                        p = target.substr(0, colon);
+                        m = toks[2];
+                        toks.erase(toks.begin() + 2);
+                        spaced_form = true;
+                    }
+                    else
+                    {
+                        m = target;
+                        p = cfg.current_entry() ? cfg.current_entry()->provider : "openai";
+                    }
+                    std::string new_base, new_key;
+                    bool has_opts = false;
+                    for (size_t i = 2; i < toks.size(); i++)
+                    {
+                        auto &t = toks[i];
+                        if (t.rfind("base:", 0) == 0)
+                        {
+                            new_base = t.substr(5);
+                            has_opts = true;
+                        }
+                        else if (t.rfind("key:", 0) == 0)
+                        {
+                            new_key = t.substr(4);
+                            has_opts = true;
+                        }
+                        else
+                            cell::sys::warn("ignoring token: {}", t);
+                    }
+                    if (has_opts)
+                    {
+                        // add or update a model
+                        int idx = cell::config::find(cfg, m, p);
+                        if (idx < 0)
+                        {
+                            cell::config::model_entry e;
+                            e.provider = p;
+                            e.model = m;
+                            e.base = new_base;
+                            cfg.models.push_back(std::move(e));
+                            idx = (int)cfg.models.size() - 1;
+                        }
+                        else if (!new_base.empty())
+                        {
+                            cfg.models[idx].base = new_base;
+                        }
+                        if (!new_key.empty())
+                        {
+                            std::string kid = "model:" + cfg.models[idx].label();
+                            vault.set(kid, new_key);
+                            sodium_memzero(new_key.data(), new_key.size());
+                            cfg.models[idx].key_id = kid;
+                        }
+                        cfg.current = (size_t)idx;
+                        cell::config::save(cfg);
+                        auto &reg = cfg.models[idx];
+                        cell::sys::println("model registered: {}", reg.label());
+                        cell::sys::println("       provider: {}", reg.provider);
+                        cell::sys::println("       model:    {}", reg.model);
+                        cell::sys::println("       base:     {}", reg.base.empty() ? "(default)" : reg.base);
+                        cell::sys::println("       key:      {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                        if (spaced_form)
+                            cell::sys::println("note: spaced form used; the registered model name is \"{}\", not \" {}\"", reg.model, reg.model);
+                        continue;
+                    }
+                    int idx = cell::config::find(cfg, m, p);
+                    if (idx < 0)
+                    {
+                        cell::sys::error("model not found: {} (use /model to add)", target);
+                        continue;
+                    }
+                    cfg.current = (size_t)idx;
+                    cell::config::save(cfg);
+                    cell::sys::println("switched to {}", cfg.models[idx].label());
+                    continue;
+                }
+                if (cmd == "/sessions")
+                {
+                    std::error_code ec;
+                    std::filesystem::path dir = cell::root / "sessions";
+                    bool any = false;
+                    if (std::filesystem::exists(dir, ec))
+                    {
+                        for (auto &entry : std::filesystem::directory_iterator(dir, ec))
+                        {
+                            if (ec)
+                                break;
+                            if (!entry.is_regular_file(ec))
+                                continue;
+                            if (entry.path().extension() != ".json")
+                                continue;
+                            any = true;
+                            std::string sid = entry.path().stem().string();
+                            std::string marker = (sid == s->id()) ? " *" : "";
+                            long long count = 0;
+                            std::string snippet;
+                            try
+                            {
+                                std::ifstream f(entry.path());
+                                auto j = nlohmann::json::parse(f, nullptr, false);
+                                if (j.contains("messages") && j["messages"].is_array())
+                                {
+                                    count = (long long)j["messages"].size();
+                                    for (auto &m : j["messages"])
+                                    {
+                                        if (m.value("role", "") == "user" && m.contains("content") && m["content"].is_string())
+                                        {
+                                            snippet = m["content"].get<std::string>();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            if (snippet.size() > 60)
+                                snippet = snippet.substr(0, 57) + "...";
+                            cell::sys::println("  {}{}  messages={}{}", sid, marker, count, snippet.empty() ? "" : "  \"" + snippet + "\"");
+                        }
+                    }
+                    if (!any)
+                        cell::sys::println("  (no sessions)");
+                    continue;
+                }
+                if (cmd == "/usages")
+                {
+                    cell::sys::println("{}", cell::stats::summarize());
+                    continue;
+                }
+                if (cmd == "/compact")
+                {
+                    cell::sys::println("{}", compact(s));
+                    s->unload();
+                    cell::config::save(cfg);
+                    continue;
+                }
+                if (cmd == "/skills")
+                {
+                    auto all = cell::skills::list();
+                    if (all.empty())
+                    {
+                        cell::sys::println("  (no skills in {})", (cell::root / "skills").string());
+                        continue;
+                    }
+                    for (auto &sk : all)
+                        cell::sys::println("  {}{}", sk.name, sk.description.empty() ? "" : ": " + sk.description);
+                    continue;
+                }
+                if (cmd == "/skill")
+                {
+                    if (toks.size() < 2)
+                    {
+                        cell::sys::error("usage: /skill NAME");
+                        continue;
+                    }
+                    auto all = cell::skills::list();
+                    const cell::skills::skill *sk = cell::skills::find(all, toks[1]);
+                    if (!sk)
+                    {
+                        cell::sys::error("skill not found: {}", toks[1]);
+                        continue;
+                    }
+                    std::string body;
+                    if (!cell::skills::content(*sk, body))
+                    {
+                        cell::sys::error("failed to read skill: {}", toks[1]);
+                        continue;
+                    }
+                    s->msg().push_back({{"role", "system"},
+                                        {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sk->name, body)}});
+                    s->unload();
+                    cell::sys::println("skill loaded: {} ({} chars)", sk->name, body.size());
+                    continue;
+                }
+                cell::sys::error("unknown command: {} (try /help)", cmd);
                 continue;
             }
 
@@ -1993,21 +2869,35 @@ int main(int argc, char const *argv[])
             int rounds = 0;
             while (!done && rounds++ < 8)
             {
-                nlohmann::json reply;
-                nlohmann::json tool_calls = nlohmann::json::array();
-                bool ok = false;
-                if (cfg.provider == "openai")
-                    ok = openai->chat_stream(api_key, cfg.model, s->msg(), tool_defs, on_token, reply, tool_calls);
-                else
-                    ok = anthropic->chat_stream(api_key, cfg.model, s->msg(), tool_defs, on_token, reply, tool_calls);
+                const cell::config::model_entry *e = cfg.current_entry();
+                if (!e)
+                {
+                    cell::sys::error("no model configured");
+                    done = true;
+                    break;
+                }
+                cell::encrypt::secure_string key = resolve_key(*e);
+                if (key.empty())
+                {
+                    cell::sys::error("no api key for {}: set the {} env var, or use /model {} base:URL key:KEY",
+                                     e->label(), e->provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", e->label());
+                    done = true;
+                    break;
+                }
+                size_t before = s->msg().size();
+                long long in_chars = content_chars(s->msg());
+                nlohmann::json reply, tool_calls, usage;
+                bool ok = do_chat(*e, key, s->msg(), true, on_token, reply, tool_calls, usage);
                 if (!ok)
                 {
                     log.error("llm request failed");
                     cell::sys::println();
                     cell::sys::error("[llm request failed]");
+                    done = true;
                     break;
                 }
                 cell::sys::println();
+                long long out_chars = reply_text_len(reply);
                 s->msg().push_back(reply);
                 if (!tool_calls.empty())
                 {
@@ -2028,14 +2918,16 @@ int main(int argc, char const *argv[])
                                 output = "[tool denied or failed]";
                         }
                         log.info(std::format("tool {} -> {}", name, output.substr(0, 200)));
-                        if (cfg.provider == "openai")
+                        if (e->provider == "openai")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", output}});
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", output}}})}});
                     }
+                    cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), (long long)(s->msg().size() - before));
                     continue;
                 }
                 done = true;
+                cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), (long long)(s->msg().size() - before));
             }
             s->unload();
             cfg.session_id = s->id();
