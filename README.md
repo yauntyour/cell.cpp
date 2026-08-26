@@ -75,6 +75,7 @@ usage: cell [options]
   --provider openai|anthropic  llm provider (default: openai)
   --base URL                   api base url for the default model
   --model MODEL                default model name
+  --proxy URL                  http(s) proxy for the default model
   --key KEY                    api key (saved to the encrypted vault)
   --session ID                 resume an existing session
   --system TEXT                system prompt
@@ -90,6 +91,7 @@ usage: cell [options]
 | `--provider` | `openai` \| `anthropic` | `openai` | LLM provider, selects the API protocol and endpoint style |
 | `--base` | URL | see below | API base URL — works with the official APIs or any OpenAI-compatible gateway |
 | `--model` | model name string | see below | Model name, e.g. `gpt-4o-mini`, `claude-3-5-haiku-latest` |
+| `--proxy` | URL | none | HTTP(S) proxy for the current model, e.g. `http://user:pass@proxy:8080`; localhost/loopback traffic always bypasses it |
 | `--key` | API key | none | Never stored in plaintext — encrypted with libsodium into `.cell/.crypt` |
 | `--session` | session ID | last used session | Resumes chat history from `.cell/sessions/<ID>.json` |
 | `--system` | prompt text | built-in coding-agent prompt | Replaces the system prompt entirely |
@@ -105,7 +107,7 @@ At startup the final configuration is assembled as follows:
 2. If no models are configured, two defaults are generated:
    - `[0] openai:gpt-4o-mini` (base: `https://api.openai.com/v1`)
    - `[1] anthropic:claude-3-5-haiku-latest` (base: `https://api.anthropic.com`)
-3. `--provider` / `--base` / `--model` are applied **in place onto the current model entry** (only non-empty fields are changed);
+3. `--provider` / `--base` / `--model` / `--proxy` are applied **in place onto the current model entry** (only non-empty fields are changed);
 4. `--key` is written to the encrypted vault and bound to the current entry; `--session` / `--system` directly replace the corresponding fields.
 
 > Note: CLI overrides happen after the config is loaded, and the merged result is **written back** to
@@ -114,9 +116,9 @@ At startup the final configuration is assembled as follows:
 
 #### 1.3 Option Details
 
-**`--provider` / `--base` / `--model`**
+**`--provider` / `--base` / `--model` / `--proxy`**
 
-All three modify the *current model entry* (the item `current_model` points to in `config.json`,
+All four modify the *current model entry* (the item `current_model` points to in `config.json`,
 entry 0 by default). You don't need to pass all of them — for example, switching only the protocol:
 
 ```bash
@@ -128,6 +130,13 @@ Use `--base` to target third-party OpenAI-compatible services:
 ```bash
 # local Ollama / vLLM / One-API etc.
 cell.exe --base http://localhost:11434/v1 --model qwen2.5-coder
+```
+
+Use `--proxy` to route API traffic through an HTTP(S) proxy (credentials may be embedded in the
+URL); `localhost`, `127.0.0.1` and `::1` are always excluded:
+
+```bash
+cell.exe --proxy http://user:pass@proxy.example.com:8080
 ```
 
 If an entry's base is empty, OpenAI defaults to `https://api.openai.com/v1` and Anthropic defaults
@@ -207,7 +216,7 @@ sent to the model.
 |---------|-------------|
 | `/help` | Show all commands |
 | `/models` | List configured models (entry 0 is the default) |
-| `/model [provider:NAME] [base:URL] [key:KEY]` | Switch models; with `base:`/`key:` it registers/updates instead |
+| `/model [provider:NAME] [base:URL] [key:KEY] [proxy:URL]` | Switch models; with `base:`/`key:`/`proxy:` it registers/updates instead |
 | `/sessions` | List saved sessions |
 | `/session ID` | Switch to another saved session |
 | `/usages` | Show per-model and per-session usage statistics |
@@ -225,6 +234,7 @@ Example output:
 ```
   [0] openai:gpt-4o-mini  <current>
        base: https://api.openai.com/v1
+       proxy: http://user:pass@proxy:8080
        key:  stored
   [1] anthropic:claude-3-5-haiku-latest
        base: https://api.anthropic.com
@@ -232,7 +242,8 @@ Example output:
 
 The number in brackets is the index (i.e. `current_model`); `<current>` marks the active model.
 `key: stored` means a vault key is bound to that model — otherwise resolution falls back to the
-environment variable or the generic `api_key`.
+environment variable or the generic `api_key`. A `proxy:` line means API traffic for that model is
+routed through the given HTTP(S) proxy; without one, libcurl's default (environment) settings apply.
 
 #### 2.3 `/model` — Switch / Register Models
 
@@ -254,13 +265,14 @@ Carrying `base:` or `key:` (either one) switches to register mode:
 ```
 /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-ant-xxx
 /model openai:gpt-4o base:https://your-proxy.example.com/v1
+/model openai:gpt-4o proxy:http://user:pass@proxy:8080
 ```
 
 Behavior details:
 
 - If the label `provider:model` doesn't exist → a new entry is appended and made current;
 - If it exists → only explicitly provided fields are updated (base changes only when `base:` is
-  given; an empty `key:` does not clear the old secret);
+  given; an empty `key:` does not clear the old secret; `proxy:` similarly only updates when given);
 - `key:KEY` is stored encrypted in the vault under `model:<provider>:<model>`;
 - The result is written back to `.cell/config.json` immediately — no `/save` needed.
 
@@ -388,7 +400,7 @@ The tool creates a `.cell/` directory in your working directory:
 
 ```
 .cell/
-├── config.json       # Multi-model config: {"models":[{provider,base,model,key}...], "current_model":N}
+├── config.json       # Multi-model config: {"models":[{provider,base,model,key,proxy}...], "current_model":N}
 ├── .crypt            # Encrypted API key vault
 ├── .key              # Symmetric encryption key
 ├── usages.json       # Per-model and per-session usage statistics

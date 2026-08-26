@@ -21,6 +21,8 @@
 #include <format>
 #include <optional>
 #include <concepts>
+#include <atomic>
+#include <csignal>
 #if defined(__cpp_lib_generator)
 #include <generator>
 #endif
@@ -47,6 +49,23 @@
 namespace cell
 {
     std::filesystem::path root = ".cell";
+    namespace text
+    {
+        // split text into lines, stripping a trailing '\r' from each line
+        static std::vector<std::string> split_lines(std::string_view text)
+        {
+            std::vector<std::string> out;
+            std::istringstream ss{std::string(text)};
+            std::string line;
+            while (std::getline(ss, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                out.push_back(std::move(line));
+            }
+            return out;
+        }
+    } // namespace text
     namespace box
     {
         // convert a string to lowercase (ASCII only, for case-insensitive matching)
@@ -227,34 +246,15 @@ namespace cell
         // edit a text file by line: op = query | insert | delete | replace, args = JSON string
         bool edit(std::string_view path, std::string_view op, std::string_view args, std::string &output)
         {
-            std::vector<std::string> lines;
             bool trailing_nl = false;
+            std::vector<std::string> lines;
             {
                 std::string content;
                 if (!read(path, content))
                     return false;
                 trailing_nl = !content.empty() && content.back() == '\n';
-                std::istringstream ss(content);
-                std::string line;
-                while (std::getline(ss, line))
-                {
-                    if (!line.empty() && line.back() == '\r')
-                        line.pop_back();
-                    lines.push_back(line);
-                }
+                lines = text::split_lines(content);
             }
-            auto split_lines = [](const std::string &text) {
-                std::vector<std::string> out;
-                std::istringstream ss(text);
-                std::string line;
-                while (std::getline(ss, line))
-                {
-                    if (!line.empty() && line.back() == '\r')
-                        line.pop_back();
-                    out.push_back(line);
-                }
-                return out;
-            };
             try
             {
                 auto j = nlohmann::json::parse(args, nullptr, false);
@@ -277,7 +277,7 @@ namespace cell
                         line = 1;
                     if (line > lines.size() + 1)
                         line = lines.size() + 1;
-                    std::vector<std::string> add = split_lines(j.value("content", ""));
+                    std::vector<std::string> add = text::split_lines(j.value("content", ""));
                     lines.insert(lines.begin() + (long long)(line - 1), add.begin(), add.end());
                     output = std::format("inserted {} line(s) before line {}", add.size(), line);
                 }
@@ -334,7 +334,7 @@ namespace cell
                         }
                         if (end > lines.size())
                             end = lines.size();
-                        std::vector<std::string> rep = split_lines(j.value("content", ""));
+                        std::vector<std::string> rep = text::split_lines(j.value("content", ""));
                         lines.erase(lines.begin() + (long long)(start - 1), lines.begin() + (long long)end);
                         lines.insert(lines.begin() + (long long)(start - 1), rep.begin(), rep.end());
                         output = std::format("replaced lines {}..{} with {} line(s)", start, end, rep.size());
@@ -362,22 +362,32 @@ namespace cell
     } // namespace box
     namespace net
     {
-        void CURL_proxy(CURL *__handle__, const char *proxy, bool ssl = false)
-        {
-            curl_easy_setopt(__handle__, CURLOPT_PROXY, proxy);
-            curl_easy_setopt(__handle__, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
-            if (ssl)
-                curl_easy_setopt(__handle__, CURLOPT_HTTPPROXYTUNNEL, 1L);
-            curl_easy_setopt(__handle__, CURLOPT_PROXYUSERPWD, "user:password");
-            curl_easy_setopt(__handle__, CURLOPT_PROXYAUTH, CURLAUTH_BASIC);
-        }
-
         size_t CURL_WriteCallback(void *contents, size_t size, size_t nmemb, std::string &userp)
         {
             size_t n = size * nmemb;
             if (nmemb != 0 && n / nmemb != size)
                 return 0; // multiplication overflow, abort transfer
             userp.append((char *)contents, n);
+            return n;
+        }
+
+        using StreamCallback = std::function<void(std::span<const char>)>;
+        using XferCallback = int (*)(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
+        size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
+        {
+            StreamCallback *callback = (StreamCallback *)userdata;
+            size_t n = size * nmemb;
+            if (nmemb != 0 && n / nmemb != size)
+                return 0; // multiplication overflow, abort transfer
+            try
+            {
+                (*callback)(std::span<const char>(ptr, n));
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << e.what() << '\n';
+                return 0;
+            }
             return n;
         }
 
@@ -406,253 +416,136 @@ namespace cell
             return "";
         }
 
-        bool CURL_get(CURL *__handle__, const char *URL, std::string &buf, std::string header = "")
+        // RAII wrapper that owns a curl_slist header list (built from spans/containers)
+        class header_list
         {
-            if (!__handle__)
-                return false;
-            curl_easy_reset(__handle__);
-            curl_easy_setopt(__handle__, CURLOPT_URL, URL);
-            curl_easy_setopt(__handle__, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(__handle__, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
-            curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
+        private:
+            struct curl_slist *list_ = nullptr;
 
-            struct curl_slist *headers = nullptr;
-            if (!header.empty())
+        public:
+            header_list() = default;
+            template <typename Range>
+            explicit header_list(const Range &headers)
             {
-                headers = curl_slist_append(headers, header.c_str());
-                curl_easy_setopt(__handle__, CURLOPT_HTTPHEADER, headers);
+                for (const auto &h : headers)
+                    list_ = curl_slist_append(list_, h.c_str());
             }
-
-            CURLcode res = curl_easy_perform(__handle__);
-            if (headers)
-                curl_slist_free_all(headers);
-            if (res != CURLE_OK)
+            header_list(const header_list &) = delete;
+            header_list &operator=(const header_list &) = delete;
+            header_list(header_list &&o) noexcept : list_(o.list_) { o.list_ = nullptr; }
+            header_list &operator=(header_list &&o) noexcept
             {
-                std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
-                return false;
+                if (this != &o)
+                {
+                    if (list_)
+                        curl_slist_free_all(list_);
+                    list_ = o.list_;
+                    o.list_ = nullptr;
+                }
+                return *this;
             }
-            return true;
-        }
+            ~header_list()
+            {
+                if (list_)
+                    curl_slist_free_all(list_);
+            }
+            curl_slist *get() const { return list_; }
+        };
 
-        bool CURL_get(CURL *__handle__, const char *URL, std::string &buf, const std::vector<std::string> &header_list)
+        // shared transport: configures a (reused) curl handle and performs one request.
+        // streaming mode routes bytes through on_token; otherwise they accumulate in out_buf.
+        static bool perform(CURL *curl, const char *url, const char *post_data, curl_off_t post_len,
+                            const char *proxy, std::span<const std::string> headers,
+                            std::string *out_buf, StreamCallback on_token,
+                            XferCallback on_xfer, void *xfer_data, long *http_code, std::string *err)
         {
-            if (!__handle__)
+            if (!curl || !url)
                 return false;
-            curl_easy_reset(__handle__);
-            curl_easy_setopt(__handle__, CURLOPT_URL, URL);
-            curl_easy_setopt(__handle__, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(__handle__, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
-            curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
-
-            struct curl_slist *headers = nullptr;
-            for (auto &header : header_list)
+            curl_easy_reset(curl);
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
+            if (proxy && *proxy)
             {
-                headers = curl_slist_append(headers, header.c_str());
-                curl_easy_setopt(__handle__, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_PROXY, proxy);
+                // tunnel HTTPS targets through the HTTP proxy via CONNECT
+                if (std::string_view(url).starts_with("https://"))
+                    curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1L);
             }
-
-            CURLcode res = curl_easy_perform(__handle__);
-            if (headers)
-                curl_slist_free_all(headers);
-            if (res != CURLE_OK)
+            if (post_data)
             {
-                std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
-                return false;
+                curl_easy_setopt(curl, CURLOPT_POST, 1L);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, post_len);
             }
-            return true;
-        }
-
-        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, std::string header = "", std::string *err = nullptr)
-        {
-            if (!__handle__)
-                return false;
-            curl_easy_reset(__handle__);
-            curl_easy_setopt(__handle__, CURLOPT_URL, URL);
-            curl_easy_setopt(__handle__, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(__handle__, CURLOPT_POST, 1L);
-            curl_easy_setopt(__handle__, CURLOPT_POSTFIELDS, data.c_str());
-            curl_easy_setopt(__handle__, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)data.size());
-
-            struct curl_slist *headers = nullptr;
-            if (!header.empty())
+            if (on_token)
             {
-                headers = curl_slist_append(headers, header.c_str());
-                curl_easy_setopt(__handle__, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &on_token);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+                curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                if (on_xfer)
+                {
+                    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xfer);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, xfer_data);
+                }
+                else
+                {
+                    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, nullptr);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
+                }
             }
-
-            curl_easy_setopt(__handle__, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
-            curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
-
-            CURLcode res = curl_easy_perform(__handle__);
+            else
+            {
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, out_buf);
+            }
+            header_list list(headers);
+            if (list.get())
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list.get());
+            CURLcode res = curl_easy_perform(curl);
             long code = 0;
-            curl_easy_getinfo(__handle__, CURLINFO_RESPONSE_CODE, &code);
-            if (headers)
-                curl_slist_free_all(headers);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            if (http_code)
+                *http_code = code;
             if (res != CURLE_OK)
             {
                 if (err)
                     *err = curl_easy_strerror(res);
                 return false;
             }
-            if (code >= 400)
+            return true;
+        }
+
+        bool CURL_post(CURL *curl, const char *url, const std::string &data, std::string &buf,
+                       const std::vector<std::string> &headers, std::string *err = nullptr, const char *proxy = nullptr)
+        {
+            long code = 0;
+            bool ok = perform(curl, url, data.c_str(), (curl_off_t)data.size(), proxy, headers, &buf,
+                              nullptr, nullptr, nullptr, &code, err);
+            if (ok && code >= 400)
             {
+                ok = false;
                 if (err)
                 {
                     *err = error_message(buf);
                     if (err->empty())
                         *err = std::format("HTTP error {}", code);
                 }
-                return false;
             }
-            return true;
+            return ok;
         }
 
-        bool CURL_post(CURL *__handle__, const char *URL, const std::string &data, std::string &buf, const std::vector<std::string> &header_list, std::string *err = nullptr)
+        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data,
+                              const std::vector<std::string> &headers, StreamCallback on_token,
+                              XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr,
+                              const char *proxy = nullptr)
         {
-            if (!__handle__)
-                return false;
-            curl_easy_reset(__handle__);
-            curl_easy_setopt(__handle__, CURLOPT_URL, URL);
-            curl_easy_setopt(__handle__, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(__handle__, CURLOPT_POST, 1L);
-            curl_easy_setopt(__handle__, CURLOPT_POSTFIELDS, data.c_str());
-            curl_easy_setopt(__handle__, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)data.size());
-
-            struct curl_slist *headers = nullptr;
-            for (auto &header : header_list)
-            {
-                headers = curl_slist_append(headers, header.c_str());
-                curl_easy_setopt(__handle__, CURLOPT_HTTPHEADER, headers);
-            }
-
-            curl_easy_setopt(__handle__, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
-            curl_easy_setopt(__handle__, CURLOPT_WRITEDATA, &buf);
-
-            CURLcode res = curl_easy_perform(__handle__);
-            long code = 0;
-            curl_easy_getinfo(__handle__, CURLINFO_RESPONSE_CODE, &code);
-            if (headers)
-                curl_slist_free_all(headers);
-            if (res != CURLE_OK)
-            {
-                if (err)
-                    *err = curl_easy_strerror(res);
-                return false;
-            }
-            if (code >= 400)
-            {
-                if (err)
-                {
-                    *err = error_message(buf);
-                    if (err->empty())
-                        *err = std::format("HTTP error {}", code);
-                }
-                return false;
-            }
-            return true;
-        }
-
-        using StreamCallback = std::function<void(std::span<const char>)>;
-        using XferCallback = int (*)(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
-        size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
-        {
-            StreamCallback *callback = (StreamCallback *)userdata;
-            size_t n = size * nmemb;
-            if (nmemb != 0 && n / nmemb != size)
-                return 0; // multiplication overflow, abort transfer
-            try
-            {
-                (*callback)(std::span<const char>(ptr, n));
-            }
-            catch (const std::exception &e)
-            {
-                std::cerr << e.what() << '\n';
-                return 0;
-            }
-            return n;
-        }
-
-        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::string &header, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr)
-        {
-            if (!curl || !url)
-                return false;
-
-            curl_easy_reset(curl);
-            curl_easy_setopt(curl, CURLOPT_URL, url);
-            curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &on_token);
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-            curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
-            if (on_xfer)
-            {
-                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xfer);
-                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, xfer_data);
-            }
-            else
-            {
-                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, nullptr);
-                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
-            }
-            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-            struct curl_slist *header_list = nullptr;
-            header_list = curl_slist_append(header_list, header.c_str());
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-
-            CURLcode res = curl_easy_perform(curl);
-            long code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-            if (http_code)
-                *http_code = code;
-            curl_slist_free_all(header_list);
-            return (res == CURLE_OK);
-        }
-
-        bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data, const std::vector<std::string> &header_list_in, StreamCallback on_token, XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr)
-        {
-            if (!curl || !url)
-                return false;
-
-            curl_easy_reset(curl);
-            curl_easy_setopt(curl, CURLOPT_URL, url);
-            curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // 本地服务不走系统代理
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &on_token);
-            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
-            curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
-            if (on_xfer)
-            {
-                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xfer);
-                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, xfer_data);
-            }
-            else
-            {
-                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, nullptr);
-                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
-            }
-            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-            struct curl_slist *headers = nullptr;
-            for (auto &header : header_list_in)
-                headers = curl_slist_append(headers, header.c_str());
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-            CURLcode res = curl_easy_perform(curl);
-            long code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-            if (http_code)
-                *http_code = code;
-            curl_slist_free_all(headers);
-            return (res == CURLE_OK);
+            return perform(curl, url, post_data.c_str(), (curl_off_t)post_data.size(), proxy, headers,
+                           nullptr, on_token, on_xfer, xfer_data, http_code, nullptr);
         }
     } // namespace net
     namespace sys
@@ -697,7 +590,6 @@ namespace cell
             std::fwrite(s.data(), 1, s.size(), stdout);
             std::fflush(stdout);
         }
-        inline void print() {}
         template <std::formattable<char>... Args>
         void println(std::format_string<Args...> fmt, Args &&...args)
         {
@@ -737,11 +629,6 @@ namespace cell
         {
             eprintln(color::yellow, fmt, std::forward<Args>(args)...);
         }
-        template <std::formattable<char>... Args>
-        void info(std::format_string<Args...> fmt, Args &&...args)
-        {
-            eprintln(color::green, fmt, std::forward<Args>(args)...);
-        }
 
         class logger
         {
@@ -780,7 +667,8 @@ namespace cell
         public:
             logger(const logger &) = delete;
             logger &operator=(const logger &) = delete;
-            ~logger() {}
+            // RAII: the file is flushed/closed when the process exits
+            ~logger() { close(); }
             static logger &instance()
             {
                 static logger log;
@@ -847,6 +735,79 @@ namespace cell
                 std::abort();
             });
         }
+
+        // scope guard: runs fn once when the guard goes out of scope (normal, exception, or return)
+        template <typename F>
+        class scoped_exit
+        {
+        private:
+            F fn_;
+            bool armed_ = true;
+
+        public:
+            explicit scoped_exit(F fn) : fn_(std::move(fn)) {}
+            scoped_exit(scoped_exit &&o) noexcept : fn_(std::move(o.fn_)), armed_(o.armed_) { o.armed_ = false; }
+            scoped_exit(const scoped_exit &) = delete;
+            scoped_exit &operator=(const scoped_exit &) = delete;
+            ~scoped_exit()
+            {
+                if (armed_)
+                {
+                    try
+                    {
+                        fn_();
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+            }
+        };
+        template <typename F>
+        scoped_exit<F> make_scoped_exit(F fn)
+        {
+            return scoped_exit<F>(std::move(fn));
+        }
+
+        namespace detail
+        {
+            // set asynchronously by signal handlers (0 = none, else the signal number); polled by the main loop
+            inline std::atomic<int> interrupt_signal{0};
+            inline void interrupt_handler(int sig)
+            {
+                interrupt_signal.store(sig); // async-signal-safe: only set a flag, no IO
+            }
+        } // namespace detail
+
+        // true when the user asked to stop (Ctrl+C / Ctrl+Break / SIGINT / SIGTERM)
+        inline bool interrupted() { return detail::interrupt_signal.load() != 0; }
+        inline int interrupt_signal() { return detail::interrupt_signal.load(); }
+        // human-readable reason for a recorded interrupt signal
+        inline std::string interrupt_reason(int sig)
+        {
+            switch (sig)
+            {
+                case SIGINT:
+                    return "SIGINT (Ctrl+C)";
+                case SIGTERM:
+                    return "SIGTERM";
+#ifdef _WIN32
+                case SIGBREAK:
+                    return "SIGBREAK (Ctrl+Break)";
+#endif
+                default:
+                    return std::format("signal {}", sig);
+            }
+        }
+        inline void install_interrupt_handler()
+        {
+            std::signal(SIGINT, detail::interrupt_handler);
+#ifdef _WIN32
+            std::signal(SIGBREAK, detail::interrupt_handler);
+#else
+            std::signal(SIGTERM, detail::interrupt_handler);
+#endif
+        }
     } // namespace sys
     namespace config
     {
@@ -856,6 +817,7 @@ namespace cell
             std::string base;                // api base url
             std::string model;               // model name
             std::string key_id;              // vault map key for the api key (optional)
+            std::string proxy;               // http(s) proxy url, e.g. http://user:pass@host:port (optional)
 
             std::string label() const { return provider + ":" + model; }
             nlohmann::json to_json() const
@@ -867,6 +829,8 @@ namespace cell
                 j["model"] = model;
                 if (!key_id.empty())
                     j["key"] = key_id;
+                if (!proxy.empty())
+                    j["proxy"] = proxy;
                 return j;
             }
             static model_entry from_json(const nlohmann::json &j)
@@ -876,6 +840,7 @@ namespace cell
                 e.base = j.value("base", "");
                 e.model = j.value("model", "");
                 e.key_id = j.value("key", "");
+                e.proxy = j.value("proxy", "");
                 return e;
             }
         };
@@ -940,11 +905,7 @@ namespace cell
             return -1;
         }
 
-#if defined(__cpp_lib_expected)
-        using config_result = std::expected<settings, std::string>;
-#else
-        using config_result = std::optional<settings>;
-#endif
+using config_result = std::expected<settings, std::string>;
         config_result load()
         {
             settings s;
@@ -955,23 +916,9 @@ namespace cell
             {
                 auto j = nlohmann::json::parse(f, nullptr, false);
                 if (j.is_discarded())
-                {
-#if defined(__cpp_lib_expected)
                     return std::unexpected(std::string("config parse error"));
-#else
-                    cell::sys::warn("config parse error");
-                    return std::nullopt;
-#endif
-                }
                 if (!j.is_object())
-                {
-#if defined(__cpp_lib_expected)
                     return std::unexpected(std::string("config is not an object"));
-#else
-                    cell::sys::warn("config is not an object");
-                    return std::nullopt;
-#endif
-                }
                 if (j.contains("models") && j["models"].is_array())
                 {
                     for (auto &mj : j["models"])
@@ -993,12 +940,7 @@ namespace cell
             }
             catch (const std::exception &e)
             {
-#if defined(__cpp_lib_expected)
                 return std::unexpected(std::format("config load failed: {}", e.what()));
-#else
-                cell::sys::warn("config load failed: {}", e.what());
-                return std::nullopt;
-#endif
             }
             return s;
         }
@@ -1539,24 +1481,6 @@ namespace cell
                 return handler_(input, output);
             }
         };
-        std::pair<size_t, size_t> tools_call(const std::vector<std::pair<std::string, std::string>> &call_list, std::unordered_map<std::string, std::shared_ptr<tool>> &tool_list)
-        {
-            size_t succeed = 0, total = 0;
-            for (auto &[call_tool, call_args] : call_list)
-            {
-                auto tool = tool_list.find(call_tool);
-                if (tool != tool_list.end())
-                {
-                    std::string output;
-                    if (tool->second->execute(call_args, output))
-                    {
-                        succeed += 1;
-                    }
-                    total += 1;
-                }
-            }
-            return std::make_pair(succeed, total);
-        }
     } // namespace tools
     namespace llm
     {
@@ -1580,8 +1504,7 @@ namespace cell
             }
             return std::string::npos;
         }
-#if defined(__cpp_lib_generator)
-        // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
+// lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
         static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
         {
             std::string_view payload;
@@ -1606,31 +1529,36 @@ namespace cell
                 co_yield j;
             }
         }
-#else
-        // fallback SSE parser for toolchains without std::generator
-        static inline bool sse_next(const std::string &buf, size_t &pos, nlohmann::json &out)
+        // incremental SSE consumer: append a chunk, deliver complete events to on_event via the
+        // zero-copy offset cursor, and compact the buffer only after a large prefix has been
+        // consumed (avoids an O(n) erase per chunk).
+        template <typename F>
+        static void sse_feed(std::string &buf, size_t &base, std::span<const char> data, F &&on_event)
         {
-            std::string_view payload;
-            size_t next = sse_next_payload(buf, pos, payload);
-            if (next == std::string::npos)
-                return false;
-            pos = next;
-            out = nlohmann::json::object();
-            try
+            buf.append(data.data(), data.size());
+            for (const nlohmann::json &j : sse_events(buf, base))
+                on_event(j);
+            if (base >= 64 * 1024)
             {
-                out = nlohmann::json::parse(payload);
+                buf.erase(0, base);
+                base = 0;
             }
-            catch (const std::exception &)
-            {
-            }
-            return true;
         }
-#endif
+        // drop the consumed prefix so the remaining tail (e.g. an error body) can be inspected
+        static void sse_finish(std::string &buf, size_t &base)
+        {
+            if (base > 0 && base <= buf.size())
+            {
+                buf.erase(0, base);
+                base = 0;
+            }
+        }
 
         class OpenAI
         {
         private:
             const std::string api_base;
+            std::string proxy_;
             CURL *curl = curl_easy_init();
 
             static std::vector<std::string> headers(const encrypt::secure_string &api_key)
@@ -1653,6 +1581,7 @@ namespace cell
         public:
             OpenAI(const std::string &api_base) : api_base(api_base) {}
             ~OpenAI() { curl_easy_cleanup(curl); }
+            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
             {
@@ -1661,7 +1590,7 @@ namespace cell
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err);
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -1691,10 +1620,10 @@ namespace cell
                 usage = nlohmann::json::object();
                 std::string text;
                 std::string sse_buf;
+                size_t sse_base = 0;
                 std::string url = api_base + "/chat/completions";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
-                    sse_buf.append(data.data(), data.size());
                     auto handle = [&](const nlohmann::json &j)
                     {
                         if (j.contains("usage") && j["usage"].is_object())
@@ -1729,26 +1658,17 @@ namespace cell
                             }
                         }
                     };
-                    size_t consumed = 0;
-#if defined(__cpp_lib_generator)
-                    for (const nlohmann::json &j : sse_events(sse_buf, consumed))
-                        handle(j);
-#else
-                    nlohmann::json j;
-                    while (sse_next(sse_buf, consumed, j))
-                        handle(j);
-#endif
-                    if (consumed > 0)
-                        sse_buf.erase(0, consumed);
+                    sse_feed(sse_buf, sse_base, data, handle);
                 };
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http);
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (ok && http >= 400)
                 {
                     ok = false;
+                    sse_finish(sse_buf, sse_base);
                     err = net::error_message(sse_buf);
                     if (err.empty())
                         err = std::format("HTTP error {}", http);
@@ -1771,6 +1691,7 @@ namespace cell
         private:
             const std::string api_base;
             CURL *curl = curl_easy_init();
+            std::string proxy_;
 
             static std::vector<std::string> headers(const encrypt::secure_string &api_key)
             {
@@ -1804,6 +1725,7 @@ namespace cell
         public:
             Anthropic(const std::string &api_base) : api_base(api_base) {}
             ~Anthropic() { curl_easy_cleanup(curl); }
+            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
             {
@@ -1812,7 +1734,7 @@ namespace cell
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err);
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -1852,10 +1774,10 @@ namespace cell
                 usage = nlohmann::json::object();
                 std::vector<nlohmann::json> blocks;
                 std::string sse_buf;
+                size_t sse_base = 0;
                 std::string url = api_base + "/v1/messages";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
-                    sse_buf.append(data.data(), data.size());
                     auto handle = [&](const nlohmann::json &ev)
                     {
                         std::string type = ev.value("type", "");
@@ -1891,26 +1813,17 @@ namespace cell
                             }
                         }
                     };
-                    size_t consumed = 0;
-#if defined(__cpp_lib_generator)
-                    for (const nlohmann::json &ev : sse_events(sse_buf, consumed))
-                        handle(ev);
-#else
-                    nlohmann::json ev;
-                    while (sse_next(sse_buf, consumed, ev))
-                        handle(ev);
-#endif
-                    if (consumed > 0)
-                        sse_buf.erase(0, consumed);
+                    sse_feed(sse_buf, sse_base, data, handle);
                 };
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http);
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (ok && http >= 400)
                 {
                     ok = false;
+                    sse_finish(sse_buf, sse_base);
                     err = net::error_message(sse_buf);
                     if (err.empty())
                         err = std::format("HTTP error {}", http);
@@ -1955,18 +1868,13 @@ namespace cell
             bool loaded = false;
 
         public:
-            session() : session_id(std::format("{}", std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()))
-            {
-                file = root / "sessions" / (session_id + ".json");
-            }
+            session() : session(std::format("{}", std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count())) {}
             session(const std::string &id) : session_id(id)
             {
                 file = root / "sessions" / (session_id + ".json");
             }
             session(session &&) = default;
             session &operator=(session &&) = default;
-            session(const session &) = default;
-            session &operator=(const session &) = default;
             ~session() {}
             void load()
             {
@@ -2090,16 +1998,7 @@ namespace cell
         }
         static std::vector<std::string> lines(const std::string &text)
         {
-            std::vector<std::string> out;
-            std::istringstream ss(text);
-            std::string line;
-            while (std::getline(ss, line))
-            {
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
-                out.push_back(line);
-            }
-            return out;
+            return text::split_lines(text);
         }
         // parse optional YAML-style front matter: "---\nname: x\ndescription: y\n---\n body"
         static bool parse_metadata(const std::string &raw, skill &s)
@@ -2301,6 +2200,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --provider openai|anthropic  default llm provider");
     cell::sys::println("  --base URL                   api base url for the default model");
     cell::sys::println("  --model MODEL                default model name");
+    cell::sys::println("  --proxy URL                  http(s) proxy for the default model");
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session");
     cell::sys::println("  --system TEXT                system prompt");
@@ -2314,7 +2214,7 @@ static void print_help()
     cell::sys::println("commands:");
     cell::sys::println("  /models                     list configured models");
     cell::sys::println("  /model NAME                 switch to a configured model (NAME or provider:NAME)");
-    cell::sys::println("  /model provider:NAME base:URL key:KEY   add/update a model");
+    cell::sys::println("  /model provider:NAME base:URL key:KEY proxy:URL   add/update a model");
     cell::sys::println("      e.g. /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx");
     cell::sys::println("  /sessions                   list saved sessions");
     cell::sys::println("  /session ID                 switch to another saved session");
@@ -2327,6 +2227,20 @@ static void print_help()
     cell::sys::println("  /exit | /quit               exit");
 }
 
+// parse tool arguments as JSON without throwing; false on any invalid input
+static bool json_args(const std::string &in, nlohmann::json &j)
+{
+    try
+    {
+        j = nlohmann::json::parse(in, nullptr, false);
+        return !j.is_discarded();
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+}
+
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic)
 {
     using cell::tools::Policy;
@@ -2337,9 +2251,23 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "string"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy,
-                   std::function<bool(const std::string &, std::string &)> fn)
+                   std::function<bool(const nlohmann::json &, std::string &)> fn)
     {
-        list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy, std::move(fn));
+        list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy,
+            [fn = std::move(fn)](const std::string &in, std::string &out) -> bool
+            {
+                nlohmann::json j;
+                if (!json_args(in, j))
+                    return false;
+                try
+                {
+                    return fn(j, out);
+                }
+                catch (const std::exception &)
+                {
+                    return false;
+                }
+            });
         nlohmann::json schema = {{"type", "object"}, {"properties", props}, {"required", required}};
         if (anthropic)
             defs.push_back({{"name", name}, {"description", desc}, {"input_schema", schema}});
@@ -2348,129 +2276,45 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     };
 
     add("exec", "Run a shell command and return its stdout output.", {{"cmd", str_prop("shell command to execute")}}, {"cmd"}, Policy::Ask,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &out)
         {
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::exec(j.value("cmd", ""), out);
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::exec(j.value("cmd", ""), out);
         });
     add("grep", "Search a text file line by line for matches of a regex pattern.", {{"path", str_prop("file path")}, {"pattern", str_prop("regex pattern")}}, {"path", "pattern"}, Policy::Allow,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &out)
         {
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::grep(j.value("path", ""), j.value("pattern", ""), out);
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::grep(j.value("path", ""), j.value("pattern", ""), out);
         });
     add("read", "Read a text file (max 1MB) and return its contents.", {{"path", str_prop("file path")}}, {"path"}, Policy::Allow,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &out)
         {
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::read(j.value("path", ""), out);
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::read(j.value("path", ""), out);
         });
     add("write", "Write text content to a file, overwriting any existing content.", {{"path", str_prop("file path")}, {"content", str_prop("text content")}}, {"path", "content"}, Policy::Ask,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &)
         {
-            (void)out;
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::write(j.value("path", ""), j.value("content", ""));
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::write(j.value("path", ""), j.value("content", ""));
         });
     add("exist", "Check whether a file or directory exists.", {{"path", str_prop("file or directory path")}}, {"path"}, Policy::Allow,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &out)
         {
-            (void)out;
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                out = cell::box::exist(j.value("path", "")) ? "yes" : "no";
-                return true;
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            out = cell::box::exist(j.value("path", "")) ? "yes" : "no";
+            return true;
         });
     add("remove", "Delete a file or an empty directory.", {{"path", str_prop("file or directory path")}}, {"path"}, Policy::Ask,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &)
         {
-            (void)out;
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::remove(j.value("path", ""));
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::remove(j.value("path", ""));
         });
     add("mkdir", "Create a directory, including any missing parents.", {{"dirpath", str_prop("directory path")}}, {"dirpath"}, Policy::Ask,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &)
         {
-            (void)out;
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::mkdir(j.value("dirpath", ""));
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::mkdir(j.value("dirpath", ""));
         });
     add("edit", "Edit a text file by line. op \"query\": {\"pattern\":\"regex\"} returns matching lines with line numbers; op \"insert\": {\"line\":N,\"content\":\"...\"} inserts content before line N (N<=1 means top, N>len appends at end); op \"delete\": {\"start\":A,\"end\":B} removes lines A..B; op \"replace\": {\"start\":A,\"end\":B,\"content\":\"...\"} replaces the line range, or {\"pattern\":\"regex\",\"content\":\"...\"} replaces every matching line.", {{"path", str_prop("file path")}, {"op", str_prop("query|insert|delete|replace")}, {"args", str_prop("JSON arguments for the operation")}}, {"path", "op", "args"}, Policy::Ask,
-        [](const std::string &in, std::string &out)
+        [](const nlohmann::json &j, std::string &out)
         {
-            try
-            {
-                auto j = nlohmann::json::parse(in, nullptr, false);
-                if (j.is_discarded())
-                    return false;
-                return cell::box::edit(j.value("path", ""), j.value("op", ""), j.value("args", ""), out);
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return cell::box::edit(j.value("path", ""), j.value("op", ""), j.value("args", ""), out);
         });
     return {list, defs};
 }
@@ -2524,6 +2368,30 @@ static int run_selftest()
     expect(cell::box::edit("edit_test.txt", "delete", "{\"start\":3,\"end\":4}", edit_out) && edit_out.find("deleted 2 line") != std::string::npos, "box::edit delete");
     expect(cell::box::read("edit_test.txt", out) && out == "TOP\nSUB\n", "box::edit delete result");
     expect(cell::box::remove("edit_test.txt"), "edit cleanup");
+
+    {
+        // sse_feed: incremental parsing with a zero-copy cursor and buffer compaction
+        std::string sse_buf;
+        size_t sse_base = 0;
+        std::vector<std::string> got;
+        auto feed = [&](const char *s)
+        {
+            cell::llm::sse_feed(sse_buf, sse_base, std::span<const char>(s, std::strlen(s)),
+                                [&](const nlohmann::json &j) { got.push_back(j.dump()); });
+        };
+        feed("data: {\"a\":1}\n\n");
+        feed("data: {\"b\""); // partial line: must not be delivered yet
+        expect(got.size() == 1, "sse_feed delivers complete events only");
+        feed(":2}\n\ndata: [DONE]\n\n"); // completes event 2; [DONE] is skipped
+        expect(got.size() == 2, "sse_feed parses across chunk boundaries");
+        expect(got[0].find("\"a\":1") != std::string::npos && got[1].find("\"b\":2") != std::string::npos, "sse_feed payload values");
+        std::string bulk;
+        for (int i = 0; i < 8000; i++)
+            bulk += "data: {}\n\n";
+        feed(bulk.c_str());
+        expect(got.size() == 8002, "sse_feed bulk events");
+        expect(sse_buf.size() < 64 * 1024, "sse_feed compacts consumed prefix");
+    }
 
     auto &log = cell::sys::logger::instance();
     log.info("test", "selftest info");
@@ -2579,6 +2447,7 @@ static int run_selftest()
     a.base = "http://x/v1";
     a.model = "m1";
     a.key_id = "k1";
+    a.proxy = "http://user:pass@p:8080";
     cell::config::model_entry b;
     b.provider = "anthropic";
     b.base = "http://y";
@@ -2591,6 +2460,8 @@ static int run_selftest()
     expect(cfg_res.has_value() && cfg_res->models.size() == 2, "config::load multi-model");
     expect(cfg_res.has_value() && cfg_res->current == 1 && cfg_res->current_entry()->model == "m2", "config current entry");
     expect(cfg_res.has_value() && cfg_res->models[0].label() == "openai:m1", "config model label");
+    expect(cfg_res.has_value() && cfg_res->models[0].proxy == "http://user:pass@p:8080", "config proxy roundtrip");
+    expect(cfg_res.has_value() && cfg_res->models[1].proxy.empty(), "config proxy default empty");
     expect(cell::config::find(*cfg_res, "m1") == 0 && cell::config::find(*cfg_res, "m2", "anthropic") == 1 && cell::config::find(*cfg_res, "nope") == -1, "config::find");
     cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
     auto legacy_res = cell::config::load();
@@ -2645,14 +2516,12 @@ int main(int argc, char const *argv[])
     bool no_color = false;
     bool verbose = false;
     std::string key_arg;
-    std::string provider_arg, base_arg, model_arg;
+    std::string provider_arg, base_arg, model_arg, proxy_arg;
     cell::config::settings cfg;
     if (auto res = cell::config::load(); res)
         cfg = *res;
-#if defined(__cpp_lib_expected)
     else
         cell::sys::warn("{}", res.error());
-#endif
     for (size_t i = 1; i < (size_t)argc; i++)
     {
         std::string arg = argv[i];
@@ -2671,6 +2540,8 @@ int main(int argc, char const *argv[])
             base_arg = cell::skills::trim(value("--base"));
         else if (arg == "--model")
             model_arg = cell::skills::trim(value("--model"));
+        else if (arg == "--proxy")
+            proxy_arg = cell::skills::trim(value("--proxy"));
         else if (arg == "--key")
             key_arg = cell::skills::trim(value("--key"));
         else if (arg == "--session")
@@ -2694,6 +2565,7 @@ int main(int argc, char const *argv[])
     cell::sys::detail::verbose_enabled = verbose;
     cell::sys::detail::init_console();
     cell::sys::install_handlers();
+    cell::sys::install_interrupt_handler();
     if (selftest)
         return run_selftest();
 
@@ -2709,7 +2581,7 @@ int main(int argc, char const *argv[])
     if (cfg.empty())
         cfg = cell::config::defaults();
     // apply CLI overrides onto the current model entry
-    if (!provider_arg.empty() || !model_arg.empty() || !base_arg.empty())
+    if (!provider_arg.empty() || !model_arg.empty() || !base_arg.empty() || !proxy_arg.empty())
     {
         if (cell::config::model_entry *e = cfg.current_entry(); e)
         {
@@ -2719,6 +2591,8 @@ int main(int argc, char const *argv[])
                 e->model = model_arg;
             if (!base_arg.empty())
                 e->base = base_arg;
+            if (!proxy_arg.empty())
+                e->proxy = proxy_arg;
         }
         else
         {
@@ -2726,6 +2600,7 @@ int main(int argc, char const *argv[])
             ne.provider = provider_arg.empty() ? "openai" : provider_arg;
             ne.model = model_arg;
             ne.base = base_arg;
+            ne.proxy = proxy_arg;
             cfg.models.push_back(std::move(ne));
             cfg.current = cfg.models.size() - 1;
         }
@@ -2803,13 +2678,17 @@ int main(int argc, char const *argv[])
         const nlohmann::json &tools = ap ? tool_defs_anthropic : tool_defs_openai;
         if (ap)
         {
+            auto &client = cache.a(e.base);
+            client.set_proxy(e.proxy);
             if (stream)
-                return cache.a(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
-            return cache.a(e.base).chat(key, e.model, msgs, tools, reply, tc, usage, err);
+                return client.chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
+            return client.chat(key, e.model, msgs, tools, reply, tc, usage, err);
         }
+        auto &client = cache.o(e.base);
+        client.set_proxy(e.proxy);
         if (stream)
-            return cache.o(e.base).chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
-        return cache.o(e.base).chat(key, e.model, msgs, tools, reply, tc, usage, err);
+            return client.chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
+        return client.chat(key, e.model, msgs, tools, reply, tc, usage, err);
     };
 
     auto on_token = [](std::span<const char> data)
@@ -2898,6 +2777,21 @@ int main(int argc, char const *argv[])
     if (!cfg.session_id.empty())
         h.use(cfg.session_id);
     cell::chat::session *s = &h.now();
+    // RAII exit guard: persists the session + config and cleans up libcurl no matter how
+    // main leaves this scope (normal /exception / Ctrl+C graceful exit).
+    auto on_exit = cell::sys::make_scoped_exit([&]
+    {
+        try
+        {
+            s->unload();
+        }
+        catch (const std::exception &)
+        {
+        }
+        cfg.session_id = s->id();
+        cell::config::save(cfg);
+        curl_global_cleanup();
+    });
     auto skills_all = cell::skills::list();
     std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
     auto ensure_prompt = [&](cell::chat::session *sess)
@@ -2930,23 +2824,25 @@ int main(int argc, char const *argv[])
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
 
-    auto list_models = [&]()
-    {
-        if (cfg.models.empty())
+auto list_models = [&]()
         {
-            cell::sys::println("  (no models configured)");
-            return;
-        }
-        for (size_t i = 0; i < cfg.models.size(); i++)
-        {
-            auto &e = cfg.models[i];
-            cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
-            if (!e.base.empty())
-                cell::sys::println("       base: {}", e.base);
-            if (!e.key_id.empty())
-                cell::sys::println("       key:  stored");
-        }
-    };
+            if (cfg.models.empty())
+            {
+                cell::sys::println("  (no models configured)");
+                return;
+            }
+            for (size_t i = 0; i < cfg.models.size(); i++)
+            {
+                auto &e = cfg.models[i];
+                cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
+                if (!e.base.empty())
+                    cell::sys::println("       base: {}", e.base);
+                if (!e.proxy.empty())
+                    cell::sys::println("       proxy: {}", e.proxy);
+                if (!e.key_id.empty())
+                    cell::sys::println("       key:  stored");
+            }
+        };
 
     // context compaction: keep system messages + head/tail, summarize the middle via the llm
     auto compact = [&](cell::chat::session *sess) -> std::string
@@ -3075,15 +2971,41 @@ int main(int argc, char const *argv[])
     // agent loop
     try
     {
+        // service termination method: invoked when an interrupt is detected. It persists
+        // the session + config, reports the reason, then falls through to the normal
+        // exit path where the RAII guard releases the remaining resources.
+        bool shutting_down = false;
+        auto shutdown = [&]()
+        {
+            if (shutting_down)
+                return;
+            shutting_down = true;
+            cell::sys::println();
+            s->unload();
+            cfg.session_id = s->id();
+            cell::config::save(cfg);
+            std::string reason = cell::sys::interrupt_reason(cell::sys::interrupt_signal());
+            log.info("core", std::format("程序中断退出 by {}", reason));
+            cell::sys::println("程序中断退出 by {}", reason);
+        };
         bool running = true;
         while (running)
         {
+            if (cell::sys::interrupted())
+            {
+                shutdown();
+                break;
+            }
             std::string input;
             if (interactive)
             {
                 cell::sys::print("> ");
                 if (!std::getline(std::cin, input))
+                {
+                    if (cell::sys::interrupted())
+                        shutdown();
                     break;
+                }
             }
             else
             {
@@ -3091,6 +3013,11 @@ int main(int argc, char const *argv[])
                 pending.clear();
                 if (input.empty())
                     break;
+            }
+            if (cell::sys::interrupted())
+            {
+                shutdown();
+                break;
             }
             if (input.size() >= 3 && (unsigned char)input[0] == 0xEF && (unsigned char)input[1] == 0xBB && (unsigned char)input[2] == 0xBF)
                 input.erase(0, 3);
@@ -3172,7 +3099,7 @@ int main(int argc, char const *argv[])
                         m = target;
                         p = cfg.current_entry() ? cfg.current_entry()->provider : "openai";
                     }
-                    std::string new_base, new_key;
+                    std::string new_base, new_key, new_proxy;
                     bool has_opts = false;
                     for (size_t i = 2; i < toks.size(); i++)
                     {
@@ -3195,11 +3122,21 @@ int main(int argc, char const *argv[])
                                 new_key = toks[++i];
                             has_opts = true;
                         }
+                        else if (t.rfind("proxy:", 0) == 0)
+                        {
+                            // tolerant spaced form: "proxy: http://..." (value in the next token)
+                            if (t.size() > 6)
+                                new_proxy = t.substr(6);
+                            else if (i + 1 < toks.size())
+                                new_proxy = toks[++i];
+                            has_opts = true;
+                        }
                         else
                             cell::sys::warn("ignoring token: {}", t);
                     }
                     new_base = cell::skills::trim(new_base);
                     new_key = cell::skills::trim(new_key);
+                    new_proxy = cell::skills::trim(new_proxy);
                     if (has_opts)
                     {
                         // add or update a model
@@ -3210,12 +3147,16 @@ int main(int argc, char const *argv[])
                             e.provider = p;
                             e.model = m;
                             e.base = new_base;
+                            e.proxy = new_proxy;
                             cfg.models.push_back(std::move(e));
                             idx = (int)cfg.models.size() - 1;
                         }
-                        else if (!new_base.empty())
+                        else
                         {
-                            cfg.models[idx].base = new_base;
+                            if (!new_base.empty())
+                                cfg.models[idx].base = new_base;
+                            if (!new_proxy.empty())
+                                cfg.models[idx].proxy = new_proxy;
                         }
                         if (!new_key.empty())
                         {
@@ -3227,14 +3168,16 @@ int main(int argc, char const *argv[])
                         cfg.current = (size_t)idx;
                         cell::config::save(cfg);
                         auto &reg = cfg.models[idx];
-                        log.info("model", std::format("registered label={} provider={} base={} key={}",
+                        log.info("model", std::format("registered label={} provider={} base={} proxy={} key={}",
                                                       reg.label(), reg.provider,
                                                       reg.base.empty() ? "(default)" : reg.base,
+                                                      reg.proxy.empty() ? "(none)" : reg.proxy,
                                                       reg.key_id.empty() ? "none" : "stored"));
                         cell::sys::println("model registered: {}", reg.label());
                         cell::sys::println("       provider: {}", reg.provider);
                         cell::sys::println("       model:    {}", reg.model);
                         cell::sys::println("       base:     {}", reg.base.empty() ? "(default)" : reg.base);
+                        cell::sys::println("       proxy:    {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
                         cell::sys::println("       key:      {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
                         if (spaced_form)
                             cell::sys::println("note: spaced form used; the registered model name is \"{}\", not \" {}\"", reg.model, reg.model);
@@ -3413,7 +3356,7 @@ int main(int argc, char const *argv[])
                 StreamUI ui;
                 auto t0 = cell::sys::detail::clock::now();
                 ui.t0 = t0;
-                // single-threaded TTFB timer + Esc-cancel: libcurl invokes this periodically while blocked
+                // single-threaded TTFB timer + Esc-cancel + Ctrl+C abort: libcurl invokes this periodically while blocked
                 auto xfer_cb = +[](void *p, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
                 {
                     auto *u = (StreamUI *)p;
@@ -3422,6 +3365,8 @@ int main(int argc, char const *argv[])
                         if (_getwch() == 27)
                             u->cancelled = true;
 #endif
+                    if (cell::sys::interrupted())
+                        return 1; // abort the transfer so the main loop can save and exit
                     if (!u->got && cell::sys::detail::color_enabled)
                     {
                         long long ms = cell::sys::elapsed_ms(u->t0);
@@ -3490,6 +3435,17 @@ int main(int argc, char const *argv[])
                     }
                     ui.timer_line = false;
                     ui.tok_line = false;
+                }
+                if (cell::sys::interrupted())
+                {
+                    // keep whatever partial reply already streamed in before exiting
+                    if (reply_text_len(reply) > 0 || !tool_calls.empty())
+                        s->msg().push_back(reply);
+                    log.warn("llm", std::format("interrupted model={} round={} partial_chars={}", e->label(), rounds, reply_text_len(reply)));
+                    cell::sys::error("[interrupted]");
+                    shutdown();
+                    done = true;
+                    break;
                 }
                 if (ui.cancelled)
                 {
@@ -3584,24 +3540,16 @@ int main(int argc, char const *argv[])
     {
         log.error("core", std::format("fatal: {}", e.what()));
         cell::sys::error("fatal: {}", e.what());
-        s->unload();
-        curl_global_cleanup();
-        return 1;
+        return 1; // the RAII exit guard saves the session + config and cleans up curl
     }
     catch (const std::exception &e)
     {
         log.error("core", std::format("unhandled: {}", e.what()));
         cell::sys::error("unhandled exception: {}", e.what());
-        s->unload();
-        curl_global_cleanup();
         return 1;
     }
 
-    s->unload();
-    cfg.session_id = s->id();
-    cell::config::save(cfg);
     log.info("exit", std::format("uptime={}ms llm_requests={} tool_calls={}",
                                  cell::sys::elapsed_ms(t_start), total_llm_requests, total_tool_calls));
-    curl_global_cleanup();
     return 0;
 }
