@@ -104,11 +104,11 @@ context: loaded 7 message(s) from disk
 | **glob** | 按文件名模式查找文件（如 `**/*.ts`） |
 | **find** | 按元数据筛选文件（名称、修改时间、大小等） |
 | **write** | 创建新文件（不能覆盖已存在的文件） |
-| **edit** | 修改已有文件（通过 SEARCH/REPLACE 块，需确保搜索文本唯一） |
+| **edit** | 修改已有文件（通过 SEARCH/REPLACE 块，需确保搜索文本唯一；编辑前必须先 read 过该文件/行） |
 | **exec** | 执行 shell 命令（默认超时 30 秒，最大 300 秒） |
 
 工具使用规则要点：
-- 读取文件前必须先读取原内容；
+- edit 前必须先读取原内容：edit 只允许修改 read 工具已返回过的文件（或行范围），未读过的文件/行会被拒绝；
 - 使用 write 前需确保父目录已存在（可用 `exec` + `mkdir -p` 创建）；
 - 单次 edit 不得涉及 3 个以上无关联的代码块；
 - 未先读取文件内容时不得连续调用超过 3 次 rg；
@@ -470,7 +470,7 @@ During a conversation the model may call one of 8 tools:
 | `glob` | Find files by name pattern (e.g. `**/*.test.ts`) | read-only, runs automatically |
 | `find` | Filter files by metadata (name, size, modification time) | read-only, runs automatically |
 | `write` | Create a **new** file (refuses to overwrite; refuses if the parent directory is missing) | confirmation required |
-| `edit` | Modify an existing file via a SEARCH/REPLACE block (ambiguous matches abort with all locations reported) | confirmation required |
+| `edit` | Modify an existing file via a SEARCH/REPLACE block (ambiguous matches abort with all locations reported). **Requires a prior read**: edits may only touch files/lines returned by an earlier `read` call, otherwise refused | confirmation required |
 | `exec` | Run build/test/git commands (default 30s timeout; result ends with `exitcode=N`) | confirmation required |
 
 Read-only tools run without asking and may execute **concurrently** within one round; `write`,

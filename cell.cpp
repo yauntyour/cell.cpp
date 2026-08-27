@@ -15,6 +15,7 @@
 #include <ctime>
 #include <future>
 #include <iterator>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <span>
@@ -1719,7 +1720,83 @@ namespace cell
             exit_code = 1;
             return plat::spawn_cmd(std::string(cmd), timeout_s, output, exit_code);
         }
-        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0)
+        // -------- read-before-edit rule --------
+        // the edit tool may only modify lines the model actually saw: every read
+        // tool call records the line range it returned (1-based inclusive, end ==
+        // (size_t)-1 means "to end of file"), and edit() refuses to touch lines
+        // not covered by any recorded read. the log is reset whenever the visible
+        // context changes (session switch/clear/compact).
+        struct read_range
+        {
+            size_t start = 0, end = 0; // 1-based inclusive
+        };
+        static std::unordered_map<std::string, std::vector<read_range>> &read_log()
+        {
+            static std::unordered_map<std::string, std::vector<read_range>> log;
+            return log;
+        }
+        static std::mutex &read_log_mx()
+        {
+            static std::mutex mx;
+            return mx;
+        }
+        // canonical, case-insensitive (on Windows) path key for the read log
+        static std::string read_log_key(std::string_view path)
+        {
+            std::error_code ec;
+            std::filesystem::path p = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+            std::string s = p.lexically_normal().generic_string();
+#ifdef _WIN32
+            for (auto &c : s)
+                if (c >= 'A' && c <= 'Z')
+                    c = char(c - 'A' + 'a');
+#endif
+            return s;
+        }
+        // record that [start, end] (1-based inclusive; end == (size_t)-1 = EOF) of
+        // path was returned by a read tool call
+        static void record_read(std::string_view path, size_t start, size_t end)
+        {
+            std::lock_guard<std::mutex> lk(read_log_mx());
+            read_log()[read_log_key(path)].push_back({start, end});
+        }
+        // forget every recorded read (session switched, cleared or compacted)
+        static void reset_read_log()
+        {
+            std::lock_guard<std::mutex> lk(read_log_mx());
+            read_log().clear();
+        }
+        // true when the recorded reads of path jointly cover [start, end]
+        static bool read_covers(std::string_view path, size_t start, size_t end)
+        {
+            std::vector<read_range> spans;
+            {
+                std::lock_guard<std::mutex> lk(read_log_mx());
+                auto it = read_log().find(read_log_key(path));
+                if (it == read_log().end())
+                    return false;
+                spans = it->second;
+            }
+            std::sort(spans.begin(), spans.end(),
+                      [](const read_range &a, const read_range &b) { return a.start < b.start; });
+            size_t covered = 0; // highest line confirmed covered, 0 = none yet
+            for (auto &r : spans)
+            {
+                if (r.start > covered + 1)
+                {
+                    // uncovered gap [covered+1, r.start-1]; it matters only if it
+                    // intersects the requested [start, end]
+                    if (r.start - 1 >= start && covered + 1 <= end)
+                        return false;
+                }
+                if (r.end > covered)
+                    covered = r.end;
+                if (covered >= end)
+                    return true;
+            }
+            return covered >= end;
+        }
+        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false)
         {
             std::ifstream file(std::filesystem::path(path), std::ios::binary);
             if (!file.is_open())
@@ -1735,7 +1812,11 @@ namespace cell
             if (!file.good() && !file.eof())
                 return false;
             if (start_line == 0 && end_line == 0)
+            {
+                if (track)
+                    record_read(path, 1, (size_t)-1);
                 return true;
+            }
             auto lines = text::split_lines(output);
             if (start_line == 0)
                 start_line = 1;
@@ -1748,6 +1829,8 @@ namespace cell
             }
             if (end_line > lines.size())
                 end_line = lines.size();
+            if (track)
+                record_read(path, start_line, end_line);
             output.clear();
             for (size_t i = start_line - 1; i < end_line; i++)
             {
@@ -1832,6 +1915,24 @@ namespace cell
                     if (line < lines.size())
                         output += std::format("  {:>6} | {}\n", line + 1, lines[line]);
                 }
+                return false;
+            }
+            // read-before-edit rule: the lines the SEARCH block touches must have
+            // been returned by a previous read tool call, or the edit is refused
+            size_t first_line = 1;
+            for (size_t i = 0; i < pos[0] && i < content.size(); i++)
+                if (content[i] == '\n')
+                    first_line++;
+            size_t last_line = first_line;
+            size_t block_end = pos[0] + search.size();
+            for (size_t i = pos[0]; i < block_end && i < content.size(); i++)
+                if (content[i] == '\n')
+                    last_line++;
+            if (block_end > pos[0] && content[block_end - 1] == '\n')
+                last_line--;
+            if (!read_covers(path, first_line, last_line))
+            {
+                output = std::format("edit refused: lines {}-{} of {} were not read. Read the file first with the read tool (read the whole file, or at least lines {}-{}) before editing.", first_line, last_line, std::string(path), first_line, last_line);
                 return false;
             }
             content.replace(pos[0], search.size(), replace);
@@ -2403,7 +2504,7 @@ namespace cell
                 "  exec  - run build/test/git commands (default timeout 30s); the result ends with 'exitcode=N' - judge success by that value, never assume\n"
                 "           NOTE: exec is sandboxed. By default (sandbox=git) ONLY local git subcommands are allowed; network-egress commands (curl, wget, git push/fetch/clone, ...) are denied in every mode. If a command is blocked, report it and let the user decide.\n"
                 "Rules:\n"
-                "- read a file before write/edit on it; never call write/edit without reading the file first.\n"
+                "- read a file before write/edit on it; never call write/edit without reading the file first. edit is enforced: it only accepts files and line ranges that a previous read call returned.\n"
                 "- before write, ensure the parent directory exists (exec: mkdir -p <dir>).\n"
                 "- one edit call must not touch more than 3 unrelated code blocks; split into multiple edit calls.\n"
                 "- do not call rg more than 3 times in a row without first reading the actual file content.\n"
@@ -3696,7 +3797,11 @@ namespace cell
                     throw std::runtime_error("no active session");
                 return it->second;
             }
-            void use(const std::string &session_id) { current = session_id; }
+            void use(const std::string &session_id)
+            {
+                current = session_id;
+                box::reset_read_log(); // switching context: recorded reads no longer apply
+            }
             // drop the in-memory session and reset to a fresh one; the on-disk file is kept
             void forget_current()
             {
@@ -3704,6 +3809,7 @@ namespace cell
                 if (it != session_list.end())
                     session_list.erase(it);
                 current = "current";
+                box::reset_read_log(); // fresh context: recorded reads no longer apply
             }
             void remove(const std::string &session_id)
             {
@@ -4104,7 +4210,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::read(j.value("path", ""), out, j.value("start", (size_t)0), j.value("end", (size_t)0));
+            return cell::box::read(j.value("path", ""), out, j.value("start", (size_t)0), j.value("end", (size_t)0), true);
         });
     add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).",
         {{"path", str_prop("file path")}, {"content", str_prop("text content")}},
@@ -4113,7 +4219,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {
             return cell::box::write_new(j.value("path", ""), j.value("content", ""), out);
         });
-    add("edit", "Modify an existing file with a SEARCH/REPLACE block: find the exact 'search' text and replace it with 'replace'. If the search text matches multiple locations, nothing is modified and every match is reported with line numbers — retry with more surrounding context lines so the search block is unique. No other edit modes are supported.",
+    add("edit", "Modify an existing file with a SEARCH/REPLACE block: find the exact 'search' text and replace it with 'replace'. If the search text matches multiple locations, nothing is modified and every match is reported with line numbers — retry with more surrounding context lines so the search block is unique. No other edit modes are supported. Rule: the file must have been read first — edit is refused for files (or line ranges) that were not returned by a previous read call, so read the whole file or the exact line range before editing.",
         {{"path", str_prop("file path")},
          {"search", str_prop("exact text block to find (include enough context to be unique)")},
          {"replace", str_prop("replacement text block")}},
@@ -4417,15 +4523,28 @@ static int run_selftest()
            "rg cleanup");
 
     std::string edit_out;
+    cell::box::reset_read_log();
     expect(cell::box::write("edit_test.txt", "aaa\nbbb\nccc\n"), "edit fixture");
+    expect(!cell::box::edit("edit_test.txt", "bbb", "BBB", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses unread file");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "aaa\nbbb\nccc\n", "edit fixture read");
     expect(cell::box::edit("edit_test.txt", "bbb", "BBB", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit search/replace");
-    expect(cell::box::read("edit_test.txt", out) && out == "aaa\nBBB\nccc\n", "box::edit result");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "aaa\nBBB\nccc\n", "box::edit result");
     expect(cell::box::write("edit_test.txt", "dup\ndup\n"), "edit ambiguity fixture");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true), "edit ambiguity fixture read");
     expect(!cell::box::edit("edit_test.txt", "dup", "X", edit_out) && edit_out.find("matched 2") != std::string::npos, "box::edit ambiguity warns");
-    expect(cell::box::read("edit_test.txt", out) && out == "dup\ndup\n", "box::edit no change on ambiguity");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "dup\ndup\n", "box::edit no change on ambiguity");
     expect(!cell::box::edit("edit_test.txt", "nope", "X", edit_out) && edit_out.find("not found") != std::string::npos, "box::edit no-match error");
     expect(cell::box::edit("edit_test.txt", "dup\ndup", "X\ndup", edit_out), "box::edit multi-line search");
-    expect(cell::box::read("edit_test.txt", out) && out == "X\ndup\n", "box::edit multi-line result");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "X\ndup\n", "box::edit multi-line result");
+    cell::box::reset_read_log();
+    expect(cell::box::write("edit_test.txt", "a\nb\nc\nd\n"), "edit range fixture");
+    expect(cell::box::read("edit_test.txt", out, 2, 3, true) && out == "b\nc\n", "edit partial read");
+    expect(!cell::box::edit("edit_test.txt", "d", "D", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses lines outside read range");
+    expect(cell::box::edit("edit_test.txt", "c", "C", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows lines inside read range");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true), "edit full read after partial");
+    expect(cell::box::edit("edit_test.txt", "d", "D", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows after full read");
+    cell::box::reset_read_log();
+    expect(!cell::box::edit("edit_test.txt", "a", "A", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refused after reset_read_log");
     expect(cell::box::remove("edit_test.txt"), "edit cleanup");
 
     {
@@ -5505,6 +5624,7 @@ int main(int argc, char const *argv[])
                 {
                     long long before = (long long)s->msg().size();
                     s->msg().clear();
+                    cell::box::reset_read_log(); // context gone: recorded reads no longer apply
                     ensure_prompt(s);
                     s->unload();
                     log.info("sess", std::format("cleared id={} msgs_before={}", s->id(), before));
@@ -5953,6 +6073,7 @@ int main(int argc, char const *argv[])
                 if (cmd == "/compact")
                 {
                     cell::sys::println("{}", compact(s));
+                    cell::box::reset_read_log(); // compaction drops read tool results from context
                     s->unload();
                     cell::config::save(cfg);
                     continue;
