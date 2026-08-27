@@ -10,7 +10,7 @@ Connect to OpenAI or Anthropic, chat with your codebase, and let the LLM read, w
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ```
-cell --provider openai --model gpt-4o --key sk-***
+cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-***
 ```
 
 </div>
@@ -28,6 +28,7 @@ cell --provider openai --model gpt-4o --key sk-***
 | 🛡️ | **Security Sandbox** | Blocks dangerous commands (`rm -rf`, `shutdown`, path traversal...) |
 | 🎨 | **Colored Output** | ANSI escape codes with Windows Virtual Terminal support |
 | ⚡ | **Agent Loop** | Up to 8 rounds of tool calls per user message |
+| 🧠 | **Chain of Thought** | `/think` streams reasoning output (OpenAI `reasoning_content` / Anthropic `thinking`) |
 | 🧪 | **Self-Test** | Built-in test suite — run with `--selftest` |
 
 ## Quick Start
@@ -53,11 +54,18 @@ g++ -std=c++26 -O2 -o cell.exe cell.cpp -lcurl -lsodium
 ### Run
 
 ```bash
-# Interactive mode
-cell.exe --provider openai --model gpt-4o --key YOUR_API_KEY
+# Interactive mode (creates an openai provider + stores the key in the encrypted vault)
+cell.exe --provider openai --base https://api.openai.com/v1 --model gpt-4o --key YOUR_API_KEY
 
 # Use Anthropic
-cell.exe --provider anthropic --model claude-sonnet-4-20250514 --key YOUR_API_KEY
+cell.exe --provider anthropic --base https://api.anthropic.com --model claude-sonnet-4-20250514 --key YOUR_API_KEY
+
+# Inside the REPL, providers are managed with /provide:
+#   /provide add openai:https://api.openai.com/v1 key:YOUR_API_KEY   add + select a provider
+#   /provides                                                        list providers
+#   /models                                                          fetch the model list
+#   /model gpt-4o                                                    switch model
+#   /think                                                           toggle chain-of-thought
 
 # Resume a saved session
 cell.exe --provider openai --model gpt-4o --session my-session
@@ -122,10 +130,10 @@ session cleared: 6333a2b6f7084f1a-1787819024 (removed 11 messages)
 
 ```
 usage: cell [options]
-  --provider openai|anthropic  llm provider (default: openai)
-  --base URL                   api base url for the default model
+  --provider NAME              select an existing provider, or create one (style = NAME)
+  --base URL                   api base url for the current provider
   --model MODEL                default model name
-  --proxy URL                  http(s) proxy for the default model
+  --proxy URL                  http(s) proxy for the current provider
   --key KEY                    api key (saved to the encrypted vault)
   --session ID                 resume an existing session
   --system TEXT                system prompt
@@ -138,10 +146,10 @@ usage: cell [options]
 
 | Option | Value | Default | Description |
 |---|---|---|---|
-| `--provider` | `openai` \| `anthropic` | `openai` | LLM provider, selects the API protocol and endpoint style |
-| `--base` | URL | see below | API base URL — works with the official APIs or any OpenAI-compatible gateway |
-| `--model` | model name string | see below | Model name, e.g. `gpt-4o-mini`, `claude-3-5-haiku-latest` |
-| `--proxy` | URL | none | HTTP(S) proxy for the current model, e.g. `http://user:pass@proxy:8080`; localhost/loopback traffic always bypasses it |
+| `--provider` | provider name (`openai` \| `anthropic` \| any alias) | none | Selects an existing provider; if it does not exist, one is created (the value doubles as the API style) |
+| `--base` | URL | see below | API base URL — works with the official APIs or any OpenAI/Anthropic-compatible gateway |
+| `--model` | model name string | none | Model name, e.g. `gpt-4o-mini`, `claude-3-5-haiku-latest` |
+| `--proxy` | URL | none | HTTP(S) proxy for the current provider, e.g. `http://user:pass@proxy:8080`; localhost/loopback traffic always bypasses it |
 | `--key` | API key | none | Never stored in plaintext — encrypted with libsodium into `.cell/.crypt` |
 | `--session` | session ID | last used session | Resumes chat history from `.cell/sessions/<ID>.json` |
 | `--system` | prompt text | built-in coding-agent prompt | Replaces the system prompt entirely |
@@ -153,11 +161,14 @@ usage: cell [options]
 
 At startup the final configuration is assembled as follows:
 
-1. `.cell/config.json` is loaded (model list + current model index + system prompt + last session ID + log cap);
-2. A fresh install ships with **no models** — on first launch cell prints a hint and you register a model
-   with `/model openai:gpt-4o base:URL key:KEY` (inside the REPL) or via the CLI options below;
-3. `--provider` / `--base` / `--model` / `--proxy` are applied **in place onto the current model entry** (only non-empty fields are changed);
-4. `--key` is written to the encrypted vault and bound to the current entry; `--session` / `--system` directly replace the corresponding fields.
+1. `.cell/config.json` is loaded (provider list + current provider/model + system prompt + last session ID + log cap);
+2. A fresh install ships with **no providers and no models** — on first launch cell prints a hint and
+   you register a provider with `/provide add openai:URL key:KEY` (inside the REPL) or via the CLI
+   options below;
+3. `--provider` selects an existing provider by name, or (legacy behavior) creates one from
+   `--base` / `--model` / `--proxy`; non-empty fields are applied in place onto the current provider;
+4. `--key` is written to the encrypted vault and bound to the current provider; `--session` /
+   `--system` directly replace the corresponding fields.
 
 > Note: CLI overrides happen after the config is loaded, and the merged result is **written back** to
 > `config.json` on exit — so provider/base/model changes passed on the command line are persistent
@@ -167,8 +178,9 @@ At startup the final configuration is assembled as follows:
 
 **`--provider` / `--base` / `--model` / `--proxy`**
 
-All four modify the *current model entry* (the item `current_model` points to in `config.json`,
-entry 0 by default). You don't need to pass all of them — for example, switching only the protocol:
+These modify the *current provider entry*. `--provider` selects an existing provider by name; when
+the name does not exist it is created and its name doubles as the API style (`openai` or
+`anthropic`). You don't need to pass all of them — for example, switching only the style:
 
 ```bash
 cell.exe --provider anthropic          # keeps current base/model, changes protocol only
@@ -188,19 +200,19 @@ URL); `localhost`, `127.0.0.1` and `::1` are always excluded:
 cell.exe --proxy http://user:pass@proxy.example.com:8080
 ```
 
-If an entry's base is empty, OpenAI defaults to `https://api.openai.com/v1` and Anthropic defaults
-to `https://api.anthropic.com` — give models you configure yourself an explicit base instead.
+If a provider's base is empty, OpenAI defaults to `https://api.openai.com/v1` and Anthropic defaults
+to `https://api.anthropic.com` — give providers you configure yourself an explicit base instead.
 
 **`--key`**
 
-The key is encrypted and stored in `.cell/.crypt` under the id `model:<provider>:<model>`
-(e.g. `model:openai:gpt-4o-mini`) and bound to the current model entry. Passing a key again for the
-same model overwrites the old value; the plaintext is securely zeroed in memory right after.
+The key is encrypted and stored in `.cell/.crypt` under the id `provider:<name>`
+(e.g. `provider:openai`) and bound to the current provider entry. Passing a key again for the
+same provider overwrites the old value; the plaintext is securely zeroed in memory right after.
 
 **API Key resolution priority** (decided per request)
 
-1. The vault key bound to the current entry (written by `--key` or `/model ... key:KEY`);
-2. The environment variable `OPENAI_API_KEY` (openai) or `ANTHROPIC_API_KEY` (anthropic);
+1. The vault key bound to the current provider (written by `--key` or `/provide add ... key:KEY`);
+2. The environment variable `OPENAI_API_KEY` (openai style) or `ANTHROPIC_API_KEY` (anthropic style);
 3. The generic vault key `api_key`.
 
 If none of the three is available, the first turn fails with an error explaining how to set one.
@@ -263,9 +275,14 @@ sent to the model.
 | Command | Description |
 |---------|-------------|
 | `/help` | Show all commands |
-| `/models` | List configured models (entry 0 is the default) |
-| `/model [provider:NAME] [base:URL] [key:KEY] [proxy:URL]` | Switch models; with `base:`/`key:`/`proxy:` it registers/updates instead |
-| `/model rm provider:NAME` | Delete a model (also removes its stored vault key) |
+| `/provides` | List configured providers |
+| `/provide NAME` | Select a provider (persists across sessions) |
+| `/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]` | Add a provider (openai or anthropic API style) |
+| `/provide rm NAME` | Delete a provider (also removes its stored vault key) |
+| `/models` | Fetch the model list from the current provider |
+| `/model NAME` | Switch to a model of the current provider |
+| `/think [on\|off]` | Toggle chain-of-thought (CoT) output |
+| `/tool [on\|off]` | Toggle tool calls (off = plain chat, no tools sent to the model) |
 | `/sessions` | List saved sessions |
 | `/session ID` | Switch to another saved session |
 | `/usages` | Show per-model and per-session usage statistics |
@@ -277,80 +294,97 @@ sent to the model.
 | `/new` | Start a fresh session (old sessions are kept on disk) |
 | `/exit` \| `/quit` | Exit the program |
 
-#### 2.2 `/models` — List Models
+#### 2.2 `/provides` and `/provide` — Providers
 
-Example output:
-
-```
-  [0] openai:gpt-4o-mini  <current>
-       base: https://api.openai.com/v1
-       proxy: http://user:pass@proxy:8080
-       key:  stored
-  [1] anthropic:claude-3-5-haiku-latest
-       base: https://api.anthropic.com
-```
-
-The number in brackets is the index (i.e. `current_model`); `<current>` marks the active model.
-`key: stored` means a vault key is bound to that model — otherwise resolution falls back to the
-environment variable or the generic `api_key`. A `proxy:` line means API traffic for that model is
-routed through the given HTTP(S) proxy; without one, libcurl's default (environment) settings apply.
-
-#### 2.3 `/model` — Switch / Register Models
-
-**Form 1: switch to an existing model**
+A **provider** is one API endpoint in one API style. The style prefix selects the protocol and
+endpoint format (`openai` → `{base}/chat/completions`, `anthropic` → `{base}/v1/messages`).
+Models are **not** stored in the config — they are fetched from the provider's models endpoint
+(`GET {base}/models` / `GET {base}/v1/models`); only the active model name is persisted.
 
 ```
-/model NAME                  # matched exactly as provider:NAME under the current provider
-/model provider:NAME         # provider given explicitly
+/provides                              # list providers
+/provide NAME                          # select a provider (persists across sessions)
+/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]
+/provide rm NAME
 ```
 
-Matching rule: a bare `NAME` is combined with the current model's provider into a label and must
-**match exactly** (e.g. when the current provider is openai, `/model gpt-4o` matches
-`openai:gpt-4o`). If not found, an error suggests using the register form instead.
-
-**Form 2: register a new model / update an existing one (and switch to it)**
-
-Carrying `base:` or `key:` (either one) switches to register mode:
+`/provides` example output:
 
 ```
-/model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-ant-xxx
-/model openai:gpt-4o base:https://your-proxy.example.com/v1
-/model openai:gpt-4o proxy:http://user:pass@proxy:8080
+  [0] openai  <current>
+       style: openai
+       base:  https://api.openai.com/v1
+       key:   stored
+       model: gpt-4o-mini
+  [1] claude
+       style: anthropic
+       base:  https://api.anthropic.com
 ```
 
-**Form 3: delete a model**
+- Adding a provider: the prefix (`openai:` / `anthropic:`) selects the API style, the rest of the
+  token is the base URL (a spaced form `openai: URL` is accepted too). The provider is named after
+  the style unless `name:ALIAS` is given, and it becomes the current provider immediately;
+- `key:KEY` is stored encrypted in the vault under `provider:<name>`; without it, resolution falls
+  back to the environment variable or the generic `api_key`;
+- `proxy:URL` routes that provider's API traffic through the given HTTP(S) proxy;
+- `/provide rm NAME` removes the provider and its vault key; if it was the current provider, the
+  selection moves to the first remaining one (and the model name is cleared, since it belonged to
+  the removed provider);
+- Selecting a provider is written back to `.cell/config.json` immediately, so it survives restarts.
+
+#### 2.3 `/models` and `/model` — Models
+
+`/models` fetches the model list from the current provider's models endpoint and prints it with
+`<current>` marking the active model:
 
 ```
-/model rm provider:NAME        # e.g. /model rm openai:gpt-4o
+provider openai (openai) - current model: gpt-4o-mini
+  gpt-4o-mini  <current>
+  gpt-4o
+  gpt-4.1-mini
 ```
 
-The entry is removed from `config.json` and any vault key bound to it
-(`model:<provider>:<name>`) is deleted too. If the removed entry was the current model, the
-selection moves to the next remaining entry (or none).
+A failed fetch (network error, wrong key, HTTP error) prints the reason; the REPL keeps running.
 
-Behavior details:
-
-- If the label `provider:model` doesn't exist → a new entry is appended and made current;
-- If it exists → only explicitly provided fields are updated (base changes only when `base:` is
-  given; an empty `key:` does not clear the old secret; `proxy:` similarly only updates when given);
-- `key:KEY` is stored encrypted in the vault under `model:<provider>:<model>`;
-- The result is written back to `.cell/config.json` immediately — no `/save` needed.
-
-**Tolerant spacing**: these forms are equivalent (values may also sit in the next token):
+`/model NAME` switches the current model by name and persists it:
 
 ```
-/model anthropic: claude-opus4.8 base: https://api.anthropic.com key: sk-ant-xxx
+/model gpt-4o              # switch to gpt-4o under the current provider
 ```
 
-Unrecognized extra tokens produce a warning and are ignored. Note: plain `/model NAME` only
-*switches* — nothing is created; registering requires `base:` or `key:`.
+The name is stored as-is (it is not required to appear in the fetched list — a warning is printed
+when it does not, since some gateways accept arbitrary names). There is no registration/delete
+form: adding a provider is done with `/provide add`, and deleting one with `/provide rm`.
 
-**Connectivity probe**: at startup, after `/new`, and after every `/model` change, cell performs a
-lightweight GET on the model's endpoint (OpenAI: `GET {base}/models`; Anthropic:
-`GET {base}/v1/models`; 5s timeout) and logs the result. A failure prints
-`[model unreachable] <label>: <reason>` as a warning but does not block the REPL.
+**Connectivity probe**: at startup, after `/new`, after `/provide add`, and after every `/model`
+change, cell performs a lightweight GET on the provider's models endpoint (OpenAI:
+`GET {base}/models`; Anthropic: `GET {base}/v1/models`; 5s timeout) and logs the result. A failure
+prints `[provider unreachable] <name>: <reason>` as a warning but does not block the REPL.
 
-#### 2.4 `/sessions` — Session List
+#### 2.4 `/think` — Chain of Thought
+
+`/think` toggles CoT output; `/think on` and `/think off` set it explicitly. The flag is persisted
+in `config.json`.
+
+- **OpenAI-style providers**: reasoning models already stream `delta.reasoning_content`; with
+  `/think` on it is displayed dim/gray ahead of the answer (no extra request parameters are sent,
+  so non-reasoning models are unaffected);
+- **Anthropic-style providers**: the request body gains `thinking: {type:"enabled",
+  budget_tokens:2048}` (max_tokens is raised accordingly) and the streamed `thinking_delta` blocks
+  are displayed dim/gray. The thinking blocks are kept in the stored assistant message, which
+  Anthropic requires when tool calls follow a thinking turn.
+
+The reasoning text is display-only — it is not fed back to the model on later turns (except for
+Anthropic's thinking blocks, which must be echoed verbatim).
+
+#### 2.5 `/tool` — Tool Calls
+
+`/tool off` disables tool calling: the tool definitions are no longer sent with the request, so
+the model answers as a plain chat without touching the filesystem; `/tool on` re-enables them
+(the flag is persisted in `config.json`). `/tool` alone toggles the state. The current state is
+shown on the startup line (`tools=off` when disabled).
+
+#### 2.6 `/sessions` — Session List
 
 Scans `.cell/sessions/*.json` and prints one line per session: session ID, message count, and a
 snippet of the first user message (≤60 chars); `*` marks the current session:
@@ -368,14 +402,14 @@ in `usages.json` are both removed (per-model aggregates are kept). Deleting the 
 switches to a fresh one. Orphaned usage records (session files deleted externally) are pruned
 automatically at startup and when `/usages` runs.
 
-#### 2.5 `/usages` — Usage Statistics
+#### 2.7 `/usages` — Usage Statistics
 
 Reads and summarizes `.cell/usages.json`, grouped by model and by session:
 
 `requests`, `messages` (messages added), `in_chars`/`out_chars` (characters sent/received),
 and `in_tok`/`out_tok` (tokens — present only if the API returns usage data).
 
-#### 2.6 `/compact` — Context Compaction
+#### 2.8 `/compact` — Context Compaction
 
 Use this when a long conversation inflates the context. Strategy:
 
@@ -389,7 +423,7 @@ Use this when a long conversation inflates the context. Strategy:
 
 Compaction itself is one LLM call and counts toward usage statistics.
 
-#### 2.7 `/skills` and `/skill` — Skill System
+#### 2.9 `/skills` and `/skill` — Skill System
 
 Skills are Markdown files under `.cell/skills/`, scanned **recursively** (so directory-style
 skills work too — e.g. `.cell/skills/my-suite/SKILL.md`). They are discovered only if they start
@@ -412,7 +446,7 @@ Body instructions injected when the skill is loaded...
 - `/skill NAME` wraps the skill body into a system message appended to the current session and saves
   immediately; it stays in effect for the rest of the session (loading repeatedly appends copies).
 
-#### 2.8 `/clear`, `/save` and `/new`
+#### 2.10 `/clear`, `/save` and `/new`
 
 - `/clear`: empties the current session's message history but **keeps the session id** — the
   system prompt and skill list are re-injected and the file is saved immediately. Useful for
@@ -424,7 +458,7 @@ Body instructions injected when the skill is loaded...
   with the system prompt and skill list re-injected. **Old session files are kept on disk** and can
   be revisited with `/session ID`.
 
-#### 2.9 Appendix: Tool Approval Prompts
+#### 2.11 Appendix: Tool Approval Prompts
 
 During a conversation the model may call one of 8 tools:
 
@@ -489,7 +523,7 @@ The tool creates a `.cell/` directory in your working directory:
 
 ```
 .cell/
-├── config.json       # Multi-model config: {"models":[{provider,base,model,key,proxy}...], "current_model":N, "log_max_lines":1000}
+├── config.json       # Provider config: {"providers":[{name,style,base,key,proxy}...], "current_provider":NAME, "current_model":NAME, "think":false, "tools":true, "log_max_lines":1000}
 ├── .crypt            # Encrypted API key vault
 ├── .key              # Symmetric encryption key
 ├── usages.json       # Per-model and per-session usage statistics

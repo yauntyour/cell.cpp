@@ -1574,34 +1574,36 @@ namespace cell
     } // namespace sys
     namespace config
     {
-        struct model_entry
+        // a model provider: one API endpoint in one API style (openai | anthropic).
+        // models are not stored in the config; they are fetched from the provider
+        // (GET {base}/models or {base}/v1/models) and only the active model name is kept.
+        struct provider_entry
         {
-            std::string provider = "openai"; // openai | anthropic
-            std::string base;                // api base url
-            std::string model;               // model name
-            std::string key_id;              // vault map key for the api key (optional)
-            std::string proxy;               // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+            std::string name;  // unique id, e.g. "openai", "claude", "deepseek"
+            std::string style = "openai"; // "openai" | "anthropic"
+            std::string base;  // api base url
+            std::string key_id; // vault map key for the api key (optional)
+            std::string proxy;  // http(s) proxy url, e.g. http://user:pass@host:port (optional)
 
-            std::string label() const { return provider + ":" + model; }
             nlohmann::json to_json() const
             {
                 nlohmann::json j;
-                j["provider"] = provider;
+                j["name"] = name;
+                j["style"] = style;
                 if (!base.empty())
                     j["base"] = base;
-                j["model"] = model;
                 if (!key_id.empty())
                     j["key"] = key_id;
                 if (!proxy.empty())
                     j["proxy"] = proxy;
                 return j;
             }
-            static model_entry from_json(const nlohmann::json &j)
+            static provider_entry from_json(const nlohmann::json &j)
             {
-                model_entry e;
-                e.provider = j.value("provider", "openai");
+                provider_entry e;
+                e.name = j.value("name", "");
+                e.style = j.value("style", "openai");
                 e.base = j.value("base", "");
-                e.model = j.value("model", "");
                 e.key_id = j.value("key", "");
                 e.proxy = j.value("proxy", "");
                 return e;
@@ -1609,8 +1611,11 @@ namespace cell
         };
         struct settings
         {
-            std::vector<model_entry> models;
-            size_t current = 0; // index of the active model (first entry is the default)
+            std::vector<provider_entry> providers; // empty until the user adds one
+            std::string current_provider;          // provider name (empty => first provider)
+            std::string current_model;             // active model name (fetched from the provider)
+            bool think = false;                    // chain-of-thought (CoT) enabled
+            bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
             std::string system_prompt =
                 "You are a helpful assistant. Inspect, search and modify files and run commands with these tools:\n"
                 "  ls    - list a directory (one level, paginated, max 500 entries/page; specify page for more)\n"
@@ -1635,34 +1640,55 @@ namespace cell
             size_t log_max_lines = 1000; // keep at most this many lines in logs/cell.log
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
-            bool empty() const { return models.empty(); }
-            const model_entry *current_entry() const
+            bool empty() const { return providers.empty(); }
+            const provider_entry *current_provider_entry() const
             {
-                if (models.empty())
+                if (providers.empty())
                     return nullptr;
-                return &models[(current < models.size()) ? current : 0];
+                for (auto &p : providers)
+                    if (p.name == current_provider)
+                        return &p;
+                return &providers[0];
             }
-            model_entry *current_entry()
+            provider_entry *current_provider_entry()
             {
-                if (models.empty())
+                if (providers.empty())
                     return nullptr;
-                return &models[(current < models.size()) ? current : 0];
+                for (auto &p : providers)
+                    if (p.name == current_provider)
+                        return &p;
+                return &providers[0];
+            }
+            // "provider:model" label for stats/log output
+            std::string model_label() const
+            {
+                const provider_entry *p = current_provider_entry();
+                if (!p)
+                    return "(none)";
+                return current_model.empty() ? p->name : p->name + ":" + current_model;
             }
         };
         std::filesystem::path file() { return root / "config.json"; }
 
-        // find a model by model-name or "provider:model" exact label
-        static int find(const settings &s, const std::string &name, const std::string &provider = "")
+        // find a provider by name
+        static int find(const settings &s, const std::string &name)
         {
-            std::string label = provider.empty() ? "" : (provider + ":" + name);
-            for (size_t i = 0; i < s.models.size(); i++)
-            {
-                if (!provider.empty() && s.models[i].label() == label)
+            for (size_t i = 0; i < s.providers.size(); i++)
+                if (s.providers[i].name == name)
                     return (int)i;
-                if (provider.empty() && s.models[i].model == name)
-                    return (int)i;
-            }
             return -1;
+        }
+        // pick a provider name that does not collide with existing ones
+        static std::string unique_name(const settings &s, const std::string &wanted)
+        {
+            if (find(s, wanted) < 0)
+                return wanted;
+            for (int i = 2;; i++)
+            {
+                std::string n = wanted + std::to_string(i);
+                if (find(s, n) < 0)
+                    return n;
+            }
         }
 
         using config_result = std::expected<settings, std::string>;
@@ -1679,25 +1705,85 @@ namespace cell
                     return std::unexpected(std::string("config parse error"));
                 if (!j.is_object())
                     return std::unexpected(std::string("config is not an object"));
-                if (j.contains("models") && j["models"].is_array())
+                if (j.contains("providers") && j["providers"].is_array())
                 {
-                    for (auto &mj : j["models"])
-                        s.models.push_back(model_entry::from_json(mj));
-                    s.current = j.value("current_model", (size_t)0);
+                    for (auto &pj : j["providers"])
+                    {
+                        provider_entry p = provider_entry::from_json(pj);
+                        if (!p.name.empty())
+                            s.providers.push_back(std::move(p));
+                    }
+                    s.current_provider = j.value("current_provider", "");
+                    s.current_model = j.value("current_model", "");
                 }
                 else
                 {
-                    // legacy flat format -> synthesize a single model entry
-                    model_entry e;
-                    e.provider = j.value("provider", "openai");
-                    e.base = j.value("base", "");
-                    e.model = j.value("model", "");
-                    if (!e.model.empty())
-                        s.models.push_back(std::move(e));
+                    // legacy formats -> migrate to providers
+                    if (j.contains("models") && j["models"].is_array())
+                    {
+                        // legacy multi-model: {"models":[{provider,base,model,key,proxy}...],"current_model":<index>}
+                        std::vector<std::pair<provider_entry, std::string>> legacy; // provider + model name
+                        size_t cur = j.value("current_model", (size_t)0);
+                        for (auto &mj : j["models"])
+                        {
+                            provider_entry e;
+                            e.style = mj.value("provider", "openai");
+                            e.base = mj.value("base", "");
+                            e.key_id = mj.value("key", "");
+                            e.proxy = mj.value("proxy", "");
+                            legacy.push_back({std::move(e), mj.value("model", "")});
+                        }
+                        if (cur >= legacy.size())
+                            cur = 0;
+                        if (!legacy.empty())
+                        {
+                            for (size_t i = 0; i < legacy.size(); i++)
+                            {
+                                auto &[pe, model] = legacy[i];
+                                bool dup = false;
+                                for (auto &p2 : s.providers)
+                                    if (p2.style == pe.style && p2.base == pe.base &&
+                                        p2.key_id == pe.key_id && p2.proxy == pe.proxy)
+                                    {
+                                        dup = true;
+                                        if (i == cur)
+                                        {
+                                            s.current_provider = p2.name;
+                                            s.current_model = model;
+                                        }
+                                        break;
+                                    }
+                                if (dup)
+                                    continue;
+                                pe.name = unique_name(s, pe.style);
+                                s.providers.push_back(pe);
+                                if (i == cur)
+                                {
+                                    s.current_provider = pe.name;
+                                    s.current_model = model;
+                                }
+                            }
+                        }
+                    }
+                    else if (j.contains("provider") && j.contains("model"))
+                    {
+                        // legacy flat: {"provider":...,"base":...,"model":...,"key":...,"proxy":...}
+                        provider_entry e;
+                        e.style = j.value("provider", "openai");
+                        e.base = j.value("base", "");
+                        e.key_id = j.value("key", "");
+                        e.proxy = j.value("proxy", "");
+                        e.name = unique_name(s, e.style);
+                        s.providers.push_back(std::move(e));
+                        s.current_provider = s.providers.back().name;
+                        s.current_model = j.value("model", "");
+                    }
                 }
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
                 s.log_max_lines = j.value("log_max_lines", (size_t)1000);
+                s.think = j.value("think", false);
+                s.tools = j.value("tools", true);
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
@@ -1715,10 +1801,13 @@ namespace cell
             std::filesystem::create_directories(root, ec);
             nlohmann::json j;
             nlohmann::json arr = nlohmann::json::array();
-            for (auto &e : s.models)
-                arr.push_back(e.to_json());
-            j["models"] = arr;
-            j["current_model"] = s.current;
+            for (auto &p : s.providers)
+                arr.push_back(p.to_json());
+            j["providers"] = arr;
+            j["current_provider"] = s.current_provider;
+            j["current_model"] = s.current_model;
+            j["think"] = s.think;
+            j["tools"] = s.tools;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
             j["log_max_lines"] = s.log_max_lines;
@@ -2421,11 +2510,12 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string text;
+                std::string reasoning;
                 std::string sse_buf;
                 size_t sse_base = 0;
                 std::string url = api_base + "/chat/completions";
@@ -2438,6 +2528,14 @@ namespace cell
                         if (!j.contains("choices") || j["choices"].empty())
                             return;
                         auto &delta = j["choices"][0]["delta"];
+                        // chain-of-thought: reasoning models stream delta.reasoning_content
+                        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
+                        {
+                            std::string t = delta["reasoning_content"].get<std::string>();
+                            reasoning += t;
+                            if (on_reason)
+                                on_reason(std::span<const char>(t));
+                        }
                         if (delta.contains("content") && delta["content"].is_string())
                             [[likely]]
                         {
@@ -2490,6 +2588,8 @@ namespace cell
                     reply["content"] = text;
                 if (!tool_calls.empty())
                     reply["tool_calls"] = tool_calls;
+                if (!reasoning.empty())
+                    cell::sys::logger::instance().debug("llm", std::format("reasoning_chars={}", reasoning.size()));
                 return ok;
             }
         };
@@ -2506,11 +2606,13 @@ namespace cell
                 auth.append(api_key.data(), api_key.size());
                 return {"Content-Type: application/json", std::move(auth), "anthropic-version: 2023-06-01"};
             }
-            static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
+            static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream, bool think = false)
             {
                 nlohmann::json b;
                 b["model"] = model;
-                b["max_tokens"] = 4096;
+                b["max_tokens"] = think ? 8192 : 4096;
+                if (think)
+                    b["thinking"] = {{"type", "enabled"}, {"budget_tokens", 2048}};
                 nlohmann::json sys = nlohmann::json::array();
                 nlohmann::json msgs = nlohmann::json::array();
                 for (auto &m : messages)
@@ -2534,14 +2636,14 @@ namespace cell
             ~Anthropic() { curl_easy_cleanup(curl); }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, bool think = false)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err, proxy_.c_str());
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false, think).dump(), buf, hdrs, &err, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -2575,7 +2677,7 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, bool think = false, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
@@ -2615,6 +2717,21 @@ namespace cell
                                 blocks[idx]["text"].get_ref<std::string &>() += t;
                                 on_token(std::span<const char>(t));
                             }
+                            else if (dt == "thinking_delta" && blocks[idx].value("type", "") == "thinking")
+                            {
+                                if (!blocks[idx].contains("thinking") || !blocks[idx]["thinking"].is_string())
+                                    blocks[idx]["thinking"] = std::string();
+                                std::string t = delta.value("thinking", "");
+                                blocks[idx]["thinking"].get_ref<std::string &>() += t;
+                                if (on_reason)
+                                    on_reason(std::span<const char>(t));
+                            }
+                            else if (dt == "signature_delta" && blocks[idx].value("type", "") == "thinking")
+                            {
+                                if (!blocks[idx].contains("signature") || !blocks[idx]["signature"].is_string())
+                                    blocks[idx]["signature"] = std::string();
+                                blocks[idx]["signature"].get_ref<std::string &>() += delta.value("signature", "");
+                            }
                             else if (dt == "input_json_delta" && blocks[idx].value("type", "") == "tool_use")
                             {
                                 if (!blocks[idx].contains("input") || !blocks[idx]["input"].is_string())
@@ -2627,7 +2744,7 @@ namespace cell
                 };
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (ok && http >= 400)
@@ -3065,10 +3182,10 @@ namespace cell
 static void print_usage(const char *prog)
 {
     cell::sys::println("usage: {} [options]", prog);
-    cell::sys::println("  --provider openai|anthropic  default llm provider");
-    cell::sys::println("  --base URL                   api base url for the default model");
+    cell::sys::println("  --provider NAME             select an existing provider, or create one (style = NAME)");
+    cell::sys::println("  --base URL                   api base url for the current provider");
     cell::sys::println("  --model MODEL                default model name");
-    cell::sys::println("  --proxy URL                  http(s) proxy for the default model");
+    cell::sys::println("  --proxy URL                  http(s) proxy for the current provider");
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session (switches to its working directory)");
     cell::sys::println("  --system TEXT                system prompt");
@@ -3080,11 +3197,15 @@ static void print_usage(const char *prog)
 static void print_help()
 {
     cell::sys::println("commands:");
-    cell::sys::println("  /models                     list configured models");
-    cell::sys::println("  /model NAME                 switch to a configured model (NAME or provider:NAME)");
-    cell::sys::println("  /model provider:NAME base:URL key:KEY proxy:URL   add/update a model");
-    cell::sys::println("  /model rm provider:NAME      delete a model (removes its stored key too)");
-    cell::sys::println("      e.g. /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx");
+    cell::sys::println("  /provides                   list configured providers");
+    cell::sys::println("  /provide NAME               select a provider (persistent across sessions)");
+    cell::sys::println("  /provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]   add a provider (openai|anthropic API style)");
+    cell::sys::println("  /provide rm NAME            delete a provider (removes its stored key too)");
+    cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
+    cell::sys::println("  /models                     fetch the model list from the current provider");
+    cell::sys::println("  /model NAME                 switch to a model of the current provider");
+    cell::sys::println("  /think [on|off]             toggle chain-of-thought (CoT) output");
+    cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
     cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
@@ -3491,33 +3612,46 @@ static int run_selftest()
     expect(vault_file.find("\"nonce\"") != std::string::npos && vault_file.find("\"ct\"") != std::string::npos, "vault entries carry nonce + ct");
 
     cell::config::settings cfg;
-    cell::config::model_entry a;
-    a.provider = "openai";
+    cell::config::provider_entry a;
+    a.name = "openai";
+    a.style = "openai";
     a.base = "http://x/v1";
-    a.model = "m1";
     a.key_id = "k1";
     a.proxy = "http://user:pass@p:8080";
-    cell::config::model_entry b;
-    b.provider = "anthropic";
+    cell::config::provider_entry b;
+    b.name = "claude";
+    b.style = "anthropic";
     b.base = "http://y";
-    b.model = "m2";
-    cfg.models = {a, b};
-    cfg.current = 1;
+    cfg.providers = {a, b};
+    cfg.current_provider = "claude";
+    cfg.current_model = "m2";
+    cfg.think = true;
+    cfg.tools = false;
     cfg.system_prompt = "sys";
     cfg.log_max_lines = 500;
-    expect(cell::config::save(cfg), "config::save multi-model");
+    expect(cell::config::save(cfg), "config::save providers");
     auto cfg_res = cell::config::load();
-    expect(cfg_res.has_value() && cfg_res->models.size() == 2, "config::load multi-model");
+    expect(cfg_res.has_value() && cfg_res->providers.size() == 2, "config::load providers");
     expect(cfg_res.has_value() && cfg_res->log_max_lines == 500, "config log_max_lines roundtrip");
-    expect(cfg_res.has_value() && cfg_res->current == 1 && cfg_res->current_entry()->model == "m2", "config current entry");
-    expect(cfg_res.has_value() && cfg_res->models[0].label() == "openai:m1", "config model label");
-    expect(cfg_res.has_value() && cfg_res->models[0].proxy == "http://user:pass@p:8080", "config proxy roundtrip");
-    expect(cfg_res.has_value() && cfg_res->models[1].proxy.empty(), "config proxy default empty");
-    expect(cell::config::find(*cfg_res, "m1") == 0 && cell::config::find(*cfg_res, "m2", "anthropic") == 1 && cell::config::find(*cfg_res, "nope") == -1, "config::find");
+    expect(cfg_res.has_value() && cfg_res->current_provider == "claude" && cfg_res->current_model == "m2", "config current provider/model");
+    expect(cfg_res.has_value() && cfg_res->think, "config think roundtrip");
+    expect(cfg_res.has_value() && !cfg_res->tools, "config tools roundtrip");
+    expect(cfg_res.has_value() && cfg_res->providers[0].name == "openai" && cfg_res->providers[0].style == "openai", "config provider fields");
+    expect(cfg_res.has_value() && cfg_res->providers[0].proxy == "http://user:pass@p:8080", "config proxy roundtrip");
+    expect(cfg_res.has_value() && cfg_res->providers[1].proxy.empty(), "config proxy default empty");
+    expect(cfg_res.has_value() && cfg_res->model_label() == "claude:m2", "config model_label");
+    expect(cfg_res.has_value() && cell::config::find(*cfg_res, "claude") == 1 && cell::config::find(*cfg_res, "nope") == -1, "config::find");
     cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
     auto legacy_res = cell::config::load();
-    expect(legacy_res.has_value() && legacy_res->models.size() == 1 && legacy_res->models[0].provider == "anthropic" && legacy_res->models[0].model == "legacy", "config legacy flat load");
+    expect(legacy_res.has_value() && legacy_res->providers.size() == 1 && legacy_res->providers[0].style == "anthropic" && legacy_res->providers[0].name == "anthropic", "config legacy flat load");
+    expect(legacy_res.has_value() && legacy_res->current_model == "legacy", "config legacy current model");
     expect(legacy_res.has_value() && legacy_res->session_id == "s1", "config legacy session");
+    cell::box::write((cell::root / "config.json").string(), "{\"models\":[{\"provider\":\"openai\",\"model\":\"m1\",\"base\":\"http://a\"},{\"provider\":\"anthropic\",\"model\":\"m2\",\"base\":\"http://b\"}],\"current_model\":1}");
+    auto mig_res = cell::config::load();
+    expect(mig_res.has_value() && mig_res->providers.size() == 2 && mig_res->current_provider == "anthropic" && mig_res->current_model == "m2", "config legacy models migration");
+    cell::box::remove((cell::root / "config.json").string());
+    auto fresh_res = cell::config::load();
+    expect(fresh_res.has_value() && fresh_res->providers.empty() && fresh_res->current_model.empty() && !fresh_res->think && fresh_res->tools, "config fresh init has no built-in providers");
     cell::box::write((cell::root / "config.json").string(), "{invalid");
     expect(!cell::config::load().has_value(), "config::load reports parse error");
 
@@ -3678,38 +3812,55 @@ int main(int argc, char const *argv[])
     long long total_llm_requests = 0;
     long long total_tool_calls = 0;
 
-    // apply CLI overrides onto the current model entry
-    if (!provider_arg.empty() || !model_arg.empty() || !base_arg.empty() || !proxy_arg.empty())
+    // apply CLI overrides: --provider NAME selects an existing provider by name;
+    // when it does not exist (or nothing is configured at all) the legacy behavior
+    // is kept: a provider is created from --provider/--base/--model/--proxy/--key.
+    if (!provider_arg.empty())
     {
-        if (cell::config::model_entry *e = cfg.current_entry(); e)
+        int idx = cell::config::find(cfg, provider_arg);
+        if (idx >= 0)
+            cfg.current_provider = provider_arg;
+        else
         {
-            if (!provider_arg.empty())
-                e->provider = provider_arg;
+            cell::config::provider_entry ne;
+            ne.name = provider_arg;
+            ne.style = provider_arg; // "openai" | "anthropic" style, matched by name
+            cfg.providers.push_back(std::move(ne));
+            cfg.current_provider = provider_arg;
+        }
+    }
+    if (!model_arg.empty() || !base_arg.empty() || !proxy_arg.empty())
+    {
+        if (cell::config::provider_entry *p = cfg.current_provider_entry(); p)
+        {
             if (!model_arg.empty())
-                e->model = model_arg;
+                cfg.current_model = model_arg;
             if (!base_arg.empty())
-                e->base = base_arg;
+                p->base = base_arg;
             if (!proxy_arg.empty())
-                e->proxy = proxy_arg;
+                p->proxy = proxy_arg;
         }
         else
         {
-            cell::config::model_entry ne;
-            ne.provider = provider_arg.empty() ? "openai" : provider_arg;
-            ne.model = model_arg;
+            cell::config::provider_entry ne;
+            ne.name = "openai";
+            ne.style = "openai";
             ne.base = base_arg;
             ne.proxy = proxy_arg;
-            cfg.models.push_back(std::move(ne));
-            cfg.current = cfg.models.size() - 1;
+            cfg.providers.push_back(std::move(ne));
+            cfg.current_provider = cfg.providers.back().name;
+            cfg.current_model = model_arg;
         }
     }
     if (!key_arg.empty())
     {
-        std::string kid = "model:" + (cfg.current_entry() ? cfg.current_entry()->label() : "default");
-        if (cell::config::model_entry *e = cfg.current_entry(); e)
-            e->key_id = kid;
-        vault.set(kid, key_arg);
-        sodium_memzero(key_arg.data(), key_arg.size());
+        if (cell::config::provider_entry *p = cfg.current_provider_entry(); p)
+        {
+            std::string kid = "provider:" + p->name;
+            p->key_id = kid;
+            vault.set(kid, key_arg);
+            sodium_memzero(key_arg.data(), key_arg.size());
+        }
     }
 
     // tool definitions for both API styles
@@ -3752,42 +3903,44 @@ int main(int argc, char const *argv[])
         }
     } cache;
 
-    auto resolve_key = [&](const cell::config::model_entry &e) -> cell::encrypt::secure_string
+    auto resolve_key = [&](const cell::config::provider_entry &p) -> cell::encrypt::secure_string
     {
-        if (!e.key_id.empty())
+        if (!p.key_id.empty())
         {
-            auto k = vault.get(e.key_id);
+            auto k = vault.get(p.key_id);
             if (!k.empty())
                 return k;
         }
-        const char *env = std::getenv(e.provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+        const char *env = std::getenv(p.style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
         if (env && *env)
             return cell::encrypt::secure_string(env);
         return vault.get("api_key");
     };
 
-    // unified request dispatch: picks the right client + tool schema for any model entry
-    auto do_chat = [&](const cell::config::model_entry &e, const cell::encrypt::secure_string &key,
-                       const nlohmann::json &msgs, bool stream, cell::net::StreamCallback on_tok,
+    // unified request dispatch: picks the right client + tool schema for any provider entry
+    auto do_chat = [&](const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
+                       const std::string &model, const nlohmann::json &msgs, bool stream,
+                       cell::net::StreamCallback on_tok, cell::net::StreamCallback on_reason,
                        nlohmann::json &reply, nlohmann::json &tc, nlohmann::json &usage, std::string &err,
-                       bool with_tools = true, cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
+                       bool with_tools = true, bool think = false,
+                       cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
-        bool ap = e.provider == "anthropic";
+        bool ap = p.style == "anthropic";
         nlohmann::json no_tools = nlohmann::json::array();
         const nlohmann::json &tools = with_tools ? (ap ? tool_defs_anthropic : tool_defs_openai) : no_tools;
         if (ap)
         {
-            auto &client = cache.a(e.base);
-            client.set_proxy(e.proxy);
+            auto &client = cache.a(p.base);
+            client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
-            return client.chat(key, e.model, msgs, tools, reply, tc, usage, err);
+                return client.chat_stream(key, model, msgs, tools, on_tok, on_reason, reply, tc, usage, err, think, on_xfer, xfer_data);
+            return client.chat(key, model, msgs, tools, reply, tc, usage, err, think);
         }
-        auto &client = cache.o(e.base);
-        client.set_proxy(e.proxy);
+        auto &client = cache.o(p.base);
+        client.set_proxy(p.proxy);
         if (stream)
-            return client.chat_stream(key, e.model, msgs, tools, on_tok, reply, tc, usage, err, on_xfer, xfer_data);
-        return client.chat(key, e.model, msgs, tools, reply, tc, usage, err);
+            return client.chat_stream(key, model, msgs, tools, on_tok, on_reason, reply, tc, usage, err, on_xfer, xfer_data);
+        return client.chat(key, model, msgs, tools, reply, tc, usage, err);
     };
 
     auto on_token = [](std::span<const char> data)
@@ -3999,55 +4152,86 @@ int main(int argc, char const *argv[])
         cell::sys::println("context: injected system_prompt={}chars{}", cfg.system_prompt.size(),
                            skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size()));
     };
-    // connectivity probe: GET the models endpoint with a short timeout; non-fatal on failure
-    auto probe_model = [&](const cell::config::model_entry &e)
+    // fetch the provider's model list from its models endpoint (5s timeout);
+    // returns false on network/protocol failure, the reason is reported in err.
+    auto fetch_models = [&](const cell::config::provider_entry &p, std::vector<std::string> &out, std::string &err) -> bool
     {
-        cell::encrypt::secure_string key = resolve_key(e);
-        std::string url = e.base + (e.provider == "anthropic" ? "/v1/models" : "/models");
+        out.clear();
+        err.clear();
+        cell::encrypt::secure_string key = resolve_key(p);
+        std::string url = p.base + (p.style == "anthropic" ? "/v1/models" : "/models");
         std::vector<std::string> hdrs;
-        if (e.provider == "anthropic")
+        if (p.style == "anthropic")
             hdrs = {"x-api-key: " + std::string(key.data(), key.size()), "anthropic-version: 2023-06-01"};
         else
             hdrs = {"Authorization: Bearer " + std::string(key.data(), key.size())};
         std::string buf;
         long code = 0;
-        std::string err;
         CURL *c = curl_easy_init();
         bool ok = c && cell::net::CURL_get(c, url.c_str(), hdrs, buf, &code, &err,
-                                     e.proxy.empty() ? nullptr : e.proxy.c_str(), 5);
+                                     p.proxy.empty() ? nullptr : p.proxy.c_str(), 5);
         curl_easy_cleanup(c);
         for (auto &h : hdrs)
             cell::encrypt::wipe(h);
-        if (ok && code == 200)
-            log.info("probe", std::format("ok model={} base={} http=200", e.label(), url));
+        if (!ok || code != 200)
+        {
+            if (err.empty())
+                err = std::format("HTTP {}", code);
+            return false;
+        }
+        try
+        {
+            auto j = nlohmann::json::parse(buf);
+            if (j.contains("data") && j["data"].is_array())
+                for (auto &m : j["data"])
+                    if (m.contains("id") && m["id"].is_string())
+                        out.push_back(m["id"].get<std::string>());
+        }
+        catch (const std::exception &e)
+        {
+            err = std::format("response parse error: {}", e.what());
+            return false;
+        }
+        return true;
+    };
+    // connectivity probe: fetch the model list; non-fatal on failure
+    auto probe_provider = [&](const cell::config::provider_entry &p)
+    {
+        std::vector<std::string> models;
+        std::string err;
+        if (fetch_models(p, models, err))
+            log.info("probe", std::format("ok provider={} models={} base={}", p.name, models.size(), p.base));
         else
         {
-            std::string why = err.empty() ? std::format("HTTP {}", code) : err;
-            log.warn("probe", std::format("fail model={} base={} err={}", e.label(), url, why));
-            cell::sys::warn("[model unreachable] {}: {}", e.label(), why);
+            std::string why = err.empty() ? "request failed" : err;
+            log.warn("probe", std::format("fail provider={} base={} err={}", p.name, p.base, why));
+            cell::sys::warn("[provider unreachable] {}: {}", p.name, why);
         }
     };
-    if (const cell::config::model_entry *e = cfg.current_entry(); e)
+    if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
     {
         std::string key_state = "missing";
-        if (!e->key_id.empty() && vault.has(e->key_id))
+        if (!p->key_id.empty() && vault.has(p->key_id))
             key_state = "stored";
-        else if (const char *env = std::getenv(e->provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"); env && *env)
+        else if (const char *env = std::getenv(p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"); env && *env)
             key_state = "env";
         else if (vault.has("api_key"))
             key_state = "generic";
-        log.info("boot", std::format("models={} active={} provider={} base={} key={} session={} skills={} prompt_chars={}",
-                                     cfg.models.size(), e->label(), e->provider,
-                                     e->base.empty() ? "(default)" : e->base, key_state,
+        log.info("boot", std::format("providers={} active={} style={} base={} model={} think={} key={} session={} skills={} prompt_chars={}",
+                                     cfg.providers.size(), p->name, p->style,
+                                     p->base.empty() ? "(default)" : p->base,
+                                     cfg.current_model.empty() ? "(none)" : cfg.current_model,
+                                     cfg.think, key_state,
                                      s->id(), skills_all.size(), cfg.system_prompt.size()));
     }
     else
-        log.info("boot", std::format("models={} active=none session={} skills={} prompt_chars={}",
-                                     cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
-    cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
-    if (cfg.models.empty())
+        log.info("boot", std::format("providers=0 active=none session={} skills={} prompt_chars={}",
+                                     s->id(), skills_all.size(), cfg.system_prompt.size()));
+    cell::sys::println("cell: session={} model={}{}{}", s->id(), cfg.model_label(),
+                       cfg.think ? " think=on" : "", cfg.tools ? "" : " tools=off");
+    if (cfg.providers.empty())
     {
-        cell::sys::warn("no model configured - register one first, e.g. /model openai:gpt-4o base:https://api.openai.com/v1 key:YOUR_KEY");
+        cell::sys::warn("no provider configured - add one first, e.g. /provide add openai:https://api.openai.com/v1 key:YOUR_KEY");
         cell::sys::println("       (or launch with --provider openai --model NAME --key KEY; see /help for commands)");
     }
     if (cell::stats::prune())
@@ -4056,26 +4240,30 @@ int main(int argc, char const *argv[])
     if (loaded_msgs > 0)
         cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
     ensure_prompt(s);
-    if (const cell::config::model_entry *e = cfg.current_entry(); e)
-        probe_model(*e);
+    if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
+        probe_provider(*p);
 
-    auto list_models = [&]()
+    auto list_providers = [&]()
     {
-        if (cfg.models.empty())
+        if (cfg.providers.empty())
         {
-            cell::sys::println("  (no models configured)");
+            cell::sys::println("  (no providers configured)");
             return;
         }
-        for (size_t i = 0; i < cfg.models.size(); i++)
+        for (size_t i = 0; i < cfg.providers.size(); i++)
         {
-            auto &e = cfg.models[i];
-            cell::sys::println("  [{}] {}{}", i, e.label(), (i == cfg.current) ? "  <current>" : "");
-            if (!e.base.empty())
-                cell::sys::println("       base: {}", e.base);
-            if (!e.proxy.empty())
-                cell::sys::println("       proxy: {}", e.proxy);
-            if (!e.key_id.empty())
-                cell::sys::println("       key:  stored");
+            auto &p = cfg.providers[i];
+            bool cur = (p.name == cfg.current_provider) || (cfg.current_provider.empty() && i == 0);
+            cell::sys::println("  [{}] {}{}", i, p.name, cur ? "  <current>" : "");
+            cell::sys::println("       style: {}", p.style);
+            if (!p.base.empty())
+                cell::sys::println("       base:  {}", p.base);
+            if (!p.proxy.empty())
+                cell::sys::println("       proxy: {}", p.proxy);
+            if (!p.key_id.empty())
+                cell::sys::println("       key:   stored");
+            if (cur)
+                cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
     };
 
@@ -4120,9 +4308,9 @@ int main(int argc, char const *argv[])
             mid_text += std::format("{}: {}\n", role, body);
         }
         std::string summary = "(llm summarization unavailable; messages truncated)";
-        if (const cell::config::model_entry *e = cfg.current_entry(); e)
+        if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p && !cfg.current_model.empty())
         {
-            cell::encrypt::secure_string key = resolve_key(*e);
+            cell::encrypt::secure_string key = resolve_key(*p);
             if (!key.empty())
             {
                 nlohmann::json prompt = nlohmann::json::array();
@@ -4130,11 +4318,11 @@ int main(int argc, char const *argv[])
                                   {"content", std::format("Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
                 nlohmann::json reply, tc, usage;
                 std::string err;
-                log.info("ctx", std::format("compacting aggregated_msgs={} via={} tools=off", rest.size(), e->label()));
+                log.info("ctx", std::format("compacting aggregated_msgs={} via={} tools=off", rest.size(), cfg.model_label()));
                 cell::sys::print("summary> ");
                 auto t0 = cell::sys::detail::clock::now();
                 total_llm_requests++;
-                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage, err, false))
+                if (do_chat(*p, key, cfg.current_model, prompt, true, on_token, nullptr, reply, tc, usage, err, false, cfg.think))
                 {
                     double sec = cell::sys::elapsed_ms(t0) / 1000.0;
                     cell::sys::println();
@@ -4149,7 +4337,7 @@ int main(int argc, char const *argv[])
                                                 in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                                 out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
                                                 cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a"));
-                    cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
+                    cell::stats::add(sess->id(), cfg.model_label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
                 }
                 else
                 {
@@ -4175,9 +4363,9 @@ int main(int argc, char const *argv[])
         std::string line;
         while (std::getline(std::cin, line))
             pending += line + "\n";
-        if (cfg.models.empty())
+        if (cfg.providers.empty())
         {
-            cell::sys::error("no model configured - register one with /model (e.g. /model openai:gpt-4o base:URL key:KEY) or pass --provider/--model/--key");
+            cell::sys::error("no provider configured - add one with /provide add openai:URL (or pass --provider/--model/--key)");
             return 1;
         }
     }
@@ -4249,8 +4437,8 @@ int main(int argc, char const *argv[])
                     ensure_prompt(s);
                     log.info("sess", std::format("new id={} previous={} kept=true", s->id(), old_id));
                     cell::sys::println("new session: {}", s->id());
-                    if (const cell::config::model_entry *e = cfg.current_entry(); e)
-                        probe_model(*e);
+                    if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
+                        probe_provider(*p);
                     continue;
                 }
                 if (cmd == "/clear")
@@ -4263,177 +4451,264 @@ int main(int argc, char const *argv[])
                     cell::sys::println("session cleared: {} (removed {} messages)", s->id(), before);
                     continue;
                 }
-                if (cmd == "/models")
+                if (cmd == "/provides")
                 {
-                    list_models();
+                    list_providers();
                     continue;
                 }
-                if (cmd == "/model")
+                if (cmd == "/provide")
                 {
                     if (toks.size() < 2)
                     {
-                        list_models();
+                        list_providers();
                         continue;
                     }
                     if (toks[1] == "rm" || toks[1] == "del")
                     {
                         if (toks.size() < 3)
                         {
-                            cell::sys::error("usage: /model rm provider:NAME");
+                            cell::sys::error("usage: /provide rm NAME");
                             continue;
                         }
-                        std::string m = toks[2], p;
-                        size_t colon = m.find(':');
-                        if (colon != std::string::npos && colon + 1 < m.size())
-                        {
-                            p = m.substr(0, colon);
-                            m = m.substr(colon + 1);
-                        }
-                        else
-                            p = cfg.current_entry() ? cfg.current_entry()->provider : "openai";
-                        int idx = cell::config::find(cfg, m, p);
+                        std::string name = toks[2];
+                        int idx = cell::config::find(cfg, name);
                         if (idx < 0)
                         {
-                            cell::sys::error("model not found: {}", toks[2]);
+                            cell::sys::error("provider not found: {}", name);
                             continue;
                         }
-                        std::string kid = cfg.models[idx].key_id;
+                        std::string kid = cfg.providers[idx].key_id;
                         if (!kid.empty() && vault.remove(kid) > 0)
                             log.info("vault", std::format("removed key id={}", kid));
-                        std::string removed = cfg.models[idx].label();
-                        cfg.models.erase(cfg.models.begin() + idx);
-                        if (cfg.current >= cfg.models.size())
-                            cfg.current = cfg.models.empty() ? 0 : cfg.models.size() - 1;
+                        bool was_current = (cfg.providers[idx].name == cfg.current_provider) ||
+                                           (cfg.current_provider.empty() && idx == 0);
+                        std::string removed = cfg.providers[idx].name;
+                        cfg.providers.erase(cfg.providers.begin() + idx);
+                        if (was_current)
+                        {
+                            if (cfg.providers.empty())
+                            {
+                                cfg.current_provider.clear();
+                                cfg.current_model.clear();
+                            }
+                            else
+                            {
+                                cfg.current_provider = cfg.providers[0].name;
+                                cfg.current_model.clear(); // the model belonged to the removed provider
+                            }
+                        }
                         cell::config::save(cfg);
-                        log.info("model", std::format("removed label={} remaining={} key_cleaned={}",
-                                                      removed, cfg.models.size(), kid.empty() ? "false" : "true"));
-                        cell::sys::println("model removed: {} ({} model(s) remaining)", removed, cfg.models.size());
+                        log.info("provider", std::format("removed name={} remaining={} key_cleaned={}",
+                                                         removed, cfg.providers.size(), kid.empty() ? "false" : "true"));
+                        cell::sys::println("provider removed: {} ({} provider(s) remaining)", removed, cfg.providers.size());
                         continue;
                     }
-                    std::string target = toks[1];
-                    std::string p, m;
-                    bool spaced_form = false;
-                    size_t colon = target.find(':');
-                    if (colon != std::string::npos && colon != 0 && colon + 1 < target.size())
+                    if (toks[1] == "add")
                     {
-                        // "provider:model" in one token, e.g. anthropic:claude-opus4.8
-                        p = target.substr(0, colon);
-                        m = target.substr(colon + 1);
-                    }
-                    else if (colon != std::string::npos && colon != 0 && colon + 1 == target.size())
-                    {
-                        // tolerant spaced form "provider: model" (any number of separating spaces)
                         if (toks.size() < 3)
                         {
-                            cell::sys::error("missing model name after '{}'", target);
+                            cell::sys::error("usage: /provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]");
                             continue;
                         }
-                        p = target.substr(0, colon);
-                        m = toks[2];
-                        toks.erase(toks.begin() + 2);
-                        spaced_form = true;
-                    }
-                    else
-                    {
-                        m = target;
-                        p = cfg.current_entry() ? cfg.current_entry()->provider : "openai";
-                    }
-                    std::string new_base, new_key, new_proxy;
-                    bool has_opts = false;
-                    for (size_t i = 2; i < toks.size(); i++)
-                    {
-                        auto &t = toks[i];
-                        if (t.rfind("base:", 0) == 0)
+                        std::string style, base;
+                        std::string name_arg, new_key, new_proxy;
+                        size_t ti = 2;
+                        // parse "style:URL" (tolerant spaced form "style: URL" also accepted)
+                        std::string t = toks[ti];
+                        size_t colon = t.find(':');
+                        if (colon != std::string::npos && colon > 0)
                         {
-                            // tolerant spaced form: "base: https://..." (value in the next token)
-                            if (t.size() > 5)
-                                new_base = t.substr(5);
-                            else if (i + 1 < toks.size())
-                                new_base = toks[++i];
-                            has_opts = true;
+                            std::string s = t.substr(0, colon);
+                            if (s == "openai" || s == "anthropic")
+                            {
+                                style = s;
+                                if (colon + 1 < t.size())
+                                    base = t.substr(colon + 1);
+                                else if (ti + 1 < toks.size())
+                                    base = toks[++ti];
+                                ti++;
+                            }
                         }
-                        else if (t.rfind("key:", 0) == 0)
+                        if (style.empty())
                         {
-                            // tolerant spaced form: "key: sk-..." (value in the next token)
-                            if (t.size() > 4)
-                                new_key = t.substr(4);
-                            else if (i + 1 < toks.size())
-                                new_key = toks[++i];
-                            has_opts = true;
+                            cell::sys::error("usage: /provide add openai:URL | anthropic:URL (the prefix selects the API style)");
+                            continue;
                         }
-                        else if (t.rfind("proxy:", 0) == 0)
+                        for (; ti < toks.size(); ti++)
                         {
-                            // tolerant spaced form: "proxy: http://..." (value in the next token)
-                            if (t.size() > 6)
-                                new_proxy = t.substr(6);
-                            else if (i + 1 < toks.size())
-                                new_proxy = toks[++i];
-                            has_opts = true;
+                            auto &tt = toks[ti];
+                            if (tt.rfind("key:", 0) == 0)
+                                new_key = tt.size() > 4 ? tt.substr(4) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                            else if (tt.rfind("proxy:", 0) == 0)
+                                new_proxy = tt.size() > 6 ? tt.substr(6) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                            else if (tt.rfind("name:", 0) == 0)
+                                name_arg = tt.size() > 5 ? tt.substr(5) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                            else
+                                cell::sys::warn("ignoring token: {}", tt);
                         }
-                        else
-                            cell::sys::warn("ignoring token: {}", t);
-                    }
-                    new_base = cell::skills::trim(new_base);
-                    new_key = cell::skills::trim(new_key);
-                    new_proxy = cell::skills::trim(new_proxy);
-                    if (has_opts)
-                    {
-                        // add or update a model
-                        int idx = cell::config::find(cfg, m, p);
-                        if (idx < 0)
+                        base = cell::skills::trim(base);
+                        new_key = cell::skills::trim(new_key);
+                        new_proxy = cell::skills::trim(new_proxy);
+                        name_arg = cell::skills::trim(name_arg);
+                        if (base.empty())
                         {
-                            cell::config::model_entry e;
-                            e.provider = p;
-                            e.model = m;
-                            e.base = new_base;
-                            e.proxy = new_proxy;
-                            cfg.models.push_back(std::move(e));
-                            idx = (int)cfg.models.size() - 1;
+                            cell::sys::error("missing api base url: /provide add {}:URL", style);
+                            continue;
                         }
-                        else
+                        std::string name = name_arg.empty() ? style : name_arg;
+                        if (cell::config::find(cfg, name) >= 0)
                         {
-                            if (!new_base.empty())
-                                cfg.models[idx].base = new_base;
-                            if (!new_proxy.empty())
-                                cfg.models[idx].proxy = new_proxy;
+                            cell::sys::error("provider already exists: {} (use /provide rm {} first)", name, name);
+                            continue;
                         }
+                        cell::config::provider_entry ne;
+                        ne.name = name;
+                        ne.style = style;
+                        ne.base = base;
+                        ne.proxy = new_proxy;
                         if (!new_key.empty())
                         {
-                            std::string kid = "model:" + cfg.models[idx].label();
+                            std::string kid = "provider:" + name;
                             vault.set(kid, new_key);
                             sodium_memzero(new_key.data(), new_key.size());
-                            cfg.models[idx].key_id = kid;
+                            ne.key_id = kid;
                         }
-                        cfg.current = (size_t)idx;
+                        cfg.providers.push_back(std::move(ne));
+                        cfg.current_provider = name;
                         cell::config::save(cfg);
-                        auto &reg = cfg.models[idx];
-                        log.info("model", std::format("registered label={} provider={} base={} proxy={} key={}",
-                                                      reg.label(), reg.provider,
-                                                      reg.base.empty() ? "(default)" : reg.base,
-                                                      reg.proxy.empty() ? "(none)" : reg.proxy,
-                                                      reg.key_id.empty() ? "none" : "stored"));
-                        cell::sys::println("model registered: {}", reg.label());
-                        cell::sys::println("       provider: {}", reg.provider);
-                        cell::sys::println("       model:    {}", reg.model);
-                        cell::sys::println("       base:     {}", reg.base.empty() ? "(default)" : reg.base);
-                        cell::sys::println("       proxy:    {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
-                        cell::sys::println("       key:      {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
-                        probe_model(reg);
-                        if (spaced_form)
-                            cell::sys::println("note: spaced form used; the registered model name is \"{}\", not \" {}\"", reg.model, reg.model);
+                        auto &reg = cfg.providers.back();
+                        log.info("provider", std::format("added name={} style={} base={} proxy={} key={}",
+                                                         reg.name, reg.style, reg.base,
+                                                         reg.proxy.empty() ? "(none)" : reg.proxy,
+                                                         reg.key_id.empty() ? "none" : "stored"));
+                        cell::sys::println("provider added: {}", reg.name);
+                        cell::sys::println("       style: {}", reg.style);
+                        cell::sys::println("       base:  {}", reg.base);
+                        cell::sys::println("       proxy: {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
+                        cell::sys::println("       key:   {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                        std::vector<std::string> models;
+                        std::string ferr;
+                        if (fetch_models(reg, models, ferr))
+                            cell::sys::println("       models: {} available (see /models)", models.size());
+                        else
+                            cell::sys::warn("[provider unreachable] {}: {}", reg.name, ferr.empty() ? "request failed" : ferr);
+                        cell::sys::println("       pick a model with /models then /model NAME");
                         continue;
                     }
-                    int idx = cell::config::find(cfg, m, p);
+                    // select a provider by name (persistent)
+                    std::string name = toks[1];
+                    int idx = cell::config::find(cfg, name);
                     if (idx < 0)
                     {
-                        cell::sys::error("model not found: {} (use /model to add)", target);
+                        cell::sys::error("provider not found: {} (use /provide add openai:URL to add one)", name);
                         continue;
                     }
-                    cfg.current = (size_t)idx;
+                    cfg.current_provider = name;
                     cell::config::save(cfg);
-                    log.info("model", std::format("switched label={} index={}/{}", cfg.models[idx].label(), idx, cfg.models.size()));
-                    cell::sys::println("switched to {}", cfg.models[idx].label());
-                    probe_model(cfg.models[idx]);
+                    log.info("provider", std::format("selected name={} model={}", name, cfg.current_model));
+                    cell::sys::println("provider selected: {}", name);
+                    if (cfg.current_model.empty())
+                        cell::sys::println("  no model set - use /models to list and /model NAME to pick one");
+                    continue;
+                }
+                if (cmd == "/models")
+                {
+                    const cell::config::provider_entry *p = cfg.current_provider_entry();
+                    if (!p)
+                    {
+                        cell::sys::error("no provider configured - add one with /provide add openai:URL");
+                        continue;
+                    }
+                    if (cfg.current_model.empty())
+                        cell::sys::println("provider {} ({}):", p->name, p->style);
+                    else
+                        cell::sys::println("provider {} ({}) - current model: {}", p->name, p->style, cfg.current_model);
+                    std::vector<std::string> models;
+                    std::string ferr;
+                    if (!fetch_models(*p, models, ferr))
+                    {
+                        cell::sys::error("failed to list models from {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
+                        continue;
+                    }
+                    if (models.empty())
+                    {
+                        cell::sys::println("  (no models returned by the provider)");
+                        continue;
+                    }
+                    for (auto &m : models)
+                        cell::sys::println("  {}{}", m, (m == cfg.current_model) ? "  <current>" : "");
+                    continue;
+                }
+                if (cmd == "/model")
+                {
+                    if (toks.size() < 2)
+                    {
+                        cell::sys::println("current: {}", cfg.model_label());
+                        cell::sys::println("  model:  {}", cfg.current_model.empty() ? "(none - use /models to list, /model NAME to switch)" : cfg.current_model);
+                        continue;
+                    }
+                    const cell::config::provider_entry *p = cfg.current_provider_entry();
+                    if (!p)
+                    {
+                        cell::sys::error("no provider configured - add one with /provide add openai:URL");
+                        continue;
+                    }
+                    std::string m = toks[1];
+                    cfg.current_model = m;
+                    cell::config::save(cfg);
+                    log.info("model", std::format("switched provider={} model={}", p->name, m));
+                    cell::sys::println("switched to {}/{}", p->name, m);
+                    std::vector<std::string> models;
+                    std::string ferr;
+                    if (fetch_models(*p, models, ferr))
+                    {
+                        if (std::find(models.begin(), models.end(), m) == models.end())
+                            cell::sys::warn("note: '{}' is not in the model list returned by {} (it may still work)", m, p->name);
+                    }
+                    else
+                        cell::sys::warn("[provider unreachable] {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
+                    continue;
+                }
+                if (cmd == "/think")
+                {
+                    if (toks.size() >= 2)
+                    {
+                        if (toks[1] == "on")
+                            cfg.think = true;
+                        else if (toks[1] == "off")
+                            cfg.think = false;
+                        else
+                        {
+                            cell::sys::error("usage: /think [on|off]");
+                            continue;
+                        }
+                    }
+                    else
+                        cfg.think = !cfg.think;
+                    cell::config::save(cfg);
+                    log.info("think", std::format("cot={}", cfg.think ? "on" : "off"));
+                    cell::sys::println("chain-of-thought: {}", cfg.think ? "ON" : "off");
+                    continue;
+                }
+                if (cmd == "/tool")
+                {
+                    if (toks.size() >= 2)
+                    {
+                        if (toks[1] == "on")
+                            cfg.tools = true;
+                        else if (toks[1] == "off")
+                            cfg.tools = false;
+                        else
+                        {
+                            cell::sys::error("usage: /tool [on|off]");
+                            continue;
+                        }
+                    }
+                    else
+                        cfg.tools = !cfg.tools;
+                    cell::config::save(cfg);
+                    log.info("tool", std::format("enabled={}", cfg.tools ? "on" : "off"));
+                    cell::sys::println("tool calls: {}", cfg.tools ? "ON" : "off");
                     continue;
                 }
                 if (cmd == "/sessions")
@@ -4651,18 +4926,18 @@ int main(int argc, char const *argv[])
             int rounds = 0;
             while (!done && rounds++ < 8)
             {
-                const cell::config::model_entry *e = cfg.current_entry();
-                if (!e)
+                const cell::config::provider_entry *p = cfg.current_provider_entry();
+                if (!p || cfg.current_model.empty())
                 {
-                    cell::sys::error("no model configured - register one with /model (e.g. /model openai:gpt-4o base:URL key:KEY)");
+                    cell::sys::error("no model configured - add a provider with /provide add openai:URL, then pick a model with /models and /model NAME");
                     done = true;
                     break;
                 }
-                cell::encrypt::secure_string key = resolve_key(*e);
+                cell::encrypt::secure_string key = resolve_key(*p);
                 if (key.empty())
                 {
-                    cell::sys::error("no api key for {}: set the {} env var, or use /model {} base:URL key:KEY",
-                                     e->label(), e->provider == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", e->label());
+                    cell::sys::error("no api key for {}: set the {} env var, or use /provide add {}:URL key:KEY",
+                                     p->name, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style);
                     done = true;
                     break;
                 }
@@ -4672,6 +4947,7 @@ int main(int argc, char const *argv[])
                 struct StreamUI
                 {
                     bool got = false, timer_line = false, tok_line = false, cancelled = false;
+                    bool reason_active = false; // reasoning output is still open on the current line
                     long long toks = 0, last_timer_ms = 0, last_cnt_ms = 0;
                     cell::sys::detail::clock::time_point t0;
                     cell::sys::detail::clock::time_point tok0;
@@ -4711,6 +4987,12 @@ int main(int argc, char const *argv[])
                     ui.toks++;
                     bool vt = cell::sys::detail::color_enabled;
                     std::string out;
+                    // end an open reasoning line before the answer text starts
+                    if (ui.reason_active)
+                    {
+                        out += "\n";
+                        ui.reason_active = false;
+                    }
                     if (vt)
                     {
                         if (ui.timer_line)
@@ -4738,9 +5020,49 @@ int main(int argc, char const *argv[])
                     std::fwrite(out.data(), 1, out.size(), stdout);
                     std::fflush(stdout);
                 };
+                // chain-of-thought output: streamed dim/gray ahead of the answer
+                cell::net::StreamCallback reason_cb = [&](std::span<const char> data)
+                {
+                    if (data.empty())
+                        return;
+                    if (!ui.got)
+                    {
+                        ui.got = true;
+                        ui.tok0 = cell::sys::detail::clock::now();
+                    }
+                    bool vt = cell::sys::detail::color_enabled;
+                    std::string out;
+                    if (vt)
+                    {
+                        if (ui.timer_line)
+                        {
+                            out += "\r\x1b[2K";
+                            ui.timer_line = false;
+                        }
+                        if (ui.tok_line)
+                        {
+                            out += "\r\x1b[2K";
+                            ui.tok_line = false;
+                        }
+                        out += "\x1b[2m";
+                        for (char c : data)
+                        {
+                            if (c == '\n')
+                                out += "\x1b[0m\n\x1b[2m";
+                            else
+                                out += c;
+                        }
+                        out += "\x1b[0m";
+                    }
+                    else
+                        out.append(data.data(), data.size());
+                    ui.reason_active = data.back() != '\n';
+                    std::fwrite(out.data(), 1, out.size(), stdout);
+                    std::fflush(stdout);
+                };
                 total_llm_requests++;
                 std::string err;
-                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, err, true, xfer_cb, &ui);
+                bool ok = do_chat(*p, key, cfg.current_model, s->msg(), true, tok_cb, reason_cb, reply, tool_calls, usage, err, cfg.tools, cfg.think, xfer_cb, &ui);
                 double total_sec = cell::sys::elapsed_ms(t0) / 1000.0;
                 double ttf_sec = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
                 if (ui.timer_line || ui.tok_line)
@@ -4756,7 +5078,7 @@ int main(int argc, char const *argv[])
                 }
                 if (ui.cancelled)
                 {
-                    log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", e->label(), rounds, reply_text_len(reply)));
+                    log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
                     cell::sys::println();
                     cell::sys::error("[cancelled]");
                     if (reply_text_len(reply) > 0 || !tool_calls.empty())
@@ -4766,7 +5088,7 @@ int main(int argc, char const *argv[])
                 }
                 if (!ok)
                 {
-                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={}", e->label(), rounds, (long long)s->msg().size(), total_sec, err.empty() ? "n/a" : err));
+                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={}", cfg.model_label(), rounds, (long long)s->msg().size(), total_sec, err.empty() ? "n/a" : err));
                     cell::sys::println();
                     cell::sys::error("[llm error] {}", err.empty() ? "request failed" : err);
                     done = true;
@@ -4778,7 +5100,7 @@ int main(int argc, char const *argv[])
                 auto out_tok = usage_out(usage);
                 auto cache_hit = usage_cache_hit(usage);
                 log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={}",
-                                            rounds, e->label(), (long long)s->msg().size(),
+                                            rounds, cfg.model_label(), (long long)s->msg().size(),
                                             in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                             out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
                                             cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a",
@@ -4856,16 +5178,16 @@ int main(int argc, char const *argv[])
                         log.info("tool", std::format("#{} {} policy={} status={} time={:.2f}s out_chars={} args={}",
                                                      tc_seq, res[i].name, res[i].policy, res[i].status, res[i].sec,
                                                      (long long)res[i].output.size(), trunc(res[i].args, 200)));
-                        if (e->provider == "openai")
+                        if (p->style == "openai")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", res[i].output}});
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", res[i].output}}})}});
                     }
-                    cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
+                    cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
                     continue;
                 }
                 done = true;
-                cell::stats::add(s->id(), e->label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
+                cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
             }
             s->unload();
             log.debug("sess", std::format("persisted id={} msgs={}", s->id(), s->msg().size()));
