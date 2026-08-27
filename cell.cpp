@@ -1032,11 +1032,17 @@ namespace cell
         static bool perform(CURL *curl, const char *url, const char *post_data, curl_off_t post_len,
                             const char *proxy, std::span<const std::string> headers,
                             std::string *out_buf, StreamCallback on_token,
-                            XferCallback on_xfer, void *xfer_data, long *http_code, std::string *err)
+                            XferCallback on_xfer, void *xfer_data, long *http_code, std::string *err,
+                            long timeout_sec = 0)
         {
             if (!curl || !url)
                 return false;
             curl_easy_reset(curl);
+            if (timeout_sec > 0)
+            {
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, std::min(timeout_sec, 5L));
+            }
             curl_easy_setopt(curl, CURLOPT_URL, url);
             curl_easy_setopt(curl, CURLOPT_NOPROXY, "localhost,127.0.0.1,::1"); // local endpoints bypass the system proxy
             if (proxy && *proxy)
@@ -1121,6 +1127,14 @@ namespace cell
         {
             return perform(curl, url, post_data.c_str(), (curl_off_t)post_data.size(), proxy, headers,
                            nullptr, on_token, on_xfer, xfer_data, http_code, nullptr);
+        }
+
+        // lightweight GET (used for connectivity probes); timeout_sec defaults to a short 5s
+        bool CURL_get(CURL *curl, const char *url, const std::vector<std::string> &headers, std::string &buf,
+                      long *http_code = nullptr, std::string *err = nullptr, const char *proxy = nullptr,
+                      long timeout_sec = 5)
+        {
+            return perform(curl, url, nullptr, 0, proxy, headers, &buf, nullptr, nullptr, nullptr, http_code, err, timeout_sec);
         }
     } // namespace net
     namespace sys
@@ -2587,6 +2601,14 @@ namespace cell
                 return it->second;
             }
             void use(const std::string &session_id) { current = session_id; }
+            // drop the in-memory session and reset to a fresh one; the on-disk file is kept
+            void forget_current()
+            {
+                auto it = session_list.find(current);
+                if (it != session_list.end())
+                    session_list.erase(it);
+                current = "current";
+            }
             void remove(const std::string &session_id)
             {
                 for (auto it = session_list.begin(); it != session_list.end(); ++it)
@@ -2855,7 +2877,8 @@ static void print_help()
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
     cell::sys::println("  /save                       save the current session");
-    cell::sys::println("  /new                        start a fresh session");
+    cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
+    cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
     cell::sys::println("  /exit | /quit               exit");
 }
 
@@ -3201,6 +3224,28 @@ static int run_selftest()
     expect(legacy_res.has_value() && legacy_res->session_id == "s1", "config legacy session");
     cell::box::write((cell::root / "config.json").string(), "{invalid");
     expect(!cell::config::load().has_value(), "config::load reports parse error");
+
+    {
+        // /new semantics: forget_current drops the in-memory session but keeps the file on disk
+        std::string sid = std::format("selftest-session-{}", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        {
+            cell::chat::history h2;
+            h2.use(sid);
+            auto &old = h2.now();
+            old.append("user", "hello");
+            old.unload();
+            expect(cell::box::exist((cell::root / "sessions" / (sid + ".json")).string()), "session unload writes file");
+            h2.forget_current();
+            auto &fresh = h2.now();
+            expect(fresh.id() != sid && fresh.msg().empty(), "forget_current switches to a fresh empty session");
+            expect(cell::box::exist((cell::root / "sessions" / (sid + ".json")).string()), "forget_current keeps old session file on disk");
+        }
+        // the kept file must still reload into a fresh history (i.e. /session <id> can revisit it)
+        cell::chat::history h3;
+        h3.use(sid);
+        auto &re = h3.now();
+        expect(re.msg().size() == 1 && re.msg()[0].value("role", "") == "user", "kept session reloads from disk");
+    }
 
     expect(vault.set("overwrite_key", "v1") && vault.get("overwrite_key") == "v1", "crypt::set new");
     expect(vault.set("overwrite_key", "v2") && vault.get("overwrite_key") == "v2", "crypt::set overwrite");
@@ -3561,6 +3606,34 @@ int main(int argc, char const *argv[])
                                      skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
     };
     ensure_prompt(s);
+    // connectivity probe: GET the models endpoint with a short timeout; non-fatal on failure
+    auto probe_model = [&](const cell::config::model_entry &e)
+    {
+        cell::encrypt::secure_string key = resolve_key(e);
+        std::string url = e.base + (e.provider == "anthropic" ? "/v1/models" : "/models");
+        std::vector<std::string> hdrs;
+        if (e.provider == "anthropic")
+            hdrs = {"x-api-key: " + std::string(key.data(), key.size()), "anthropic-version: 2023-06-01"};
+        else
+            hdrs = {"Authorization: Bearer " + std::string(key.data(), key.size())};
+        std::string buf;
+        long code = 0;
+        std::string err;
+        CURL *c = curl_easy_init();
+        bool ok = c && cell::net::CURL_get(c, url.c_str(), hdrs, buf, &code, &err,
+                                     e.proxy.empty() ? nullptr : e.proxy.c_str(), 5);
+        curl_easy_cleanup(c);
+        for (auto &h : hdrs)
+            cell::encrypt::wipe(h);
+        if (ok && code == 200)
+            log.info("probe", std::format("ok model={} base={} http=200", e.label(), url));
+        else
+        {
+            std::string why = err.empty() ? std::format("HTTP {}", code) : err;
+            log.warn("probe", std::format("fail model={} base={} err={}", e.label(), url, why));
+            cell::sys::warn("[model unreachable] {}: {}", e.label(), why);
+        }
+    };
     if (const cell::config::model_entry *e = cfg.current_entry(); e)
     {
         std::string key_state = "missing";
@@ -3579,6 +3652,8 @@ int main(int argc, char const *argv[])
         log.info("boot", std::format("models={} active=none session={} skills={} prompt_chars={}",
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
+    if (const cell::config::model_entry *e = cfg.current_entry(); e)
+        probe_model(*e);
 
     auto list_models = [&]()
     {
@@ -3782,11 +3857,24 @@ int main(int argc, char const *argv[])
                 if (cmd == "/new")
                 {
                     std::string old_id = s->id();
-                    h.remove(old_id);
+                    s->unload();
+                    h.forget_current();
                     s = &h.now();
                     ensure_prompt(s);
-                    log.info("sess", std::format("new id={} previous={} discarded=true", s->id(), old_id));
+                    log.info("sess", std::format("new id={} previous={} kept=true", s->id(), old_id));
                     cell::sys::println("new session: {}", s->id());
+                    if (const cell::config::model_entry *e = cfg.current_entry(); e)
+                        probe_model(*e);
+                    continue;
+                }
+                if (cmd == "/clear")
+                {
+                    long long before = (long long)s->msg().size();
+                    s->msg().clear();
+                    ensure_prompt(s);
+                    s->unload();
+                    log.info("sess", std::format("cleared id={} msgs_before={}", s->id(), before));
+                    cell::sys::println("session cleared: {} (removed {} messages)", s->id(), before);
                     continue;
                 }
                 if (cmd == "/models")
@@ -3909,6 +3997,7 @@ int main(int argc, char const *argv[])
                         cell::sys::println("       base:     {}", reg.base.empty() ? "(default)" : reg.base);
                         cell::sys::println("       proxy:    {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
                         cell::sys::println("       key:      {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                        probe_model(reg);
                         if (spaced_form)
                             cell::sys::println("note: spaced form used; the registered model name is \"{}\", not \" {}\"", reg.model, reg.model);
                         continue;
@@ -3923,6 +4012,7 @@ int main(int argc, char const *argv[])
                     cell::config::save(cfg);
                     log.info("model", std::format("switched label={} index={}/{}", cfg.models[idx].label(), idx, cfg.models.size()));
                     cell::sys::println("switched to {}", cfg.models[idx].label());
+                    probe_model(cfg.models[idx]);
                     continue;
                 }
                 if (cmd == "/sessions")

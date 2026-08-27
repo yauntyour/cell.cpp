@@ -224,7 +224,8 @@ sent to the model.
 | `/skills` | List available skills |
 | `/skill NAME` | Load a skill into the current session |
 | `/save` | Save the current session immediately |
-| `/new` | Discard the current session and start a fresh one |
+| `/clear` | Clear the current session context (keeps the session id) |
+| `/new` | Start a fresh session (old sessions are kept on disk) |
 | `/exit` \| `/quit` | Exit the program |
 
 #### 2.2 `/models` — List Models
@@ -285,6 +286,11 @@ Behavior details:
 Unrecognized extra tokens produce a warning and are ignored. Note: plain `/model NAME` only
 *switches* — nothing is created; registering requires `base:` or `key:`.
 
+**Connectivity probe**: at startup, after `/new`, and after every `/model` change, cell performs a
+lightweight GET on the model's endpoint (OpenAI: `GET {base}/models`; Anthropic:
+`GET {base}/v1/models`; 5s timeout) and logs the result. A failure prints
+`[model unreachable] <label>: <reason>` as a warning but does not block the REPL.
+
 #### 2.4 `/sessions` — Session List
 
 Scans `.cell/sessions/*.json` and prints one line per session: session ID, message count, and a
@@ -340,14 +346,17 @@ Body instructions injected when the skill is loaded...
 - `/skill NAME` wraps the skill body into a system message appended to the current session and saves
   immediately; it stays in effect for the rest of the session (loading repeatedly appends copies).
 
-#### 2.8 `/save` and `/new`
+#### 2.8 `/clear`, `/save` and `/new`
 
+- `/clear`: empties the current session's message history but **keeps the session id** — the
+  system prompt and skill list are re-injected and the file is saved immediately. Useful for
+  starting a long conversation over without losing the session's identity;
 - `/save`: writes the current session to `.cell/sessions/<id>.json` right away. The session is also
   auto-saved after every conversation round, after `/compact` and after `/skill` — `/save` is mainly
   a manual safety net;
-- `/new`: **deletes** the current session file, generates a fresh session (ID = Unix timestamp in
-  seconds), and re-injects the system prompt and skill list. The old conversation cannot be
-  recovered — use with care.
+- `/new`: saves the current session, then starts a fresh session (ID = Unix timestamp in seconds)
+  with the system prompt and skill list re-injected. **Old session files are kept on disk** and can
+  be revisited with `/session ID`.
 
 #### 2.9 Appendix: Tool Approval Prompts
 
