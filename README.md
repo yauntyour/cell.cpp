@@ -217,6 +217,7 @@ sent to the model.
 | `/help` | Show all commands |
 | `/models` | List configured models (entry 0 is the default) |
 | `/model [provider:NAME] [base:URL] [key:KEY] [proxy:URL]` | Switch models; with `base:`/`key:`/`proxy:` it registers/updates instead |
+| `/model rm provider:NAME` | Delete a model (also removes its stored vault key) |
 | `/sessions` | List saved sessions |
 | `/session ID` | Switch to another saved session |
 | `/usages` | Show per-model and per-session usage statistics |
@@ -269,6 +270,16 @@ Carrying `base:` or `key:` (either one) switches to register mode:
 /model openai:gpt-4o proxy:http://user:pass@proxy:8080
 ```
 
+**Form 3: delete a model**
+
+```
+/model rm provider:NAME        # e.g. /model rm openai:gpt-4o
+```
+
+The entry is removed from `config.json` and any vault key bound to it
+(`model:<provider>:<name>`) is deleted too. If the removed entry was the current model, the
+selection moves to the next remaining entry (or none).
+
 Behavior details:
 
 - If the label `provider:model` doesn't exist → a new entry is appended and made current;
@@ -303,6 +314,11 @@ snippet of the first user message (≤60 chars); `*` marks the current session:
 
 `/session ID` loads another saved session (the current one is saved first); an ID with no file on
 disk simply starts a fresh session — same semantics as `--session`.
+
+`/session rm ID` deletes a session: the file `.cell/sessions/<id>.json` **and its usage record**
+in `usages.json` are both removed (per-model aggregates are kept). Deleting the current session
+switches to a fresh one. Orphaned usage records (session files deleted externally) are pruned
+automatically at startup and when `/usages` runs.
 
 #### 2.5 `/usages` — Usage Statistics
 

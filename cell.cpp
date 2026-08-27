@@ -2839,6 +2839,35 @@ namespace cell
             bump(m);
             save(j);
         }
+        // remove the usage record of one session (used when a session is deleted)
+        static void remove(const std::string &session_id)
+        {
+            nlohmann::json j = load();
+            if (j["sessions"].contains(session_id))
+            {
+                j["sessions"].erase(session_id);
+                save(j);
+            }
+        }
+        // drop usage records whose session files no longer exist on disk; returns true if any were dropped
+        static bool prune()
+        {
+            nlohmann::json j = load();
+            auto &sess = j["sessions"];
+            std::vector<std::string> gone;
+            for (auto &[k, v] : sess.items())
+            {
+                std::error_code ec;
+                if (!std::filesystem::exists(root / "sessions" / (k + ".json"), ec))
+                    gone.push_back(k);
+            }
+            if (gone.empty())
+                return false;
+            for (auto &k : gone)
+                sess.erase(k);
+            save(j);
+            return true;
+        }
         static std::string fmt(const nlohmann::json &rec)
         {
             return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={} total_tok={}",
@@ -2886,9 +2915,11 @@ static void print_help()
     cell::sys::println("  /models                     list configured models");
     cell::sys::println("  /model NAME                 switch to a configured model (NAME or provider:NAME)");
     cell::sys::println("  /model provider:NAME base:URL key:KEY proxy:URL   add/update a model");
+    cell::sys::println("  /model rm provider:NAME      delete a model (removes its stored key too)");
     cell::sys::println("      e.g. /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx");
     cell::sys::println("  /sessions                   list saved sessions");
     cell::sys::println("  /session ID                 switch to another saved session");
+    cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
     cell::sys::println("  /usages                     show per-model and per-session usage statistics");
     cell::sys::println("  /compact                    compress the current session context");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
@@ -3307,6 +3338,14 @@ static int run_selftest()
     expect(stats_json["models"]["anthropic:claude-x"].value("input_tokens", 0LL) == 3, "stats tokens");
     expect(stats_json["models"]["openai:gpt-4o"].value("total_tokens", 0LL) == 15, "stats total_tokens recorded");
     expect(stats_json["sessions"]["sess-A"].value("total_tokens", 0LL) == 15, "stats session total_tokens recorded");
+    cell::stats::add("sess-rm", "openai:gpt-4o", 10, 5, 2, 1, 3, 1);
+    expect(cell::stats::load()["sessions"].contains("sess-rm"), "stats record added");
+    cell::stats::remove("sess-rm");
+    expect(!cell::stats::load()["sessions"].contains("sess-rm"), "stats::remove drops session record");
+    cell::stats::add("sess-orphan", "openai:gpt-4o", 10, 5, 2, 1, 3, 1);
+    expect(cell::stats::load()["sessions"].contains("sess-orphan"), "orphan record added");
+    expect(cell::stats::prune(), "stats::prune drops file-less sessions");
+    expect(!cell::stats::load()["sessions"].contains("sess-orphan"), "stats::prune removes the orphan");
     expect(cell::stats::summarize().find("openai:gpt-4o") != std::string::npos, "stats summarize");
 
     cell::sys::logger::instance().close();
@@ -3684,6 +3723,8 @@ int main(int argc, char const *argv[])
         log.info("boot", std::format("models={} active=none session={} skills={} prompt_chars={}",
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
+    if (cell::stats::prune())
+        log.info("stats", "boot pruned orphaned session usage records");
     long long loaded_msgs = (long long)s->msg().size();
     if (loaded_msgs > 0)
         cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
@@ -3902,6 +3943,41 @@ int main(int argc, char const *argv[])
                         list_models();
                         continue;
                     }
+                    if (toks[1] == "rm" || toks[1] == "del")
+                    {
+                        if (toks.size() < 3)
+                        {
+                            cell::sys::error("usage: /model rm provider:NAME");
+                            continue;
+                        }
+                        std::string m = toks[2], p;
+                        size_t colon = m.find(':');
+                        if (colon != std::string::npos && colon + 1 < m.size())
+                        {
+                            p = m.substr(0, colon);
+                            m = m.substr(colon + 1);
+                        }
+                        else
+                            p = cfg.current_entry() ? cfg.current_entry()->provider : "openai";
+                        int idx = cell::config::find(cfg, m, p);
+                        if (idx < 0)
+                        {
+                            cell::sys::error("model not found: {}", toks[2]);
+                            continue;
+                        }
+                        std::string kid = cfg.models[idx].key_id;
+                        if (!kid.empty() && vault.remove(kid) > 0)
+                            log.info("vault", std::format("removed key id={}", kid));
+                        std::string removed = cfg.models[idx].label();
+                        cfg.models.erase(cfg.models.begin() + idx);
+                        if (cfg.current >= cfg.models.size())
+                            cfg.current = cfg.models.empty() ? 0 : cfg.models.size() - 1;
+                        cell::config::save(cfg);
+                        log.info("model", std::format("removed label={} remaining={} key_cleaned={}",
+                                                      removed, cfg.models.size(), kid.empty() ? "false" : "true"));
+                        cell::sys::println("model removed: {} ({} model(s) remaining)", removed, cfg.models.size());
+                        continue;
+                    }
                     std::string target = toks[1];
                     std::string p, m;
                     bool spaced_form = false;
@@ -4081,7 +4157,36 @@ int main(int argc, char const *argv[])
                 {
                     if (toks.size() < 2)
                     {
-                        cell::sys::error("usage: /session SESSION_ID (see /sessions)");
+                        cell::sys::error("usage: /session SESSION_ID | rm SESSION_ID (see /sessions)");
+                        continue;
+                    }
+                    if (toks[1] == "rm" || toks[1] == "del")
+                    {
+                        if (toks.size() < 3)
+                        {
+                            cell::sys::error("usage: /session rm SESSION_ID");
+                            continue;
+                        }
+                        std::string target = toks[2];
+                        std::error_code ec;
+                        std::filesystem::path p = cell::root / "sessions" / (target + ".json");
+                        bool existed = std::filesystem::exists(p, ec);
+                        if (existed && !std::filesystem::remove(p, ec))
+                        {
+                            cell::sys::error("failed to delete session {}", target);
+                            continue;
+                        }
+                        cell::stats::remove(target);
+                        log.info("sess", std::format("deleted id={} file={} usage_cleaned=true", target, existed));
+                        if (target == s->id())
+                        {
+                            h.forget_current();
+                            s = &h.now();
+                            ensure_prompt(s);
+                            cell::sys::println("session deleted: {} (usage stats removed); new session: {}", target, s->id());
+                        }
+                        else
+                            cell::sys::println("session deleted: {} (usage stats removed)", target);
                         continue;
                     }
                     std::string target = toks[1];
@@ -4100,6 +4205,8 @@ int main(int argc, char const *argv[])
                 }
                 if (cmd == "/usages")
                 {
+                    if (cell::stats::prune())
+                        log.info("stats", "pruned orphaned session usage records");
                     cell::sys::println("{}", cell::stats::summarize());
                     continue;
                 }
