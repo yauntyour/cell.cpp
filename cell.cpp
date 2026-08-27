@@ -1452,6 +1452,9 @@ namespace cell
                 "- one edit call must not touch more than 3 unrelated code blocks; split into multiple edit calls.\n"
                 "- do not call rg more than 3 times in a row without first reading the actual file content.\n"
                 "- after exec, do not assert it 'should have succeeded' - check the exit code.\n"
+                "Concurrency:\n"
+                "- You can call multiple read-only tools (ls, read, rg, glob, find) simultaneously in a single response for faster exploration.\n"
+                "- The system executes these tools in parallel, so feel free to batch them when you need information from multiple sources.\n"
                 "When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
 
@@ -3169,6 +3172,64 @@ static int run_selftest()
             expect(d.contains("name") ? d.contains("description")
                                       : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
                    "tool schema carries name+description");
+    }
+
+    {
+        // concurrent invocation of read-only tools (Policy::Allow): every call runs
+        // on its own thread and must succeed with independent, uncorrupted output
+        expect(cell::box::mkdir("conc_dir"), "conc dir");
+        for (int i = 0; i < 16; i++)
+            expect(cell::box::write(std::format("conc_dir/f{:02d}.txt", i), std::format("payload {}\n", i)), "conc fixture");
+        auto [conc_tools, conc_defs] = build_tools(false);
+        (void)conc_defs;
+        std::vector<std::future<std::pair<bool, std::string>>> reads;
+        for (int i = 0; i < 16; i++)
+            reads.push_back(std::async(std::launch::async, [&conc_tools, i]
+                                       {
+                                           std::string o;
+                                           bool ok = conc_tools["read"]->execute(
+                                               nlohmann::json{{"path", std::format("conc_dir/f{:02d}.txt", i)}}.dump(), o);
+                                           return std::make_pair(ok, std::move(o));
+                                       }));
+        bool reads_ok = true;
+        for (int i = 0; i < 16; i++)
+        {
+            auto [ok, o] = reads[i].get();
+            reads_ok = reads_ok && ok && o == std::format("payload {}\n", i);
+        }
+        expect(reads_ok, "concurrent read tool calls all succeed");
+        std::vector<std::future<bool>> mixed;
+        mixed.push_back(std::async(std::launch::async, [&conc_tools]
+                                   {
+                                       std::string o;
+                                       return conc_tools["rg"]->execute(R"({"pattern":"payload","path":"conc_dir"})", o) &&
+                                              o.find("f00.txt") != std::string::npos && o.find("f15.txt") != std::string::npos;
+                                   }));
+        mixed.push_back(std::async(std::launch::async, [&conc_tools]
+                                   {
+                                       std::string o;
+                                       return conc_tools["glob"]->execute(R"({"pattern":"f0*.txt","path":"conc_dir"})", o) &&
+                                              o.find("f00.txt") != std::string::npos && o.find("f09.txt") != std::string::npos;
+                                   }));
+        mixed.push_back(std::async(std::launch::async, [&conc_tools]
+                                   {
+                                       std::string o;
+                                       return conc_tools["find"]->execute(R"({"path":"conc_dir","name":"f*"})", o) &&
+                                              o.find("f00.txt") != std::string::npos && o.find("f15.txt") != std::string::npos;
+                                   }));
+        mixed.push_back(std::async(std::launch::async, [&conc_tools]
+                                   {
+                                       std::string o;
+                                       return conc_tools["ls"]->execute(R"({"path":"conc_dir"})", o) &&
+                                              o.find("f00.txt") != std::string::npos && o.find("f15.txt") != std::string::npos;
+                                   }));
+        bool mixed_ok = true;
+        for (auto &f : mixed)
+            mixed_ok = mixed_ok && f.get();
+        expect(mixed_ok, "concurrent mixed read-only tool calls (rg/glob/find/ls)");
+        for (int i = 0; i < 16; i++)
+            cell::box::remove(std::format("conc_dir/f{:02d}.txt", i));
+        expect(cell::box::remove("conc_dir"), "conc cleanup");
     }
 
     {
