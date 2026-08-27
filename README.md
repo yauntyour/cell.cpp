@@ -66,6 +66,56 @@ cell.exe --provider openai --model gpt-4o --session my-session
 cell.exe --selftest
 ```
 
+### Example
+
+```bash
+cell: session=6333a2b6f7084f1a-1787819024 model=openai:Qwen3.8-27B
+context: loaded 7 message(s) from disk
+> /sessions
+  > cwd: C:\Users\yaunt
+    6333a2b6f7084f1a-1787819024 *  messages=7  "你好，请介绍一下你自己"
+> 还记得前面聊了什么吗
+记得呀，咱们前面聊了这些内容：
+
+1. **你让我介绍自己** —— 我介绍了我是千问（Qwen），由阿里巴巴研发的大语言模型，具备长文理解、逻辑推理、多任务能力等特性。
+
+2. **你让我查看当前目录下的项目** —— 我列出了目录内容，发现这是一个 Windows 用户主目录（包含 `Desktop`、`Documents`、`source`、各种开发工具配置目录如 `.cargo`、`.pnpm`、`.gradle` 等），而不是某个具体的项目根目录。我还提到了一些零散文件，比如一个约 790MB 的 `java_error_in_studio.hprof` 崩溃转储文件。
+
+我最后还问你是否需要进一步查看某个具体目录（比如 `source` 或 `Documents`）。
+
+接下来想继续做什么呢？😊
+[2026-08-27 08:31:55] INFO  [llm  ] round=1 model=openai:Qwen3.8-27B stream=true ctx_msgs=8 tok_in=3424 tok_out=393 cache=92.6% time=19.95s ttf=11.06s tools=0
+> 检查工具列表
+以下是我当前拥有的工具列表：
+
+| 工具 | 说明 |
+|------|------|
+| **ls** | 列出目录内容（单级，分页，每页最多 500 条） |
+| **read** | 读取文件内容（单次最大 1MB，支持按行号分段读取） |
+| **rg** | 递归搜索文件内容（跳过隐藏文件和 .gitignore 路径） |
+| **glob** | 按文件名模式查找文件（如 `**/*.ts`） |
+| **find** | 按元数据筛选文件（名称、修改时间、大小等） |
+| **write** | 创建新文件（不能覆盖已存在的文件） |
+| **edit** | 修改已有文件（通过 SEARCH/REPLACE 块，需确保搜索文本唯一） |
+| **exec** | 执行 shell 命令（默认超时 30 秒，最大 300 秒） |
+
+工具使用规则要点：
+- 读取文件前必须先读取原内容；
+- 使用 write 前需确保父目录已存在（可用 `exec` + `mkdir -p` 创建）；
+- 单次 edit 不得涉及 3 个以上无关联的代码块；
+- 未先读取文件内容时不得连续调用超过 3 次 rg；
+- `exec` 后需根据返回值判断成功与否。
+
+需要我用这些工具做什么？比如继续查看刚才目录里的某个项目？
+[2026-08-27 08:32:52] INFO  [llm  ] round=1 model=openai:Qwen3.8-27B stream=true ctx_msgs=10 tok_in=3625 tok_out=417 cache=94.3% time=21.24s ttf=5.53s tools=0
+> /compact
+context already small (10 messages to aggregate)
+> /clear
+context: injected system_prompt=1740chars
+session cleared: 6333a2b6f7084f1a-1787819024 (removed 11 messages)
+> /quit
+```
+
 ## Usage
 
 ### 1. Command-Line Options
@@ -103,10 +153,9 @@ usage: cell [options]
 
 At startup the final configuration is assembled as follows:
 
-1. `.cell/config.json` is loaded (model list + current model index + system prompt + last session ID);
-2. If no models are configured, two defaults are generated:
-   - `[0] openai:gpt-4o-mini` (base: `https://api.openai.com/v1`)
-   - `[1] anthropic:claude-3-5-haiku-latest` (base: `https://api.anthropic.com`)
+1. `.cell/config.json` is loaded (model list + current model index + system prompt + last session ID + log cap);
+2. A fresh install ships with **no models** — on first launch cell prints a hint and you register a model
+   with `/model openai:gpt-4o base:URL key:KEY` (inside the REPL) or via the CLI options below;
 3. `--provider` / `--base` / `--model` / `--proxy` are applied **in place onto the current model entry** (only non-empty fields are changed);
 4. `--key` is written to the encrypted vault and bound to the current entry; `--session` / `--system` directly replace the corresponding fields.
 
@@ -140,8 +189,7 @@ cell.exe --proxy http://user:pass@proxy.example.com:8080
 ```
 
 If an entry's base is empty, OpenAI defaults to `https://api.openai.com/v1` and Anthropic defaults
-to `https://api.anthropic.com` (pre-filled only in the auto-generated default entries; models you
-configure yourself should get an explicit base).
+to `https://api.anthropic.com` — give models you configure yourself an explicit base instead.
 
 **`--key`**
 
@@ -441,18 +489,21 @@ The tool creates a `.cell/` directory in your working directory:
 
 ```
 .cell/
-├── config.json       # Multi-model config: {"models":[{provider,base,model,key,proxy}...], "current_model":N}
+├── config.json       # Multi-model config: {"models":[{provider,base,model,key,proxy}...], "current_model":N, "log_max_lines":1000}
 ├── .crypt            # Encrypted API key vault
 ├── .key              # Symmetric encryption key
 ├── usages.json       # Per-model and per-session usage statistics
 ├── skills/
 │   └── *.md          # Skills (front matter: name/description, body injected on /skill)
 ├── logs/
-│   └── cell.log      # Timestamped application logs
+│   └── cell.log      # Timestamped application logs, trimmed to the last log_max_lines lines at startup
 └── sessions/
     ├── <id>.json     # Persisted chat sessions
     └── ...
 ```
+
+`log_max_lines` (default `1000`, minimum 10) controls how many lines `logs/cell.log` keeps — on
+every startup the file is trimmed to its tail before new entries are appended.
 
 ## License
 

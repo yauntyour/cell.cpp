@@ -1355,7 +1355,9 @@ namespace cell
             {
                 std::error_code ec;
                 std::filesystem::create_directories(root / "logs", ec);
-                file.open(root / "logs" / "cell.log", std::ios::app);
+                auto path = root / "logs" / "cell.log";
+                trim_log(path, configured_max_lines());
+                file.open(path, std::ios::app);
             }
 
             // structured line: [timestamp] LEVEL [cat  ] key=value message
@@ -1386,6 +1388,47 @@ namespace cell
             {
                 static logger log;
                 return log;
+            }
+            // configured cap for logs/cell.log (from root/config.json, default 1000)
+            static size_t configured_max_lines()
+            {
+                size_t limit = 1000;
+                std::ifstream f(root / "config.json");
+                if (f.is_open())
+                {
+                    try
+                    {
+                        auto j = nlohmann::json::parse(f, nullptr, false);
+                        if (!j.is_discarded() && j.is_object())
+                            limit = j.value("log_max_lines", (size_t)1000);
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+                return std::max<size_t>(10, limit);
+            }
+            // keep only the last `limit` lines of a log file (no-op when absent/under cap)
+            static void trim_log(const std::filesystem::path &p, size_t limit)
+            {
+                std::ifstream in(p, std::ios::binary);
+                if (!in.is_open() || limit == 0)
+                    return;
+                size_t n = 0;
+                std::string line;
+                while (std::getline(in, line))
+                    n++;
+                if (n <= limit)
+                    return;
+                size_t skip = n - limit;
+                in.clear();
+                in.seekg(0);
+                for (size_t i = 0; i < skip && std::getline(in, line); i++)
+                    ;
+                std::string tail((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                in.close();
+                std::ofstream out(p, std::ios::trunc | std::ios::binary);
+                out << tail;
             }
             void close()
             {
@@ -1589,6 +1632,7 @@ namespace cell
                 "- The system executes these tools in parallel, so feel free to batch them when you need information from multiple sources.\n"
                 "When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
+            size_t log_max_lines = 1000; // keep at most this many lines in logs/cell.log
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
             bool empty() const { return models.empty(); }
@@ -1607,30 +1651,6 @@ namespace cell
         };
         std::filesystem::path file() { return root / "config.json"; }
 
-        static model_entry default_model(const std::string &provider)
-        {
-            model_entry e;
-            if (provider == "anthropic")
-            {
-                e.provider = "anthropic";
-                e.base = "https://api.anthropic.com";
-                e.model = "claude-3-5-haiku-latest";
-            }
-            else
-            {
-                e.provider = "openai";
-                e.base = "https://api.openai.com/v1";
-                e.model = "gpt-4o-mini";
-            }
-            return e;
-        }
-        static settings defaults()
-        {
-            settings s;
-            s.models.push_back(default_model("openai"));
-            s.models.push_back(default_model("anthropic"));
-            return s;
-        }
         // find a model by model-name or "provider:model" exact label
         static int find(const settings &s, const std::string &name, const std::string &provider = "")
         {
@@ -1677,6 +1697,7 @@ namespace cell
                 }
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
+                s.log_max_lines = j.value("log_max_lines", (size_t)1000);
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
@@ -1700,6 +1721,7 @@ namespace cell
             j["current_model"] = s.current;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
+            j["log_max_lines"] = s.log_max_lines;
             if (!s.session_id.empty())
                 s.active_sessions[cwd_id()] = s.session_id;
             j["active_sessions"] = s.active_sessions;
@@ -3430,6 +3452,26 @@ static int run_selftest()
     }
     expect(no_throw, "sys::throw_if");
 
+    // log rotation: trim_log keeps only the tail of an over-cap log file
+    {
+        auto logpath = cell::root / "logs" / "trim_test.log";
+        std::string bulk;
+        for (int i = 0; i < 50; i++)
+            bulk += std::format("line {:02d}\n", i);
+        expect(cell::box::write(logpath.string(), bulk), "log trim fixture written");
+        cell::sys::logger::trim_log(logpath, 10);
+        std::string trimmed;
+        expect(cell::box::read(logpath.string(), trimmed), "log trim result readable");
+        expect(trimmed.find("line 00") == std::string::npos, "log trim drops head lines");
+        expect(trimmed.find("line 40") != std::string::npos && trimmed.find("line 49") != std::string::npos, "log trim keeps tail lines");
+        size_t lines = (size_t)std::count(trimmed.begin(), trimmed.end(), '\n');
+        expect(lines == 10, "log trim caps line count");
+        cell::sys::logger::trim_log(logpath, 10);
+        expect(cell::box::read(logpath.string(), trimmed) && std::count(trimmed.begin(), trimmed.end(), '\n') == 10, "log trim idempotent");
+        expect(cell::box::remove(logpath.string()), "log trim fixture removed");
+        expect(cell::sys::logger::configured_max_lines() >= 10, "log max lines has a floor");
+    }
+
     cell::encrypt::crypt vault;
     expect(vault.add("selftest_key", "secret-123"), "crypt::add");
     cell::encrypt::secure_string k1 = vault.get("selftest_key");
@@ -3462,9 +3504,11 @@ static int run_selftest()
     cfg.models = {a, b};
     cfg.current = 1;
     cfg.system_prompt = "sys";
+    cfg.log_max_lines = 500;
     expect(cell::config::save(cfg), "config::save multi-model");
     auto cfg_res = cell::config::load();
     expect(cfg_res.has_value() && cfg_res->models.size() == 2, "config::load multi-model");
+    expect(cfg_res.has_value() && cfg_res->log_max_lines == 500, "config log_max_lines roundtrip");
     expect(cfg_res.has_value() && cfg_res->current == 1 && cfg_res->current_entry()->model == "m2", "config current entry");
     expect(cfg_res.has_value() && cfg_res->models[0].label() == "openai:m1", "config model label");
     expect(cfg_res.has_value() && cfg_res->models[0].proxy == "http://user:pass@p:8080", "config proxy roundtrip");
@@ -3634,9 +3678,6 @@ int main(int argc, char const *argv[])
     long long total_llm_requests = 0;
     long long total_tool_calls = 0;
 
-    // make sure at least the default models exist (first entry is the default)
-    if (cfg.empty())
-        cfg = cell::config::defaults();
     // apply CLI overrides onto the current model entry
     if (!provider_arg.empty() || !model_arg.empty() || !base_arg.empty() || !proxy_arg.empty())
     {
@@ -4004,6 +4045,11 @@ int main(int argc, char const *argv[])
         log.info("boot", std::format("models={} active=none session={} skills={} prompt_chars={}",
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
+    if (cfg.models.empty())
+    {
+        cell::sys::warn("no model configured - register one first, e.g. /model openai:gpt-4o base:https://api.openai.com/v1 key:YOUR_KEY");
+        cell::sys::println("       (or launch with --provider openai --model NAME --key KEY; see /help for commands)");
+    }
     if (cell::stats::prune())
         log.info("stats", "boot pruned orphaned session usage records");
     long long loaded_msgs = (long long)s->msg().size();
@@ -4129,6 +4175,11 @@ int main(int argc, char const *argv[])
         std::string line;
         while (std::getline(std::cin, line))
             pending += line + "\n";
+        if (cfg.models.empty())
+        {
+            cell::sys::error("no model configured - register one with /model (e.g. /model openai:gpt-4o base:URL key:KEY) or pass --provider/--model/--key");
+            return 1;
+        }
     }
 
     // agent loop
@@ -4603,7 +4654,7 @@ int main(int argc, char const *argv[])
                 const cell::config::model_entry *e = cfg.current_entry();
                 if (!e)
                 {
-                    cell::sys::error("no model configured");
+                    cell::sys::error("no model configured - register one with /model (e.g. /model openai:gpt-4o base:URL key:KEY)");
                     done = true;
                     break;
                 }
