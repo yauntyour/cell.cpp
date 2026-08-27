@@ -2670,13 +2670,22 @@ namespace cell
                     continue;
                 std::string key = trim(std::string_view(line).substr(0, colon));
                 std::string val = trim(std::string_view(line).substr(colon + 1));
+                if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\'')))
+                    val = val.substr(1, val.size() - 2);
                 if (key == "name")
                     s.name = val;
                 else if (key == "description")
                     s.description = val;
             }
             if (s.name.empty())
-                s.name = std::filesystem::path(s.file).stem().string();
+            {
+                std::filesystem::path p(s.file);
+                std::string stem = p.stem().string();
+                // directory-style skills use SKILL.md/README.md: fall back to the folder name
+                if ((stem == "SKILL" || stem == "skill" || stem == "README" || stem == "readme") && p.has_parent_path())
+                    stem = p.parent_path().filename().string();
+                s.name = stem;
+            }
             if (s.description.empty())
             {
                 std::string body = text.substr(end + 4);
@@ -2693,6 +2702,34 @@ namespace cell
             }
             return true;
         }
+        static void scan_dir(const std::filesystem::path &dir, const std::filesystem::path &rel, std::vector<skill> &out, int depth)
+        {
+            std::error_code ec;
+            if (depth > 6)
+                return;
+            std::filesystem::directory_iterator it(dir, ec);
+            if (ec)
+                return;
+            for (; it != std::filesystem::directory_iterator(); it.increment(ec))
+            {
+                if (ec)
+                    break;
+                const auto &entry = *it;
+                if (entry.is_directory(ec))
+                    scan_dir(entry.path(), rel / entry.path().filename(), out, depth + 1);
+                else if (entry.is_regular_file(ec) && entry.path().extension() == ".md")
+                {
+                    std::string text;
+                    if (!box::read(entry.path().string(), text) || text.empty())
+                        continue;
+                    skill s;
+                    s.file = (rel / entry.path().filename()).string();
+                    if (!parse_metadata(text, s))
+                        continue;
+                    out.push_back(std::move(s));
+                }
+            }
+        }
         static std::vector<skill> list()
         {
             std::vector<skill> out;
@@ -2700,27 +2737,7 @@ namespace cell
             std::error_code ec;
             if (!std::filesystem::exists(dir, ec))
                 return out;
-            std::filesystem::directory_iterator it(dir, ec);
-            if (ec)
-                return out;
-            for (; it != std::filesystem::directory_iterator(); it.increment(ec))
-            {
-                if (ec)
-                    break;
-                const auto &entry = *it;
-                if (!entry.is_regular_file(ec))
-                    continue;
-                if (entry.path().extension() != ".md")
-                    continue;
-                std::string text;
-                if (!box::read(entry.path().string(), text) || text.empty())
-                    continue;
-                skill s;
-                s.file = entry.path().filename().string();
-                if (!parse_metadata(text, s))
-                    continue;
-                out.push_back(std::move(s));
-            }
+            scan_dir(dir, {}, out, 0);
             std::sort(out.begin(), out.end(), [](const skill &a, const skill &b)
                       { return a.name < b.name; });
             return out;
@@ -3266,6 +3283,19 @@ static int run_selftest()
     expect(cell::skills::content(*found, skill_body) && skill_body.find("# Build Helper") != std::string::npos && skill_body.find("---") == std::string::npos, "skill content strips front matter");
     std::string meta = cell::skills::metadata_prompt(skills);
     expect(meta.find("build-helper") != std::string::npos, "skill metadata prompt");
+    expect(cell::box::mkdir((cell::root / "skills" / "suite" / "core").string()), "nested skill dirs");
+    expect(cell::box::write((cell::root / "skills" / "suite" / "core" / "SKILL.md").string(),
+                            "---\nname: nested-skill\ndescription: \"nested directory skill\"\n---\nbody of nested skill\n"),
+           "nested SKILL.md");
+    auto skills_nested = cell::skills::list();
+    expect(skills_nested.size() == 2, "skills::list discovers directory-style skills");
+    const cell::skills::skill *nested = nullptr;
+    for (auto &sk : skills_nested)
+        if (sk.name == "nested-skill")
+            nested = &sk;
+    expect(nested && nested->description == "nested directory skill", "nested skill front matter parse (quotes stripped)");
+    std::string nested_body;
+    expect(nested && cell::skills::content(*nested, nested_body) && nested_body.find("body of nested skill") != std::string::npos, "nested skill content loads");
 
     cell::stats::add("sess-A", "openai:gpt-4o", 100, 50, 10, 5, 15, 2);
     cell::stats::add("sess-A", "openai:gpt-4o", 50, 20, std::nullopt, std::nullopt, std::nullopt, 1);

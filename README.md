@@ -327,8 +327,9 @@ Compaction itself is one LLM call and counts toward usage statistics.
 
 #### 2.7 `/skills` and `/skill` — Skill System
 
-Skills are Markdown files in `.cell/skills/*.md`. They are discovered only if they start with a
-YAML-style front matter block (otherwise ignored):
+Skills are Markdown files under `.cell/skills/`, scanned **recursively** (so directory-style
+skills work too — e.g. `.cell/skills/my-suite/SKILL.md`). They are discovered only if they start
+with a YAML-style front matter block (otherwise ignored):
 
 ```markdown
 ---
@@ -338,8 +339,10 @@ description: helpers for building cell
 Body instructions injected when the skill is loaded...
 ```
 
-- `name` falls back to the file name (without extension); `description` falls back to the first
-  non-empty body line (truncated at ~120 characters);
+- `name` falls back to the file name (without extension); for directory-style skills named
+  `SKILL.md`/`README.md` it falls back to the parent folder name; `description` falls back to the
+  first non-empty body line (truncated at ~120 characters); surrounding quotes in front-matter
+  values are stripped;
 - As long as valid skills exist, every **new session** gets an "available skills" list injected as a
   system message, so the model can suggest loading a matching skill;
 - `/skill NAME` wraps the skill body into a system message appended to the current session and saves
