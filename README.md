@@ -315,13 +315,12 @@ and `in_tok`/`out_tok` (tokens — present only if the API returns usage data).
 
 Use this when a long conversation inflates the context. Strategy:
 
-- All system messages are kept;
-- Of the non-system messages, the **first 2 and last 6** are kept;
-- The middle messages are summarized by the current model (streamed live with the prefix
-  `summary> `), and the summary is inserted as a new system message;
-- With 12 or fewer non-system messages it reports "already small" and does nothing;
+- The **first system prompt message is kept as-is**;
+- **Every other message** (skills/system injections, user, assistant, tool results) is fed to the
+  current model and aggregated into a **single summary message** of the form
+  `{"role": "system", "content": "Here is a summary that ..."}`;
+- With 12 or fewer messages to aggregate it reports "already small" and does nothing;
 - If summarization fails, a placeholder truncation text is used as fallback;
-- Kept history messages are rewritten as plain text to avoid dangling tool_call ids;
 - Session and config are saved immediately afterwards.
 
 Compaction itself is one LLM call and counts toward usage statistics.

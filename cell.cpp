@@ -1437,7 +1437,7 @@ namespace cell
             std::vector<model_entry> models;
             size_t current = 0; // index of the active model (first entry is the default)
             std::string system_prompt =
-                "You are a coding agent. Inspect, search and modify files and run commands with these tools:\n"
+                "You are a helpful assistant. Inspect, search and modify files and run commands with these tools:\n"
                 "  ls    - list a directory (one level, paginated, max 500 entries/page; specify page for more)\n"
                 "  read  - read a file (max 1MB per call; pass start/end line numbers to read large files in segments)\n"
                 "  rg    - search file contents (skips hidden files and .gitignore'd paths; up to 500 matches grouped by file as 'line: content')\n"
@@ -3450,10 +3450,11 @@ int main(int argc, char const *argv[])
     auto do_chat = [&](const cell::config::model_entry &e, const cell::encrypt::secure_string &key,
                        const nlohmann::json &msgs, bool stream, cell::net::StreamCallback on_tok,
                        nlohmann::json &reply, nlohmann::json &tc, nlohmann::json &usage, std::string &err,
-                       cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
+                       bool with_tools = true, cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
         bool ap = e.provider == "anthropic";
-        const nlohmann::json &tools = ap ? tool_defs_anthropic : tool_defs_openai;
+        nlohmann::json no_tools = nlohmann::json::array();
+        const nlohmann::json &tools = with_tools ? (ap ? tool_defs_anthropic : tool_defs_openai) : no_tools;
         if (ap)
         {
             auto &client = cache.a(e.base);
@@ -3604,8 +3605,9 @@ int main(int argc, char const *argv[])
             sess->msg().push_back({{"role", "system"}, {"content", skills_prompt}});
         log.debug("ctx", std::format("inject system_prompt={}chars{}", cfg.system_prompt.size(),
                                      skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
+        cell::sys::println("context: injected system_prompt={}chars{}", cfg.system_prompt.size(),
+                           skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size()));
     };
-    ensure_prompt(s);
     // connectivity probe: GET the models endpoint with a short timeout; non-fatal on failure
     auto probe_model = [&](const cell::config::model_entry &e)
     {
@@ -3652,6 +3654,10 @@ int main(int argc, char const *argv[])
         log.info("boot", std::format("models={} active=none session={} skills={} prompt_chars={}",
                                      cfg.models.size(), s->id(), skills_all.size(), cfg.system_prompt.size()));
     cell::sys::println("cell: session={} model={}", s->id(), cfg.current_entry() ? cfg.current_entry()->label() : "none");
+    long long loaded_msgs = (long long)s->msg().size();
+    if (loaded_msgs > 0)
+        cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
+    ensure_prompt(s);
     if (const cell::config::model_entry *e = cfg.current_entry(); e)
         probe_model(*e);
 
@@ -3675,31 +3681,32 @@ int main(int argc, char const *argv[])
         }
     };
 
-    // context compaction: keep system messages + head/tail, summarize the middle via the llm
+    // context compaction: keep the first system prompt message, aggregate every other message
+    // (skills/system, user, assistant, tool) into a single {"role":"system","content":"Here is a summary that ..."}
     auto compact = [&](cell::chat::session *sess) -> std::string
     {
         auto &msgs = sess->msg();
-        nlohmann::json sys = nlohmann::json::array();
-        nlohmann::json rest = nlohmann::json::array();
-        for (auto &m : msgs)
+        size_t first_sys = (size_t)-1;
+        nlohmann::json base_sys;
+        for (size_t i = 0; i < msgs.size(); i++)
         {
-            if (m.value("role", "") == "system")
-                sys.push_back(m);
-            else
-                rest.push_back(m);
+            if (msgs[i].value("role", "") == "system")
+            {
+                first_sys = i;
+                base_sys = msgs[i];
+                break;
+            }
         }
+        nlohmann::json rest = nlohmann::json::array();
+        for (size_t i = 0; i < msgs.size(); i++)
+            if (i != first_sys)
+                rest.push_back(msgs[i]);
         if (rest.size() <= 12)
-            return std::format("context already small ({} non-system messages)", rest.size());
-        const size_t head_n = 2, tail_n = 6;
-        nlohmann::json keep_head(rest.begin(), rest.begin() + (ptrdiff_t)head_n);
-        nlohmann::json keep_tail(rest.end() - (ptrdiff_t)tail_n, rest.end());
-        nlohmann::json middle(rest.begin() + (ptrdiff_t)head_n, rest.end() - (ptrdiff_t)tail_n);
+            return std::format("context already small ({} messages to aggregate)", rest.size());
         std::string mid_text;
-        for (auto &m : middle)
+        for (auto &m : rest)
         {
             std::string role = m.value("role", "");
-            if (role == "tool")
-                continue;
             std::string body;
             auto it = m.find("content");
             if (it != m.end())
@@ -3722,14 +3729,14 @@ int main(int argc, char const *argv[])
             {
                 nlohmann::json prompt = nlohmann::json::array();
                 prompt.push_back({{"role", "user"},
-                                  {"content", std::format("Summarize the following removed part of a coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
+                                  {"content", std::format("Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
                 nlohmann::json reply, tc, usage;
                 std::string err;
-                log.info("ctx", std::format("compacting removed_msgs={} via={} head_keep=2 tail_keep=6", middle.size(), e->label()));
+                log.info("ctx", std::format("compacting aggregated_msgs={} via={} tools=off", rest.size(), e->label()));
                 cell::sys::print("summary> ");
                 auto t0 = cell::sys::detail::clock::now();
                 total_llm_requests++;
-                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage, err))
+                if (do_chat(*e, key, prompt, true, on_token, reply, tc, usage, err, false))
                 {
                     double sec = cell::sys::elapsed_ms(t0) / 1000.0;
                     cell::sys::println();
@@ -3753,38 +3760,14 @@ int main(int argc, char const *argv[])
                 }
             }
         }
-        // rebuild kept messages as plain text to avoid orphaned tool_call_ids
-        auto plain = [](const nlohmann::json &m) -> nlohmann::json
-        {
-            nlohmann::json out;
-            out["role"] = m.value("role", "");
-            auto it = m.find("content");
-            if (it != m.end() && it->is_string())
-                out["content"] = *it;
-            else if (it != m.end() && it->is_array())
-            {
-                std::string t;
-                for (auto &b : *it)
-                    if (b.value("type", "") == "text" && b.contains("text"))
-                        t += b["text"].get<std::string>();
-                out["content"] = t;
-            }
-            else
-                out["content"] = "";
-            return out;
-        };
         nlohmann::json new_msgs = nlohmann::json::array();
-        for (auto &m : sys)
-            new_msgs.push_back(m);
+        if (first_sys != (size_t)-1)
+            new_msgs.push_back(base_sys);
         new_msgs.push_back({{"role", "system"},
-                            {"content", std::format("The middle part of this conversation was removed for length. Summary of the removed part:\n{}", summary)}});
-        for (auto &m : keep_head)
-            new_msgs.push_back(plain(m));
-        for (auto &m : keep_tail)
-            new_msgs.push_back(plain(m));
-        size_t removed = middle.size();
+                            {"content", std::format("Here is a summary that captures the previous conversation:\n{}", summary)}});
+        size_t removed = rest.size();
         msgs = new_msgs;
-        return std::format("context compacted: removed {} message(s), {} remain", removed, new_msgs.size());
+        return std::format("context compacted: aggregated {} message(s) into 1 summary, {} message(s) remain", removed, new_msgs.size());
     };
 
     bool interactive = cell::plat::is_tty(stdin);
@@ -4133,7 +4116,7 @@ int main(int argc, char const *argv[])
                                         {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sk->name, body)}});
                     s->unload();
                     log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), s->msg().size()));
-                    cell::sys::println("skill loaded: {} ({} chars)", sk->name, body.size());
+                    cell::sys::println("skill loaded: {} ({} chars, total msgs={})", sk->name, body.size(), s->msg().size());
                     continue;
                 }
                 cell::sys::error("unknown command: {} (try /help)", cmd);
@@ -4237,7 +4220,7 @@ int main(int argc, char const *argv[])
                 };
                 total_llm_requests++;
                 std::string err;
-                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, err, xfer_cb, &ui);
+                bool ok = do_chat(*e, key, s->msg(), true, tok_cb, reply, tool_calls, usage, err, true, xfer_cb, &ui);
                 double total_sec = cell::sys::elapsed_ms(t0) / 1000.0;
                 double ttf_sec = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
                 if (ui.timer_line || ui.tok_line)
