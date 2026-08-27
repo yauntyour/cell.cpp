@@ -22,7 +22,7 @@ cell --provider openai --model gpt-4o --key sk-***
 | | Feature | Description |
 |---|---|---|
 | 🤖 | **Dual LLM Support** | OpenAI and Anthropic APIs, streaming & non-streaming |
-| 🔧 | **8 Built-in Tools** | `exec`, `read`, `write`, `edit`, `grep`, `exist`, `remove`, `mkdir` |
+| 🔧 | **8 Built-in Tools** | `ls`, `read`, `write`, `edit`, `rg`, `exec`, `glob`, `find` |
 | 🔒 | **Encrypted Vault** | libsodium-based credential storage with secure memory handling |
 | 💬 | **Session Persistence** | Chat history saved and restored across sessions |
 | 🛡️ | **Security Sandbox** | Blocks dangerous commands (`rm -rf`, `shutdown`, path traversal...) |
@@ -351,24 +351,38 @@ Body instructions injected when the skill is loaded...
 
 #### 2.9 Appendix: Tool Approval Prompts
 
-During a conversation the model may call tools. `exec`, `write`, `remove`, `mkdir` and `edit` are
-confirmation-required tools and show an interactive prompt before every execution:
+During a conversation the model may call one of 8 tools:
+
+| Tool | Purpose | Approval |
+|---|---|---|
+| `ls` | List a directory (one level, paginated, max 500 entries/page) | read-only, runs automatically |
+| `read` | Read a file (max 1MB per call; optional line-range segmenting) | read-only, runs automatically |
+| `rg` | Recursive content search (skips hidden files and `.gitignore` paths, max 500 matches) | read-only, runs automatically |
+| `glob` | Find files by name pattern (e.g. `**/*.test.ts`) | read-only, runs automatically |
+| `find` | Filter files by metadata (name, size, modification time) | read-only, runs automatically |
+| `write` | Create a **new** file (refuses to overwrite; refuses if the parent directory is missing) | confirmation required |
+| `edit` | Modify an existing file via a SEARCH/REPLACE block (ambiguous matches abort with all locations reported) | confirmation required |
+| `exec` | Run build/test/git commands (default 30s timeout; result ends with `exitcode=N`) | confirmation required |
+
+Read-only tools run without asking and may execute **concurrently** within one round; `write`,
+`edit` and `exec` run sequentially and show an interactive prompt before every execution:
 
 ```
 allow exec({"cmd":"g++ -std=c++26 -O2 -o cell.exe cell.cpp"})? [y/N]
 ```
 
-Answer `y` or `Y` to allow; anything else (including plain Enter) rejects that call. `read`,
-`grep` and `exist` are read-only tools that run without asking. Before execution, every tool's
-arguments also pass a sandbox check: paths containing `..`, or anything matching the dangerous
-command deny-list (`rm -rf`, `format`, `shutdown`, `taskkill`, ...) are rejected outright.
+Answer `y` or `Y` to allow; anything else (including plain Enter) rejects that call.
+High-risk commands (`rm -rf`, `chmod`, `chown`, `del /s`, ...) pass the sandbox but demand a
+**second** confirmation. Before execution, every tool's arguments also pass a sandbox check:
+paths containing `..`, or anything matching the dangerous command deny-list (`format`, `shutdown`,
+`taskkill`, ...) are rejected outright.
 
 ## Architecture
 
 The entire application lives in a single `cell.cpp` file, organized into clean namespaces:
 
 ```
-cell::box      ─ Sandboxed system operations (file I/O, exec, edit, grep)
+cell::box      ─ Sandboxed system operations (file I/O, exec, rg, glob, find, SEARCH/REPLACE edit)
 cell::net      ─ HTTP networking via libcurl (GET, POST, SSE streaming)
 cell::sys      ─ Console output, logger, exceptions
 cell::config   ─ Configuration persistence (.cell/config.json)
