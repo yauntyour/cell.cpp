@@ -264,9 +264,141 @@ namespace cell
             return key;
 #endif
         }
+        // absolute directory containing the cell executable: the anchor of the
+        // .cell data dir, independent of the cwd cell happens to run in
+        inline std::filesystem::path executable_dir()
+        {
+#ifdef _WIN32
+            std::wstring buf;
+            DWORD n = 0, cap = MAX_PATH + 1;
+            do
+            {
+                buf.resize(cap);
+                n = GetModuleFileNameW(nullptr, buf.data(), (DWORD)buf.size());
+                cap *= 2;
+            } while (n == (DWORD)buf.size());
+            if (n == 0)
+                return std::filesystem::current_path();
+            buf.resize(n);
+            return std::filesystem::path(buf).parent_path();
+#else
+            std::string buf(4096, '\0');
+            ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size());
+            if (n > 0)
+            {
+                buf.resize((size_t)n);
+                return std::filesystem::path(buf).parent_path();
+            }
+            return std::filesystem::current_path();
+#endif
+        }
     } // namespace plat
 
-    std::filesystem::path root = ".cell";
+    std::filesystem::path root = plat::executable_dir() / ".cell";
+
+    // normalized absolute working directory: the identity of "the cwd cell runs in"
+    static std::filesystem::path workdir()
+    {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::current_path(ec);
+        if (ec || p.empty())
+            p = ".";
+        p = std::filesystem::absolute(p, ec);
+        return p.lexically_normal();
+    }
+    // stable per-cwd key: sha3-256 of the normalized cwd path, hex, truncated to 16 chars.
+    // windows paths are case-insensitive, so the input is lowercased before hashing.
+    static std::string cwd_id()
+    {
+        std::string s = workdir().string();
+#ifdef _WIN32
+        for (auto &c : s)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+#endif
+        static bool sodium_ready = false;
+        if (!sodium_ready)
+            sodium_ready = sodium_init() != -1;
+        unsigned char digest[crypto_hash_sha3256_BYTES];
+        crypto_hash_sha3256(digest, (const unsigned char *)s.data(), s.size());
+        std::string out;
+        out.reserve(crypto_hash_sha3256_BYTES * 2);
+        for (size_t i = 0; i < crypto_hash_sha3256_BYTES; i++)
+            out += std::format("{:02x}", digest[i]);
+        out.resize(16);
+        return out;
+    }
+    // every session id embeds its cwd key before the first '-'
+    static std::string session_prefix(const std::string &session_id)
+    {
+        size_t d = session_id.find('-');
+        return d == std::string::npos ? session_id : session_id.substr(0, d);
+    }
+    // on-disk session file: <root>/sessions/<cwd key>/<id>.json
+    static std::filesystem::path session_path(const std::string &session_id)
+    {
+        return root / "sessions" / session_prefix(session_id) / (session_id + ".json");
+    }
+    // canonical, case-insensitive (on Windows) path equality
+    static bool same_path(const std::string &a, const std::string &b)
+    {
+        std::error_code ec;
+        std::filesystem::path na = std::filesystem::weakly_canonical(a, ec);
+        std::filesystem::path nb = std::filesystem::weakly_canonical(b, ec);
+        std::string sa = na.string(), sb = nb.string();
+#ifdef _WIN32
+        for (auto &c : sa)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+        for (auto &c : sb)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+#endif
+        return sa == sb;
+    }
+    // index of cwd hash -> cwd path, kept at <root>/sessions/sessions.json so every
+    // hash can be resolved back to the directory it stands for
+    static std::filesystem::path sessions_index_path()
+    {
+        return root / "sessions" / "sessions.json";
+    }
+    static nlohmann::json sessions_index()
+    {
+        std::ifstream f(sessions_index_path());
+        if (!f.is_open())
+            return nlohmann::json::object();
+        try
+        {
+            auto j = nlohmann::json::parse(f, nullptr, false);
+            if (!j.is_discarded() && j.is_object())
+                return j;
+        }
+        catch (const std::exception &)
+        {
+        }
+        return nlohmann::json::object();
+    }
+    static std::string cwd_for_key(const std::string &key)
+    {
+        auto j = sessions_index();
+        if (j.contains(key) && j[key].is_string())
+            return j[key].get<std::string>();
+        return "";
+    }
+    static void remember_cwd(const std::string &key, const std::string &path)
+    {
+        if (key.empty() || path.empty())
+            return;
+        std::error_code ec;
+        std::filesystem::create_directories(root / "sessions", ec);
+        auto j = sessions_index();
+        if (j.value(key, "") == path)
+            return;
+        j[key] = path;
+        std::ofstream f(sessions_index_path(), std::ios::trunc);
+        if (f.is_open())
+            f << j.dump(2);
+    }
     namespace text
     {
         // split text into lines, stripping a trailing '\r' from each line
@@ -1457,6 +1589,7 @@ namespace cell
                 "- The system executes these tools in parallel, so feel free to batch them when you need information from multiple sources.\n"
                 "When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
+            std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
             bool empty() const { return models.empty(); }
             const model_entry *current_entry() const
@@ -1544,6 +1677,10 @@ namespace cell
                 }
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
+                if (j.contains("active_sessions") && j["active_sessions"].is_object())
+                    for (auto &[k, v] : j["active_sessions"].items())
+                        if (v.is_string())
+                            s.active_sessions[k] = v.get<std::string>();
             }
             catch (const std::exception &e)
             {
@@ -1551,7 +1688,7 @@ namespace cell
             }
             return s;
         }
-        bool save(const settings &s)
+        bool save(settings &s)
         {
             std::error_code ec;
             std::filesystem::create_directories(root, ec);
@@ -1563,6 +1700,9 @@ namespace cell
             j["current_model"] = s.current;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
+            if (!s.session_id.empty())
+                s.active_sessions[cwd_id()] = s.session_id;
+            j["active_sessions"] = s.active_sessions;
             std::ofstream f(file(), std::ios::trunc);
             if (!f.is_open())
                 return false;
@@ -2511,16 +2651,14 @@ namespace cell
         {
         private:
             std::string session_id;
+            std::string cwd; // working directory this session belongs to
             nlohmann::json messages = nlohmann::json::array(); // [{"role":"user","content":"hi"},...]
             std::filesystem::path file;
             bool loaded = false;
 
         public:
-            session() : session(std::format("{}", std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count())) {}
-            session(const std::string &id) : session_id(id)
-            {
-                file = root / "sessions" / (session_id + ".json");
-            }
+            session() : session(std::format("{}-{}", cwd_id(), std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count())) {}
+            session(const std::string &id) : session_id(id), cwd(workdir().string()), file(session_path(session_id)) {}
             session(session &&) = default;
             session &operator=(session &&) = default;
             ~session() {}
@@ -2546,6 +2684,7 @@ namespace cell
                         messages = j["messages"];
                         cell::sys::logger::instance().info("sess", std::format("loaded id={} msgs={}", session_id, messages.size()));
                     }
+                    cwd = j.value("cwd", cwd);
                 }
                 catch (const std::exception &)
                 {
@@ -2556,15 +2695,19 @@ namespace cell
             void unload()
             {
                 std::error_code ec;
-                std::filesystem::create_directories(root / "sessions", ec);
+                std::filesystem::create_directories(file.parent_path(), ec);
                 nlohmann::json j;
                 j["id"] = session_id;
+                j["cwd"] = cwd;
                 j["messages"] = messages;
                 std::ofstream f(file, std::ios::trunc);
                 if (f.is_open())
                     f << j.dump(2);
+                remember_cwd(session_prefix(session_id), cwd);
             }
             const std::string &id() const { return session_id; }
+            const std::string &cwd_path() const { return cwd; }
+            const std::filesystem::path &path() const { return file; }
             nlohmann::json &msg() { return messages; }
             void append(const std::string &role, const nlohmann::json &content)
             {
@@ -2620,7 +2763,7 @@ namespace cell
                         continue;
                     std::string key = it->first;
                     std::error_code ec;
-                    std::filesystem::remove(root / "sessions" / (session_id + ".json"), ec);
+                    std::filesystem::remove(session_path(session_id), ec);
                     session_list.erase(it);
                     if (current == key)
                         current = "current";
@@ -2861,7 +3004,7 @@ namespace cell
             for (auto &[k, v] : sess.items())
             {
                 std::error_code ec;
-                if (!std::filesystem::exists(root / "sessions" / (k + ".json"), ec))
+                if (!std::filesystem::exists(session_path(k), ec))
                     gone.push_back(k);
             }
             if (gone.empty())
@@ -2905,7 +3048,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --model MODEL                default model name");
     cell::sys::println("  --proxy URL                  http(s) proxy for the default model");
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
-    cell::sys::println("  --session ID                 resume an existing session");
+    cell::sys::println("  --session ID                 resume an existing session (switches to its working directory)");
     cell::sys::println("  --system TEXT                system prompt");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
@@ -2920,8 +3063,8 @@ static void print_help()
     cell::sys::println("  /model provider:NAME base:URL key:KEY proxy:URL   add/update a model");
     cell::sys::println("  /model rm provider:NAME      delete a model (removes its stored key too)");
     cell::sys::println("      e.g. /model anthropic:claude-opus4.8 base:https://api.anthropic.com key:sk-xxx");
-    cell::sys::println("  /sessions                   list saved sessions");
-    cell::sys::println("  /session ID                 switch to another saved session");
+    cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
+    cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
     cell::sys::println("  /usages                     show per-model and per-session usage statistics");
     cell::sys::println("  /compact                    compress the current session context");
@@ -3343,17 +3486,23 @@ static int run_selftest()
             auto &old = h2.now();
             old.append("user", "hello");
             old.unload();
-            expect(cell::box::exist((cell::root / "sessions" / (sid + ".json")).string()), "session unload writes file");
+            expect(cell::box::exist(cell::chat::session(sid).path().string()), "session unload writes file");
             h2.forget_current();
             auto &fresh = h2.now();
             expect(fresh.id() != sid && fresh.msg().empty(), "forget_current switches to a fresh empty session");
-            expect(cell::box::exist((cell::root / "sessions" / (sid + ".json")).string()), "forget_current keeps old session file on disk");
+            expect(cell::box::exist(cell::chat::session(sid).path().string()), "forget_current keeps old session file on disk");
         }
         // the kept file must still reload into a fresh history (i.e. /session <id> can revisit it)
         cell::chat::history h3;
         h3.use(sid);
         auto &re = h3.now();
         expect(re.msg().size() == 1 && re.msg()[0].value("role", "") == "user", "kept session reloads from disk");
+        // sessions are grouped per cwd: the file sits under the cwd-keyed dir and records its cwd
+        expect(cell::box::read(cell::chat::session(sid).path().string(), out) && out.find("\"cwd\"") != std::string::npos, "session file records its cwd");
+        expect(cell::cwd_id() == cell::cwd_id(), "cwd_id is stable");
+        // cwd hash -> path index written on unload
+        expect(cell::box::exist((cell::root / "sessions" / "sessions.json").string()), "sessions index written on unload");
+        expect(cell::cwd_for_key(cell::session_prefix(sid)) == cell::workdir().string(), "sessions index maps cwd hash to path");
     }
 
     expect(vault.set("overwrite_key", "v1") && vault.get("overwrite_key") == "v1", "crypt::set new");
@@ -3706,10 +3855,81 @@ int main(int argc, char const *argv[])
     };
 
     // session + skills prompt injection
+    // one-time migration: legacy flat root/sessions/<id>.json files move into the
+    // current cwd group as <cwd key>-<id>.json (their id and cwd fields rewritten)
+    {
+        std::error_code ec;
+        std::filesystem::path sdir = cell::root / "sessions";
+        if (std::filesystem::exists(sdir, ec))
+        {
+            std::string wid = cell::cwd_id();
+            for (auto &e : std::filesystem::directory_iterator(sdir, ec))
+            {
+                if (ec)
+                    break;
+                if (!e.is_regular_file(ec) || e.path().extension() != ".json")
+                    continue;
+                if (e.path().filename() == "sessions.json")
+                    continue;
+                std::string old = e.path().stem().string();
+                std::string nid = wid + "-" + old;
+                try
+                {
+                    nlohmann::json j;
+                    {
+                        std::ifstream fin(e.path());
+                        j = nlohmann::json::parse(fin, nullptr, false);
+                    }
+                    if (j.is_discarded())
+                        continue;
+                    j["id"] = nid;
+                    j["cwd"] = cell::workdir().string();
+                    std::filesystem::create_directories(cell::root / "sessions" / wid, ec);
+                    std::ofstream fout(cell::session_path(nid), std::ios::trunc);
+                    if (!fout.is_open())
+                        continue;
+                    fout << j.dump(2);
+                    fout.close();
+                    std::filesystem::remove(e.path(), ec);
+                    cell::remember_cwd(wid, cell::workdir().string());
+                    if (cfg.active_sessions.find(wid) == cfg.active_sessions.end())
+                        cfg.active_sessions[wid] = nid;
+                    log.info("sess", std::format("migrated legacy session {} -> {}", old, nid));
+                }
+                catch (const std::exception &)
+                {
+                }
+            }
+        }
+    }
+    // resolve the active session: per-cwd remember, then legacy config session field
     cell::chat::history h;
-    if (!cfg.session_id.empty())
-        h.use(cfg.session_id);
+    {
+        std::string wid = cell::cwd_id();
+        std::string active;
+        auto it = cfg.active_sessions.find(wid);
+        if (it != cfg.active_sessions.end() && !it->second.empty())
+            active = it->second;
+        else if (!cfg.session_id.empty())
+        {
+            std::string id = cfg.session_id.find('-') == std::string::npos ? wid + "-" + cfg.session_id : cfg.session_id;
+            if (cell::session_prefix(id) == wid && std::filesystem::exists(cell::session_path(id)))
+                active = id;
+        }
+        if (!active.empty())
+            h.use(active);
+    }
     cell::chat::session *s = &h.now();
+    // a resumed session may belong to another cwd: follow it so tools operate there
+    if (const std::string &sc = s->cwd_path(); !sc.empty() && !cell::same_path(sc, cell::workdir().string()))
+    {
+        std::error_code ec;
+        std::filesystem::current_path(sc, ec);
+        if (ec)
+            cell::sys::warn("session cwd unreachable: {} (staying in {})", sc, cell::workdir().string());
+        else
+            cell::sys::println("cwd -> {}", cell::workdir().string());
+    }
     // RAII exit guard: persists the session + config and cleans up libcurl no matter how
     // main leaves this scope (normal /exception / Ctrl+C graceful exit).
     auto on_exit = cell::sys::make_scoped_exit([&]
@@ -4167,51 +4387,81 @@ int main(int argc, char const *argv[])
                 }
                 if (cmd == "/sessions")
                 {
+                    struct s_entry
+                    {
+                        std::string id, cwd, snippet;
+                        long long count = 0;
+                    };
+                    std::vector<s_entry> entries;
                     std::error_code ec;
                     std::filesystem::path dir = cell::root / "sessions";
-                    bool any = false;
+                    auto index = cell::sessions_index();
                     if (std::filesystem::exists(dir, ec))
                     {
-                        for (auto &entry : std::filesystem::directory_iterator(dir, ec))
+                        for (auto &g : std::filesystem::directory_iterator(dir, ec))
                         {
                             if (ec)
                                 break;
-                            if (!entry.is_regular_file(ec))
+                            if (!g.is_directory(ec))
                                 continue;
-                            if (entry.path().extension() != ".json")
-                                continue;
-                            any = true;
-                            std::string sid = entry.path().stem().string();
-                            std::string marker = (sid == s->id()) ? " *" : "";
-                            long long count = 0;
-                            std::string snippet;
-                            try
+                            std::string key = g.path().filename().string();
+                            std::string group_cwd = index.value(key, "");
+                            for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
                             {
-                                std::ifstream f(entry.path());
-                                auto j = nlohmann::json::parse(f, nullptr, false);
-                                if (j.contains("messages") && j["messages"].is_array())
+                                if (ec)
+                                    break;
+                                if (!f.is_regular_file(ec) || f.path().extension() != ".json")
+                                    continue;
+                                s_entry e;
+                                e.id = f.path().stem().string();
+                                try
                                 {
-                                    count = (long long)j["messages"].size();
-                                    for (auto &m : j["messages"])
+                                    std::ifstream fin(f.path());
+                                    auto j = nlohmann::json::parse(fin, nullptr, false);
+                                    e.cwd = group_cwd;
+                                    if (e.cwd.empty())
+                                        e.cwd = j.value("cwd", "");
+                                    if (j.contains("messages") && j["messages"].is_array())
                                     {
-                                        if (m.value("role", "") == "user" && m.contains("content") && m["content"].is_string())
+                                        e.count = (long long)j["messages"].size();
+                                        for (auto &m : j["messages"])
                                         {
-                                            snippet = m["content"].get<std::string>();
-                                            break;
+                                            if (m.value("role", "") == "user" && m.contains("content") && m["content"].is_string())
+                                            {
+                                                e.snippet = m["content"].get<std::string>();
+                                                break;
+                                            }
                                         }
                                     }
                                 }
+                                catch (const std::exception &)
+                                {
+                                }
+                                if (e.snippet.size() > 60)
+                                    e.snippet = e.snippet.substr(0, 57) + "...";
+                                entries.push_back(std::move(e));
                             }
-                            catch (const std::exception &)
-                            {
-                            }
-                            if (snippet.size() > 60)
-                                snippet = snippet.substr(0, 57) + "...";
-                            cell::sys::println("  {}{}  messages={}{}", sid, marker, count, snippet.empty() ? "" : "  \"" + snippet + "\"");
                         }
                     }
-                    if (!any)
+                    if (entries.empty())
+                    {
                         cell::sys::println("  (no sessions)");
+                        continue;
+                    }
+                    std::sort(entries.begin(), entries.end(), [](const s_entry &a, const s_entry &b)
+                              { return a.cwd != b.cwd ? a.cwd < b.cwd : a.id < b.id; });
+                    std::string cur_cwd = cell::workdir().string();
+                    std::string group;
+                    for (auto &e : entries)
+                    {
+                        if (e.cwd != group)
+                        {
+                            group = e.cwd;
+                            cell::sys::println("  {} cwd: {}", cell::same_path(group, cur_cwd) ? ">" : "-", group.empty() ? "(unknown)" : group);
+                        }
+                        std::string marker = (e.id == s->id()) ? " *" : "";
+                        cell::sys::println("    {}{}  messages={}{}", e.id, marker, e.count, e.snippet.empty() ? "" : "  \"" + e.snippet + "\"");
+                    }
                     continue;
                 }
                 if (cmd == "/session")
@@ -4230,7 +4480,7 @@ int main(int argc, char const *argv[])
                         }
                         std::string target = toks[2];
                         std::error_code ec;
-                        std::filesystem::path p = cell::root / "sessions" / (target + ".json");
+                        std::filesystem::path p = cell::session_path(target);
                         bool existed = std::filesystem::exists(p, ec);
                         if (existed && !std::filesystem::remove(p, ec))
                         {
@@ -4257,6 +4507,27 @@ int main(int argc, char const *argv[])
                         continue;
                     }
                     s->unload();
+                    // the target session may live under another cwd: follow it so the
+                    // chat context and the process cwd stay consistent
+                    std::string tcwd;
+                    try
+                    {
+                        std::ifstream f(cell::session_path(target));
+                        auto j = nlohmann::json::parse(f, nullptr, false);
+                        tcwd = j.value("cwd", "");
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                    if (!tcwd.empty() && !cell::same_path(tcwd, cell::workdir().string()))
+                    {
+                        std::error_code ec;
+                        std::filesystem::current_path(tcwd, ec);
+                        if (ec)
+                            cell::sys::warn("session cwd unreachable: {} (staying in {})", tcwd, cell::workdir().string());
+                        else
+                            cell::sys::println("cwd -> {}", cell::workdir().string());
+                    }
                     h.use(target);
                     s = &h.now();
                     ensure_prompt(s);
