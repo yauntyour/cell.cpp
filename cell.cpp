@@ -2201,6 +2201,8 @@ namespace cell
                 if (tools.is_array() && !tools.empty())
                     b["tools"] = tools;
                 b["stream"] = stream;
+                if (stream)
+                    b["stream_options"] = {{"include_usage", true}};
                 return b;
             }
 
@@ -2408,7 +2410,10 @@ namespace cell
                     {
                         std::string type = ev.value("type", "");
                         if (type == "message_start" && ev.contains("message") && ev["message"].contains("usage"))
+                        {
                             usage["input_tokens"] = ev["message"]["usage"].value("input_tokens", 0);
+                            usage["cache_read_input_tokens"] = ev["message"]["usage"].value("cache_read_input_tokens", 0);
+                        }
                         else if (type == "message_delta" && ev.contains("usage"))
                             usage["output_tokens"] = ev["usage"].value("output_tokens", 0);
                         size_t idx = ev.value("index", (size_t)blocks.size());
@@ -3499,6 +3504,30 @@ int main(int argc, char const *argv[])
         }
         return std::nullopt;
     };
+    // cache hit rate = cached prompt tokens / total prompt tokens
+    // OpenAI: usage.prompt_tokens_details.cached_tokens within usage.prompt_tokens (total incl. cache)
+    // Anthropic (llama.cpp): usage.cache_read_input_tokens disjoint from usage.input_tokens, so total = cache + input
+    auto usage_cache_hit = [](const nlohmann::json &u) -> std::optional<double>
+    {
+        if (!u.is_object())
+            return std::nullopt;
+        long long cached = -1, total = -1;
+        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
+        {
+            cached = u["prompt_tokens_details"].value("cached_tokens", 0LL);
+            if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                total = u["prompt_tokens"].get<long long>();
+        }
+        else if (u.contains("cache_read_input_tokens") && u["cache_read_input_tokens"].is_number_integer())
+        {
+            cached = u["cache_read_input_tokens"].get<long long>();
+            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                total = cached + u["input_tokens"].get<long long>();
+        }
+        if (cached < 0 || total <= 0)
+            return std::nullopt;
+        return (double)cached / (double)total;
+    };
 
     // session + skills prompt injection
     cell::chat::history h;
@@ -3634,10 +3663,12 @@ int main(int argc, char const *argv[])
                         summary = "(empty summary)";
                     auto in_tok = usage_in(usage);
                     auto out_tok = usage_out(usage);
-                    log.info("ctx", std::format("summary chars={} time={:.2f}s tok_in={} tok_out={}",
+                    auto cache_hit = usage_cache_hit(usage);
+                    log.info("ctx", std::format("summary chars={} time={:.2f}s tok_in={} tok_out={} cache={}",
                                                 summary.size(), sec,
                                                 in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
-                                                out_tok.has_value() ? std::to_string(*out_tok) : "n/a"));
+                                                out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
+                                                cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a"));
                     cell::stats::add(sess->id(), e->label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
                 }
                 else
@@ -4152,10 +4183,12 @@ int main(int argc, char const *argv[])
                 long long out_chars = reply_text_len(reply);
                 auto in_tok = usage_in(usage);
                 auto out_tok = usage_out(usage);
-                log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} time={:.2f}s ttf={} tools={}",
+                auto cache_hit = usage_cache_hit(usage);
+                log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={}",
                                             rounds, e->label(), (long long)s->msg().size(),
                                             in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
                                             out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
+                                            cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a",
                                             total_sec, ttf_sec < 0 ? "n/a" : std::format("{:.2f}s", ttf_sec),
                                             tool_calls.size()));
                 s->msg().push_back(reply);
