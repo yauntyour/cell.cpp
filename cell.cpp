@@ -2334,7 +2334,7 @@ namespace cell
                     line++;
             return line;
         }
-        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false)
+        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false, size_t offset = 0, size_t limit = 0)
         {
             std::ifstream file(std::filesystem::path(path), std::ios::binary);
             if (!file.is_open())
@@ -2349,6 +2349,12 @@ namespace cell
             file.read(&output[0], (std::streamsize)size);
             if (!file.good() && !file.eof())
                 return false;
+            // offset/limit mode: convert to start_line/end_line semantics
+            if (offset > 0 || limit > 0)
+            {
+                start_line = offset + 1; // offset is 0-based, start_line is 1-based
+                end_line = (limit > 0) ? (offset + limit) : (size_t)-1;
+            }
             if (start_line == 0 && end_line == 0)
             {
                 if (track)
@@ -4892,14 +4898,14 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return cell::box::list_dir(j.value("path", "."), j.value("page", (size_t)1),
                                        std::max<size_t>(1, std::min<size_t>(j.value("page_size", (size_t)500), 500)), out);
         });
-    add("read", "Read a text file (capped at 1MB per call) and return its contents. Use optional start/end line numbers to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
+    add("read", "Read a text file (capped at 1MB per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
         {{"path", str_prop("file path")},
-         {"start", str_prop("first line to read, 1-based (optional)")},
-         {"end", str_prop("last line to read, 1-based (optional)")}},
+         {"offset", str_prop("number of lines to skip from the start (0-based, optional)")},
+         {"limit", str_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::read(j.value("path", ""), out, j.value("start", (size_t)0), j.value("end", (size_t)0), true);
+            return cell::box::read(j.value("path", ""), out, 0, 0, true, j.value("offset", (size_t)0), j.value("limit", (size_t)0));
         });
     add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).",
         {{"path", str_prop("file path")}, {"content", str_prop("text content")}},
