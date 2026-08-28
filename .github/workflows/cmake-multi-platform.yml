@@ -41,17 +41,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
       - name: Configure & Build
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64
-          cmake --build build --config Release
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
 
       - name: Verify static linking
         run: |
-          dumpbin /dependents build\Release\cell.exe
+          dumpbin /dependents build\cell.exe
 
       - name: Package
-        run: Compress-Archive -Path build\Release\cell.exe,LICENSE -DestinationPath cell-windows-x64.zip
+        run: Compress-Archive -Path build\cell.exe,LICENSE -DestinationPath cell-windows-x64.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -67,7 +75,7 @@ jobs:
       - name: Install GCC & build tools
         run: |
           brew update
-          brew install gcc cmake ninja openssl
+          brew install gcc cmake ninja openssl autoconf automake libtool
 
       - name: Detect GCC version
         id: gcc

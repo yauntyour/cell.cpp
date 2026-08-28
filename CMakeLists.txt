@@ -34,6 +34,10 @@ endif()
 
 set(SODIUM_PREFIX "${CMAKE_BINARY_DIR}/deps/sodium")
 
+# 提前创建目录，避免较新版本 CMake（如 4.x）在生成阶段
+# 因 IMPORTED target 的 INTERFACE_INCLUDE_DIRECTORIES 指向不存在路径而报错
+file(MAKE_DIRECTORY "${SODIUM_PREFIX}/include")
+
 find_program(MAKE_PROG make gmake)
 if(NOT MAKE_PROG)
     set(MAKE_PROG "make")
@@ -111,6 +115,13 @@ set(HTTP_ONLY         ON  CACHE BOOL "" FORCE)
 set(ENABLE_UNIX_SOCKETS OFF CACHE BOOL "" FORCE)
 set(CURL_DISABLE_LDAP   ON  CACHE BOOL "" FORCE)
 set(CURL_DISABLE_LDAPS  ON  CACHE BOOL "" FORCE)
+# 禁用可选的第三方依赖，避免 CI 环境缺少包时配置失败
+set(CURL_USE_LIBPSL  OFF CACHE BOOL "" FORCE)
+set(CURL_USE_LIBIDN2 OFF CACHE BOOL "" FORCE)
+set(CURL_USE_BROTLI  OFF CACHE BOOL "" FORCE)
+set(CURL_USE_ZSTD    OFF CACHE BOOL "" FORCE)
+set(CURL_USE_NGHTTP2 OFF CACHE BOOL "" FORCE)
+set(CURL_USE_LIBSSH2 OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(curl
     GIT_REPOSITORY https://github.com/curl/curl.git
