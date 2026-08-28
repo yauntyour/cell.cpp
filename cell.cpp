@@ -2340,15 +2340,24 @@ namespace cell
             std::ifstream file(std::filesystem::path(path), std::ios::binary);
             if (!file.is_open())
                 return false;
-            file.seekg(0, std::ios::end);
-            std::streamoff off = file.tellg();
-            if (off < 0 || off > (std::streamoff)1024 * 1024 * 128)
-                return false;
-            size_t size = (size_t)off;
-            file.seekg(0);
-            output.resize(size);
-            file.read(&output[0], (std::streamsize)size);
-            if (!file.good() && !file.eof())
+            // per-call cap: 128M characters (UTF-8 code points; a multi-byte
+            // sequence counts once). Streamed in, so oversized files fail fast
+            // without ever being fully buffered.
+            constexpr size_t kMaxChars = (size_t)128 * 1024 * 1024;
+            output.clear();
+            char buf[1 << 15];
+            size_t chars = 0;
+            while (file.read(buf, sizeof buf) || file.gcount() > 0)
+            {
+                size_t n = (size_t)file.gcount();
+                for (size_t i = 0; i < n; i++)
+                    if ((buf[i] & 0xC0) != 0x80) // not a UTF-8 continuation byte
+                        chars++;
+                if (chars > kMaxChars)
+                    return false;
+                output.append(buf, n);
+            }
+            if (!file.eof())
                 return false;
             // offset/limit mode: convert to start_line/end_line semantics
             if (offset > 0 || limit > 0)
@@ -2367,7 +2376,7 @@ namespace cell
             // single pass over the buffer: slice the requested line range directly
             // into a fresh string (no intermediate per-line copies)
             std::string out;
-            out.reserve(size);
+            out.reserve(output.size());
             size_t nline = 0;
             size_t line_begin = 0;
             for (size_t i = 0; i < output.size(); i++)
@@ -3190,7 +3199,7 @@ namespace cell
             std::string system_prompt =
                 "You are a helpful assistant. Inspect, search and modify files and run commands with these tools:\n"
                 "  ls    - list a directory (one level, paginated, max 500 entries/page; specify page for more)\n"
-                "  read  - read a file (max 128MB per call; pass start/end line numbers to read large files in segments)\n"
+                "  read  - read a file (max 128M characters per call; pass offset/limit to read large files in segments)\n"
                 "  rg    - search file contents (skips hidden files and .gitignore'd paths; up to 500 matches grouped by file as 'line: content')\n"
                 "  glob  - find files by name pattern (e.g. **/*.test.ts); use it to narrow down when ls returns too many entries\n"
                 "  find  - filter files by metadata (name, size, modification time)\n"
@@ -4867,6 +4876,54 @@ static bool json_args(const std::string &in, nlohmann::json &j)
     }
 }
 
+// tool argument that may arrive as a JSON number or a quoted numeric string
+// (models frequently quote integers); returns the parsed value or fallback
+static size_t num_arg(const nlohmann::json &j, const char *key, size_t fallback)
+{
+    auto it = j.find(key);
+    if (it == j.end())
+        return fallback;
+    if (it->is_number_unsigned())
+        return it->get<size_t>();
+    if (it->is_number_integer())
+    {
+        long long v = it->get<long long>();
+        return v > 0 ? (size_t)v : fallback;
+    }
+    if (it->is_number_float())
+    {
+        double v = it->get<double>();
+        return v > 0 ? (size_t)v : fallback;
+    }
+    if (it->is_string())
+    {
+        const std::string &s = it->get_ref<const std::string &>();
+        char *end = nullptr;
+        unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+        if (end != s.c_str() && *end == '\0')
+            return (size_t)v;
+    }
+    return fallback;
+}
+
+static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
+{
+    auto it = j.find(key);
+    if (it == j.end())
+        return fallback;
+    if (it->is_number())
+        return it->get<double>();
+    if (it->is_string())
+    {
+        const std::string &s = it->get_ref<const std::string &>();
+        char *end = nullptr;
+        double v = std::strtod(s.c_str(), &end);
+        if (end != s.c_str() && *end == '\0')
+            return v;
+    }
+    return fallback;
+}
+
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic)
 {
     using cell::tools::Policy;
@@ -4908,17 +4965,17 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::list_dir(j.value("path", "."), j.value("page", (size_t)1),
-                                       std::max<size_t>(1, std::min<size_t>(j.value("page_size", (size_t)500), 500)), out);
+            return cell::box::list_dir(j.value("path", "."), num_arg(j, "page", 1),
+                                       std::max<size_t>(1, std::min<size_t>(num_arg(j, "page_size", 500), 500)), out);
         });
-    add("read", "Read a text file (capped at 128MB per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
+    add("read", "Read a text file (capped at 128M characters per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
         {{"path", str_prop("file path")},
          {"offset", str_prop("number of lines to skip from the start (0-based, optional)")},
          {"limit", str_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::read(j.value("path", ""), out, 0, 0, true, j.value("offset", (size_t)0), j.value("limit", (size_t)0));
+            return cell::box::read(j.value("path", ""), out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0));
         });
     add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).",
         {{"path", str_prop("file path")}, {"content", str_prop("text content")}},
@@ -4944,7 +5001,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         [](const nlohmann::json &j, std::string &out)
         {
             return cell::box::rg(j.value("pattern", ""), j.value("path", "."),
-                                 std::max<size_t>(1, std::min<size_t>(j.value("max_results", (size_t)500), 500)), out);
+                                 std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
     add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. The command is sandboxed: by default only local git subcommands are allowed; network-egress commands (curl, wget, git push/fetch/clone, python urllib, node fetch, ...) are denied in every mode, and non-whitelisted commands need a broader sandbox mode. High-risk commands (rm -rf, chmod, ...) require a second confirmation.",
         {{"cmd", str_prop("shell command to execute")},
@@ -4952,7 +5009,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {"cmd"}, Policy::Ask,
         [](const nlohmann::json &j, std::string &out)
         {
-            double timeout = j.value("timeout", 30.0);
+            double timeout = dbl_arg(j, "timeout", 30.0);
             if (!(timeout > 0) || timeout > 300)
                 timeout = 30.0;
             int exit_code = 1;
@@ -4978,8 +5035,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         [](const nlohmann::json &j, std::string &out)
         {
             return cell::box::find(j.value("path", "."), j.value("name", ""),
-                                   j.value("newer_than_hours", 0.0), j.value("larger_than_bytes", 0LL),
-                                   std::max<size_t>(1, std::min<size_t>(j.value("max_results", (size_t)500), 500)), out);
+                                   dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
+                                   std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
     return {list, defs};
 }
@@ -5258,6 +5315,18 @@ static int run_selftest()
     expect(cell::box::remove("edit_test.txt"), "edit cleanup");
 
     {
+        // numeric tool args tolerate both JSON numbers and quoted numeric strings
+        // (models frequently quote integers); garbage/missing fall back
+        nlohmann::json sj = nlohmann::json::parse(R"({"offset":"85","limit":"20"})");
+        expect(num_arg(sj, "offset", 0) == 85 && num_arg(sj, "limit", 0) == 20, "num_arg parses quoted numbers");
+        nlohmann::json nj = nlohmann::json::parse(R"({"offset":85,"limit":20})");
+        expect(num_arg(nj, "offset", 0) == 85 && num_arg(nj, "limit", 0) == 20, "num_arg parses plain numbers");
+        expect(num_arg(nj, "missing", 7) == 7, "num_arg falls back on missing key");
+        expect(num_arg(sj, "junk", 3) == 3, "num_arg falls back on garbage string");
+        expect(dbl_arg(nlohmann::json::parse(R"({"timeout":"30"})"), "timeout", 1.0) == 30.0, "dbl_arg parses quoted timeout");
+    }
+
+    {
         // tool registry: exactly the 8 redesigned tools with correct policies
         auto [tool_list, tool_defs] = build_tools(false);
         const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "glob", "find"};
@@ -5304,6 +5373,18 @@ static int run_selftest()
             reads_ok = reads_ok && ok && o == std::format("payload {}\n", i);
         }
         expect(reads_ok, "concurrent read tool calls all succeed");
+        {
+            // read tool with quoted offset/limit: the exact shape that used to
+            // throw type_error.302 and fail every read
+            std::string o;
+            expect(conc_tools["read"]->execute(nlohmann::json{{"path", "conc_dir/f00.txt"}, {"offset", "0"}, {"limit", "1"}}.dump(), o) &&
+                       o == "payload 0\n",
+                   "read tool tolerates string offset/limit");
+            o.clear();
+            expect(conc_tools["read"]->execute(nlohmann::json{{"path", "conc_dir/f00.txt"}, {"offset", 0}, {"limit", 1}}.dump(), o) &&
+                       o == "payload 0\n",
+                   "read tool tolerates number offset/limit");
+        }
         std::vector<std::future<bool>> mixed;
         mixed.push_back(std::async(std::launch::async, [&conc_tools]
                                    {
@@ -7200,7 +7281,7 @@ int main(int argc, char const *argv[])
                         // prompt-injection defence: every tool result is sanitized
                         // (injection fingerprints redacted) and wrapped in explicit
                         // untrusted-data boundaries before it reaches the LLM.
-                        std::string body = cell::box::sanitize_output(res[i].output, 1024 * 1024 * 128);
+                        std::string body = cell::box::sanitize_output(res[i].output, 1024 * 1024 * 512);
                         std::string marker;
                         try
                         {
