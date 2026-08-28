@@ -133,7 +133,8 @@ namespace cell
                 for (;;)
                 {
                     std::unique_lock lk(mx);
-                    cv.wait(lk, [&] { return stopping || !pending.empty(); });
+                    cv.wait(lk, [&]
+                            { return stopping || !pending.empty(); });
                     if (stopping && pending.empty())
                         return;
                     auto it = pending.begin();
@@ -149,7 +150,11 @@ namespace cell
             }
 
         public:
-            file_writer() { worker = std::jthread([this] { run(); }); }
+            file_writer()
+            {
+                worker = std::jthread([this]
+                                      { run(); });
+            }
             ~file_writer()
             {
                 {
@@ -488,7 +493,7 @@ namespace cell
     }
     // call after every chdir so the cached workdir / cwd_id stay correct
     static void reset_workdir_cache() { workdir_cache().reset(); }
-// stable per-cwd key: sha3-256 of the normalized cwd path, hex, truncated to 16 chars.
+    // stable per-cwd key: sha3-256 of the normalized cwd path, hex, truncated to 16 chars.
     // windows paths are case-insensitive, so the input is lowercased before hashing.
     static std::string cwd_id()
     {
@@ -2843,8 +2848,8 @@ namespace cell
         {
         private:
             std::ofstream file;
-            std::mutex mx;             // probe/log calls can come from worker threads
-            std::string buf;           // buffered log lines; flushed on threshold / close
+            std::mutex mx;   // probe/log calls can come from worker threads
+            std::string buf; // buffered log lines; flushed on threshold / close
 
             logger()
             {
@@ -3076,7 +3081,7 @@ namespace cell
             std::mutex mx;
             std::condition_variable cv;
             std::deque<std::move_only_function<void()>> jobs;
-            size_t active = 0;      // submitted jobs not yet finished
+            size_t active = 0; // submitted jobs not yet finished
             size_t max_workers = 16;
             bool stopping = false;
             std::vector<std::jthread> workers;
@@ -3085,7 +3090,8 @@ namespace cell
             {
                 if (workers.size() >= max_workers)
                     return;
-                workers.emplace_back([this] { worker_loop(); });
+                workers.emplace_back([this]
+                                     { worker_loop(); });
             }
             void worker_loop()
             {
@@ -3094,7 +3100,8 @@ namespace cell
                     std::move_only_function<void()> job;
                     {
                         std::unique_lock lk(mx);
-                        cv.wait(lk, [&] { return stopping || !jobs.empty(); });
+                        cv.wait(lk, [&]
+                                { return stopping || !jobs.empty(); });
                         if (stopping && jobs.empty())
                             return;
                         job = std::move(jobs.front());
@@ -3129,7 +3136,8 @@ namespace cell
             void wait_all()
             {
                 std::unique_lock lk(mx);
-                cv.wait(lk, [&] { return active == 0; });
+                cv.wait(lk, [&]
+                        { return active == 0; });
             }
             void shutdown()
             {
@@ -3275,8 +3283,8 @@ namespace cell
                 "- Never read or modify the .cell runtime directory (it stores your API keys and session data) - only .cell/skills is readable. The sandbox blocks it, so do not attempt workarounds.\n"
                 "When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
-            size_t log_max_lines = 1000; // keep at most this many lines in logs/cell.log
-            size_t max_threads = 16;     // concurrent read-only tool workers (1..16)
+            size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
+            size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
             bool empty() const { return providers.empty(); }
@@ -3898,8 +3906,8 @@ namespace cell
             const Policy permission = Policy::Ask;
 
         public:
-tool(const size_t id, const std::string key, const Policy permission)
-            : id(id), key(key), permission(permission) {}
+            tool(const size_t id, const std::string key, const Policy permission)
+                : id(id), key(key), permission(permission) {}
             virtual bool execute(const std::string &input, std::string &output)
             {
                 (void)input;
@@ -6273,7 +6281,8 @@ int main(int argc, char const *argv[])
     // boot-time probe runs in the background so startup never blocks on the network
     auto probe_async = [&](const cell::config::provider_entry &p)
     {
-        probe_threads.emplace_back([&, p] { probe_provider(p); });
+        probe_threads.emplace_back([&, p]
+                                   { probe_provider(p); });
     };
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
     {
