@@ -16,6 +16,7 @@
 #include <future>
 #include <iterator>
 #include <mutex>
+#include <atomic>
 #include <sstream>
 #include <thread>
 #include <span>
@@ -2031,7 +2032,7 @@ namespace cell
                         stack.push_back(std::move(lv));
                         continue;
                     }
-                    if (std::filesystem::file_size(p, ec) > 1024 * 1024)
+                    if (std::filesystem::file_size(p, ec) > 1024 * 1024 * 128)
                         continue; // skip large/binary candidates
                     std::ifstream f(p);
                     if (!f.is_open())
@@ -2341,7 +2342,7 @@ namespace cell
                 return false;
             file.seekg(0, std::ios::end);
             std::streamoff off = file.tellg();
-            if (off < 0 || off > 1024 * 1024)
+            if (off < 0 || off > (std::streamoff)1024 * 1024 * 128)
                 return false;
             size_t size = (size_t)off;
             file.seekg(0);
@@ -3189,15 +3190,17 @@ namespace cell
             std::string system_prompt =
                 "You are a helpful assistant. Inspect, search and modify files and run commands with these tools:\n"
                 "  ls    - list a directory (one level, paginated, max 500 entries/page; specify page for more)\n"
-                "  read  - read a file (max 1MB per call; pass start/end line numbers to read large files in segments)\n"
+                "  read  - read a file (max 128MB per call; pass start/end line numbers to read large files in segments)\n"
                 "  rg    - search file contents (skips hidden files and .gitignore'd paths; up to 500 matches grouped by file as 'line: content')\n"
                 "  glob  - find files by name pattern (e.g. **/*.test.ts); use it to narrow down when ls returns too many entries\n"
                 "  find  - filter files by metadata (name, size, modification time)\n"
                 "  write - create a NEW file only; never use it to modify an existing file (it is refused - use edit)\n"
                 "  edit  - modify an existing file with a SEARCH/REPLACE block; the search text must be unique (add context lines otherwise)\n"
-                "  exec  - run build/test/git commands (default timeout 30s); the result ends with 'exitcode=N' - judge success by that value, never assume\n"
-                "           NOTE: exec is sandboxed. By default (sandbox=git) ONLY local git subcommands are allowed; network-egress commands (curl, wget, git push/fetch/clone, ...) are denied in every mode. If a command is blocked, report it and let the user decide.\n"
+                "  exec  - run build/test/git commands (default timeout 30s, max 300s); the result ends with 'exitcode=N' - judge success by that value, never assume\n"
+                "           USE SPARINGLY - last resort only: prefer ls/read/rg/glob/find for inspection and write/edit for changes; exec only for what no other tool can do (mkdir -p, builds, tests, git).\n"
+                "           Security review of EVERY exec call: (1) it always prompts the user and is blocked if refused; (2) a sandbox filters it - network egress (curl, wget, ssh, scp, git push/fetch/clone/...), credential/env reads (env dumps, key variables, the .cell vault) and path traversal are denied in EVERY mode; mode 'git' (default) allows ONLY local git subcommands, 'safe' adds harmless local tools (echo, ls, cat, mkdir, g++, python, node, ...) but never inline code (python -c / node -e / bash -c), 'open' keeps the blacklist but still denies network egress and credentials; (3) high-risk commands (recursive/forced deletes, chmod/chown/sudo/icacls, git commit/merge/checkout/reset/stash/clean/...) require a SECOND confirmation; (4) if a command is blocked or refused, do NOT retry workarounds or variants - report it and let the user decide.\n"
                 "Rules:\n"
+                "- avoid exec whenever a dedicated tool suffices: inspect with ls/read/rg/glob/find, modify with write/edit; exec is only for build/test/git operations no other tool can perform.\n"
                 "- read a file before write/edit on it; never call write/edit without reading the file first. edit is enforced: it only accepts files and line ranges that a previous read call returned.\n"
                 "- before write, ensure the parent directory exists (exec: mkdir -p <dir>).\n"
                 "- one edit call must not touch more than 3 unrelated code blocks; split into multiple edit calls.\n"
@@ -3848,6 +3851,7 @@ tool(const size_t id, const std::string key, const Policy permission)
             size_t tool_id() const { return id; }
             const std::string &name() const { return key; }
             Policy policy() const { return permission; }
+            virtual bool blocked() const { return false; }
         };
         template <typename F>
         concept tool_handler = requires(F f, const std::string &input, std::string &output) {
@@ -3859,15 +3863,19 @@ tool(const size_t id, const std::string key, const Policy permission)
         private:
             using handler_t = std::move_only_function<bool(const std::string &input, std::string &output)>;
             handler_t handler_;
+            std::atomic<bool> blocked_{false};
 
         public:
             template <tool_handler F>
             callable_tool(size_t id, const std::string &key, Policy permission, F &&fn)
                 : tool(id, key, permission), handler_(std::forward<F>(fn)) {}
+            bool blocked() const override { return blocked_.load(std::memory_order_relaxed); }
             bool execute(const std::string &input, std::string &output) override
             {
+                blocked_.store(false, std::memory_order_relaxed);
                 if (policy() == Policy::Deny)
                 {
+                    blocked_.store(true, std::memory_order_relaxed);
                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=policy_deny", name()));
                     return false;
                 }
@@ -3878,6 +3886,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                     std::getline(std::cin, answer);
                     if (answer != "y" && answer != "Y")
                     {
+                        blocked_.store(true, std::memory_order_relaxed);
                         cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=rejected_by_user", name()));
                         return false;
                     }
@@ -3886,6 +3895,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                     {
                         if (!box::check_exec(input))
                         {
+                            blocked_.store(true, std::memory_order_relaxed);
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), input));
                             cell::sys::println("[{}] exec blocked by sandbox (mode={}) - network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode()));
                             return false;
@@ -3896,6 +3906,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                             std::getline(std::cin, answer);
                             if (answer != "y" && answer != "Y")
                             {
+                                blocked_.store(true, std::memory_order_relaxed);
                                 cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
                                 return false;
                             }
@@ -3921,6 +3932,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                         }
                         if (blocked)
                         {
+                            blocked_.store(true, std::memory_order_relaxed);
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox args={}", name(), input));
                             return false;
                         }
@@ -3955,6 +3967,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                     }
                     if (blocked)
                     {
+                        blocked_.store(true, std::memory_order_relaxed);
                         cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=path_traversal args={}", name(), input));
                         return false;
                     }
@@ -4898,7 +4911,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return cell::box::list_dir(j.value("path", "."), j.value("page", (size_t)1),
                                        std::max<size_t>(1, std::min<size_t>(j.value("page_size", (size_t)500), 500)), out);
         });
-    add("read", "Read a text file (capped at 1MB per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
+    add("read", "Read a text file (capped at 128MB per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
         {{"path", str_prop("file path")},
          {"offset", str_prop("number of lines to skip from the start (0-based, optional)")},
          {"limit", str_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
@@ -6916,8 +6929,9 @@ int main(int argc, char const *argv[])
 
             bool done = false;
             int rounds = 0;
-            while (!done && rounds++ < 8)
+            while (!done)
             {
+                rounds++;
                 const cell::config::provider_entry *p = cfg.current_provider_entry();
                 if (!p || cfg.current_model.empty())
                 {
@@ -7105,6 +7119,7 @@ int main(int argc, char const *argv[])
                     {
                         std::string name, args, policy, status, output;
                         double sec = 0;
+                        bool blocked = false;
                     };
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
@@ -7139,6 +7154,11 @@ int main(int argc, char const *argv[])
                                     res[i].output = std::move(o);
                                     res[i].status = "ok";
                                 }
+                                else if (it->second->blocked())
+                                {
+                                    res[i].blocked = true;
+                                    res[i].status = "blocked";
+                                }
                                 res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
                         }
                         else
@@ -7161,6 +7181,11 @@ int main(int argc, char const *argv[])
                             res[i].output = o;
                             res[i].status = "ok";
                         }
+                        else if (it != tool_list.end() && it->second->blocked())
+                        {
+                            res[i].blocked = true;
+                            res[i].status = "blocked";
+                        }
                         res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0;
                     }
                     // results are emitted in the original tool_call order
@@ -7175,7 +7200,7 @@ int main(int argc, char const *argv[])
                         // prompt-injection defence: every tool result is sanitized
                         // (injection fingerprints redacted) and wrapped in explicit
                         // untrusted-data boundaries before it reaches the LLM.
-                        std::string body = cell::box::sanitize_output(res[i].output);
+                        std::string body = cell::box::sanitize_output(res[i].output, 1024 * 1024 * 128);
                         std::string marker;
                         try
                         {
@@ -7201,7 +7226,19 @@ int main(int argc, char const *argv[])
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
                     }
+                    // a rejected/blocked tool call ends this agent loop: no point
+                    // asking the model to retry a call the sandbox/user refused
+                    bool any_blocked = false;
+                    for (size_t i = 0; i < tool_calls.size(); i++)
+                        if (res[i].blocked)
+                        {
+                            any_blocked = true;
+                            cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
+                            break;
+                        }
                     cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
+                    if (any_blocked)
+                        done = true;
                     continue;
                 }
                 done = true;
