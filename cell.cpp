@@ -45,6 +45,55 @@
 #include <termios.h>
 #endif
 
+// JSON tool/config argument that may arrive as a JSON number or a quoted
+// numeric string (models frequently quote integers, and hand-edited config
+// files often do too); returns the parsed value or fallback. Never throws.
+static size_t num_arg(const nlohmann::json &j, const char *key, size_t fallback)
+{
+    auto it = j.find(key);
+    if (it == j.end())
+        return fallback;
+    if (it->is_number_unsigned())
+        return it->get<size_t>();
+    if (it->is_number_integer())
+    {
+        long long v = it->get<long long>();
+        return v > 0 ? (size_t)v : fallback;
+    }
+    if (it->is_number_float())
+    {
+        double v = it->get<double>();
+        return v > 0 ? (size_t)v : fallback;
+    }
+    if (it->is_string())
+    {
+        const std::string &s = it->get_ref<const std::string &>();
+        char *end = nullptr;
+        unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+        if (end != s.c_str() && *end == '\0')
+            return (size_t)v;
+    }
+    return fallback;
+}
+
+static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
+{
+    auto it = j.find(key);
+    if (it == j.end())
+        return fallback;
+    if (it->is_number())
+        return it->get<double>();
+    if (it->is_string())
+    {
+        const std::string &s = it->get_ref<const std::string &>();
+        char *end = nullptr;
+        double v = std::strtod(s.c_str(), &end);
+        if (end != s.c_str() && *end == '\0')
+            return v;
+    }
+    return fallback;
+}
+
 namespace cell
 {
     // offloads file writes off the hot path: submits are coalesced per path
@@ -2870,7 +2919,7 @@ namespace cell
                     {
                         auto j = nlohmann::json::parse(f, nullptr, false);
                         if (!j.is_discarded() && j.is_object())
-                            limit = j.value("log_max_lines", (size_t)1000);
+                            limit = num_arg(j, "log_max_lines", 1000);
                     }
                     catch (const std::exception &)
                     {
@@ -3313,7 +3362,7 @@ namespace cell
                     {
                         // legacy multi-model: {"models":[{provider,base,model,key,proxy}...],"current_model":<index>}
                         std::vector<std::pair<provider_entry, std::string>> legacy; // provider + model name
-                        size_t cur = j.value("current_model", (size_t)0);
+                        size_t cur = num_arg(j, "current_model", 0);
                         for (auto &mj : j["models"])
                         {
                             provider_entry e;
@@ -3371,8 +3420,8 @@ namespace cell
                 }
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
-                s.log_max_lines = j.value("log_max_lines", (size_t)1000);
-                s.max_threads = std::clamp(j.value("thread_pool_size", (size_t)16), (size_t)1, (size_t)16);
+                s.log_max_lines = num_arg(j, "log_max_lines", 1000);
+                s.max_threads = std::clamp(num_arg(j, "thread_pool_size", 16), (size_t)1, (size_t)16);
                 s.think = j.value("think", false);
                 s.tools = j.value("tools", true);
                 s.sandbox_mode = j.value("sandbox_mode", "git");
@@ -4156,7 +4205,7 @@ tool(const size_t id, const std::string key, const Policy permission)
                         {
                             for (auto &tc : delta["tool_calls"])
                             {
-                                size_t idx = tc.value("index", (size_t)tool_calls.size());
+                                size_t idx = num_arg(tc, "index", tool_calls.size());
                                 while (tool_calls.size() <= idx)
                                     tool_calls.push_back({{"id", ""}, {"type", "function"}, {"function", {{"name", ""}, {"arguments", ""}}}});
                                 auto &acc = tool_calls[idx];
@@ -4301,12 +4350,12 @@ tool(const size_t id, const std::string key, const Policy permission)
                         std::string type = ev.value("type", "");
                         if (type == "message_start" && ev.contains("message") && ev["message"].contains("usage"))
                         {
-                            usage["input_tokens"] = ev["message"]["usage"].value("input_tokens", 0);
-                            usage["cache_read_input_tokens"] = ev["message"]["usage"].value("cache_read_input_tokens", 0);
+                            usage["input_tokens"] = (long long)num_arg(ev["message"]["usage"], "input_tokens", 0);
+                            usage["cache_read_input_tokens"] = (long long)num_arg(ev["message"]["usage"], "cache_read_input_tokens", 0);
                         }
                         else if (type == "message_delta" && ev.contains("usage"))
-                            usage["output_tokens"] = ev["usage"].value("output_tokens", 0);
-                        size_t idx = ev.value("index", (size_t)blocks.size());
+                            usage["output_tokens"] = (long long)num_arg(ev["usage"], "output_tokens", 0);
+                        size_t idx = num_arg(ev, "index", blocks.size());
                         if (type == "content_block_start")
                         {
                             while (blocks.size() <= idx)
@@ -4743,16 +4792,16 @@ tool(const size_t id, const std::string key, const Policy permission)
             auto &j = mem();
             auto bump = [&](nlohmann::json &rec)
             {
-                rec["requests"] = rec.value("requests", 0LL) + 1;
-                rec["messages"] = rec.value("messages", 0LL) + messages;
-                rec["input_chars"] = rec.value("input_chars", 0LL) + input_chars;
-                rec["output_chars"] = rec.value("output_chars", 0LL) + output_chars;
+                rec["requests"] = (long long)num_arg(rec, "requests", 0) + 1;
+                rec["messages"] = (long long)num_arg(rec, "messages", 0) + messages;
+                rec["input_chars"] = (long long)num_arg(rec, "input_chars", 0) + input_chars;
+                rec["output_chars"] = (long long)num_arg(rec, "output_chars", 0) + output_chars;
                 if (input_tokens)
-                    rec["input_tokens"] = rec.value("input_tokens", 0LL) + *input_tokens;
+                    rec["input_tokens"] = (long long)num_arg(rec, "input_tokens", 0) + *input_tokens;
                 if (output_tokens)
-                    rec["output_tokens"] = rec.value("output_tokens", 0LL) + *output_tokens;
+                    rec["output_tokens"] = (long long)num_arg(rec, "output_tokens", 0) + *output_tokens;
                 if (total_tokens)
-                    rec["total_tokens"] = rec.value("total_tokens", 0LL) + *total_tokens;
+                    rec["total_tokens"] = (long long)num_arg(rec, "total_tokens", 0) + *total_tokens;
             };
             auto &sess = j["sessions"][session_id];
             if (!sess.is_object())
@@ -4797,10 +4846,10 @@ tool(const size_t id, const std::string key, const Policy permission)
         static std::string fmt(const nlohmann::json &rec)
         {
             return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={} total_tok={}",
-                               rec.value("requests", 0LL), rec.value("messages", 0LL),
-                               rec.value("input_chars", 0LL), rec.value("output_chars", 0LL),
-                               rec.value("input_tokens", 0LL), rec.value("output_tokens", 0LL),
-                               rec.value("total_tokens", 0LL));
+                               (long long)num_arg(rec, "requests", 0), (long long)num_arg(rec, "messages", 0),
+                               (long long)num_arg(rec, "input_chars", 0), (long long)num_arg(rec, "output_chars", 0),
+                               (long long)num_arg(rec, "input_tokens", 0), (long long)num_arg(rec, "output_tokens", 0),
+                               (long long)num_arg(rec, "total_tokens", 0));
         }
         static std::string summarize()
         {
@@ -4874,54 +4923,6 @@ static bool json_args(const std::string &in, nlohmann::json &j)
     {
         return false;
     }
-}
-
-// tool argument that may arrive as a JSON number or a quoted numeric string
-// (models frequently quote integers); returns the parsed value or fallback
-static size_t num_arg(const nlohmann::json &j, const char *key, size_t fallback)
-{
-    auto it = j.find(key);
-    if (it == j.end())
-        return fallback;
-    if (it->is_number_unsigned())
-        return it->get<size_t>();
-    if (it->is_number_integer())
-    {
-        long long v = it->get<long long>();
-        return v > 0 ? (size_t)v : fallback;
-    }
-    if (it->is_number_float())
-    {
-        double v = it->get<double>();
-        return v > 0 ? (size_t)v : fallback;
-    }
-    if (it->is_string())
-    {
-        const std::string &s = it->get_ref<const std::string &>();
-        char *end = nullptr;
-        unsigned long long v = std::strtoull(s.c_str(), &end, 10);
-        if (end != s.c_str() && *end == '\0')
-            return (size_t)v;
-    }
-    return fallback;
-}
-
-static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
-{
-    auto it = j.find(key);
-    if (it == j.end())
-        return fallback;
-    if (it->is_number())
-        return it->get<double>();
-    if (it->is_string())
-    {
-        const std::string &s = it->get_ref<const std::string &>();
-        char *end = nullptr;
-        double v = std::strtod(s.c_str(), &end);
-        if (end != s.c_str() && *end == '\0')
-            return v;
-    }
-    return fallback;
 }
 
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic)
@@ -5601,6 +5602,15 @@ static int run_selftest()
     expect(fresh_res.has_value() && fresh_res->providers.empty() && fresh_res->current_model.empty() && !fresh_res->think && fresh_res->tools, "config fresh init has no built-in providers");
     cell::box::write((cell::root / "config.json").string(), "{invalid");
     expect(!cell::config::load().has_value(), "config::load reports parse error");
+    // quoted numbers in a hand-edited config must not reject the whole file
+    cell::box::write((cell::root / "config.json").string(),
+                     "{\"providers\":[{\"name\":\"openai\",\"style\":\"openai\",\"base\":\"http://x/v1\"}],"
+                     "\"current_model\":\"m\",\"log_max_lines\":\"500\",\"thread_pool_size\":\"8\"}");
+    auto quoted_res = cell::config::load();
+    expect(quoted_res.has_value() && quoted_res->providers.size() == 1 && quoted_res->log_max_lines == 500 && quoted_res->max_threads == 8,
+           "config tolerates quoted numeric fields");
+    expect(cell::sys::logger::instance().configured_max_lines() == 500, "logger tolerates quoted log_max_lines");
+    cell::box::remove((cell::root / "config.json").string());
 
     {
         // /new semantics: forget_current drops the in-memory session but keeps the file on disk
@@ -5709,6 +5719,14 @@ static int run_selftest()
         expect(clean_meta.find("build-helper") != std::string::npos && clean_meta.find("redacted") == std::string::npos, "clean skill metadata passes through");
     }
 
+    cell::box::write((cell::root / "usages.json").string(),
+                     "{\"sessions\":{\"sess-Q\":{\"requests\":\"7\",\"input_chars\":\"100\"}},"
+                     "\"models\":{\"quoted:model\":{\"requests\":\"3\",\"total_tokens\":\"9\"}}}");
+    cell::stats::add("sess-Q", "quoted:model", 10, 5, 2, 1, 3, 1);
+    auto qj = cell::stats::load();
+    expect(qj["sessions"]["sess-Q"].value("requests", 0LL) == 8 && qj["sessions"]["sess-Q"].value("input_chars", 0LL) == 110,
+           "stats bump tolerates quoted numbers");
+    expect(qj["models"]["quoted:model"].value("total_tokens", 0LL) == 12, "stats model record tolerates quoted numbers");
     cell::stats::add("sess-A", "openai:gpt-4o", 100, 50, 10, 5, 15, 2);
     cell::stats::add("sess-A", "openai:gpt-4o", 50, 20, std::nullopt, std::nullopt, std::nullopt, 1);
     cell::stats::add("sess-B", "anthropic:claude-x", 30, 10, 3, 1, 4, 1);
@@ -6069,7 +6087,7 @@ int main(int argc, char const *argv[])
         long long cached = -1, total = -1;
         if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
         {
-            cached = u["prompt_tokens_details"].value("cached_tokens", 0LL);
+            cached = (long long)num_arg(u["prompt_tokens_details"], "cached_tokens", 0);
             if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
                 total = u["prompt_tokens"].get<long long>();
         }
