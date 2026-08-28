@@ -46,6 +46,118 @@
 
 namespace cell
 {
+    // offloads file writes off the hot path: submits are coalesced per path
+    // (latest content wins), a single background thread performs the disk I/O.
+    // flush() drains synchronously and is required before any disk read of a
+    // recently-submitted path (commands like /sessions, /session, /save, exit).
+    namespace async_io
+    {
+        class file_writer
+        {
+        private:
+            struct job
+            {
+                std::filesystem::path path;
+                std::string content;
+            };
+            std::mutex mx;
+            std::condition_variable cv;
+            std::unordered_map<std::string, job> pending; // path -> latest job
+            bool writing = false;
+            bool stopping = false;
+            std::jthread worker;
+
+            static void write_file(const job &j)
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(j.path.parent_path(), ec);
+                std::ofstream f(j.path, std::ios::binary | std::ios::trunc);
+                if (f.is_open())
+                {
+                    f.write(j.content.data(), (std::streamsize)j.content.size());
+                    f.flush();
+                }
+            }
+            void run()
+            {
+                for (;;)
+                {
+                    std::unique_lock lk(mx);
+                    cv.wait(lk, [&] { return stopping || !pending.empty(); });
+                    if (stopping && pending.empty())
+                        return;
+                    auto it = pending.begin();
+                    job j = std::move(it->second);
+                    pending.erase(it);
+                    writing = true;
+                    lk.unlock();
+                    write_file(j);
+                    lk.lock();
+                    writing = false;
+                    cv.notify_all();
+                }
+            }
+
+        public:
+            file_writer() { worker = std::jthread([this] { run(); }); }
+            ~file_writer()
+            {
+                {
+                    std::lock_guard lk(mx);
+                    stopping = true;
+                }
+                cv.notify_all();
+                if (worker.joinable())
+                    worker.join();
+            }
+            file_writer(const file_writer &) = delete;
+            file_writer &operator=(const file_writer &) = delete;
+
+            void submit(std::filesystem::path path, std::string content)
+            {
+                {
+                    std::lock_guard lk(mx);
+                    pending[path.string()] = job{std::move(path), std::move(content)};
+                }
+                cv.notify_one();
+            }
+            // drain everything synchronously (including any in-flight write)
+            void flush()
+            {
+                std::unique_lock lk(mx);
+                while (!pending.empty() || writing)
+                {
+                    if (writing)
+                    {
+                        cv.wait(lk);
+                        continue;
+                    }
+                    auto it = pending.begin();
+                    job j = std::move(it->second);
+                    pending.erase(it);
+                    writing = true;
+                    lk.unlock();
+                    write_file(j);
+                    lk.lock();
+                    writing = false;
+                    cv.notify_all();
+                }
+            }
+        };
+        inline file_writer &writer()
+        {
+            static file_writer w;
+            return w;
+        }
+        inline void submit(std::filesystem::path path, std::string content)
+        {
+            writer().submit(std::move(path), std::move(content));
+        }
+        inline void flush()
+        {
+            writer().flush();
+        }
+    } // namespace async_io
     // platform layer: the only place in this file that knows about OS-specific
     // APIs. everything else in the code base calls these portable shims and is
     // free of #ifdef.
@@ -295,27 +407,48 @@ namespace cell
         }
     } // namespace plat
 
+    // ASCII-only lowercase, in place (case-insensitive matching; Windows paths)
+    static void lower_ascii(std::string &s)
+    {
+        for (auto &c : s)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+    }
+
     std::filesystem::path root = plat::executable_dir() / ".cell";
 
     // normalized absolute working directory: the identity of "the cwd cell runs in"
+    static std::optional<std::filesystem::path> &workdir_cache()
+    {
+        static std::optional<std::filesystem::path> c;
+        return c;
+    }
     static std::filesystem::path workdir()
     {
+        if (auto &c = workdir_cache(); c)
+            return *c;
         std::error_code ec;
         std::filesystem::path p = std::filesystem::current_path(ec);
         if (ec || p.empty())
             p = ".";
         p = std::filesystem::absolute(p, ec);
-        return p.lexically_normal();
+        p = p.lexically_normal();
+        workdir_cache() = p;
+        return p;
     }
-    // stable per-cwd key: sha3-256 of the normalized cwd path, hex, truncated to 16 chars.
+    // call after every chdir so the cached workdir / cwd_id stay correct
+    static void reset_workdir_cache() { workdir_cache().reset(); }
+// stable per-cwd key: sha3-256 of the normalized cwd path, hex, truncated to 16 chars.
     // windows paths are case-insensitive, so the input is lowercased before hashing.
     static std::string cwd_id()
     {
-        std::string s = workdir().string();
+        static std::string cached_wd, cached_id;
+        std::string wd = workdir().string();
+        if (!cached_id.empty() && cached_wd == wd)
+            return cached_id;
+        std::string s = wd;
 #ifdef _WIN32
-        for (auto &c : s)
-            if (c >= 'A' && c <= 'Z')
-                c = char(c - 'A' + 'a');
+        lower_ascii(s);
 #endif
         static bool sodium_ready = false;
         if (!sodium_ready)
@@ -327,6 +460,8 @@ namespace cell
         for (size_t i = 0; i < crypto_hash_sha3256_BYTES; i++)
             out += std::format("{:02x}", digest[i]);
         out.resize(16);
+        cached_wd = std::move(wd);
+        cached_id = out;
         return out;
     }
     // every session id embeds its cwd key before the first '-'
@@ -348,12 +483,8 @@ namespace cell
         std::filesystem::path nb = std::filesystem::weakly_canonical(b, ec);
         std::string sa = na.string(), sb = nb.string();
 #ifdef _WIN32
-        for (auto &c : sa)
-            if (c >= 'A' && c <= 'Z')
-                c = char(c - 'A' + 'a');
-        for (auto &c : sb)
-            if (c >= 'A' && c <= 'Z')
-                c = char(c - 'A' + 'a');
+        lower_ascii(sa);
+        lower_ascii(sb);
 #endif
         return sa == sb;
     }
@@ -363,21 +494,38 @@ namespace cell
     {
         return root / "sessions" / "sessions.json";
     }
+    // cached parse of the sessions index; invalidated by root changes (selftest) or writes
+    static std::optional<nlohmann::json> &index_cache()
+    {
+        static std::optional<nlohmann::json> c;
+        return c;
+    }
+    static std::filesystem::path &index_cache_root()
+    {
+        static std::filesystem::path r;
+        return r;
+    }
     static nlohmann::json sessions_index()
     {
+        if (index_cache() && index_cache_root() == root)
+            return *index_cache();
+        nlohmann::json j = nlohmann::json::object();
         std::ifstream f(sessions_index_path());
-        if (!f.is_open())
-            return nlohmann::json::object();
-        try
+        if (f.is_open())
         {
-            auto j = nlohmann::json::parse(f, nullptr, false);
-            if (!j.is_discarded() && j.is_object())
-                return j;
+            try
+            {
+                auto jj = nlohmann::json::parse(f, nullptr, false);
+                if (!jj.is_discarded() && jj.is_object())
+                    j = std::move(jj);
+            }
+            catch (const std::exception &)
+            {
+            }
         }
-        catch (const std::exception &)
-        {
-        }
-        return nlohmann::json::object();
+        index_cache() = j;
+        index_cache_root() = root;
+        return j;
     }
     static std::string cwd_for_key(const std::string &key)
     {
@@ -396,25 +544,45 @@ namespace cell
         if (j.value(key, "") == path)
             return;
         j[key] = path;
-        std::ofstream f(sessions_index_path(), std::ios::trunc);
-        if (f.is_open())
-            f << j.dump(2);
+        index_cache() = j; // keep the cache authoritative
+        async_io::submit(sessions_index_path(), j.dump(2));
     }
     namespace text
     {
-        // split text into lines, stripping a trailing '\r' from each line
-        static std::vector<std::string> split_lines(std::string_view text)
+        // lazy line views over a text buffer (zero-copy): strips a trailing '\r'
+        // from each line, yields string_views into the source. never copies bytes.
+        static std::generator<std::string_view> lines(std::string_view text)
         {
-            std::vector<std::string> out;
-            std::istringstream ss{std::string(text)};
-            std::string line;
-            while (std::getline(ss, line))
+            size_t start = 0;
+            while (start < text.size())
             {
+                size_t nl = text.find('\n', start);
+                size_t end = nl == std::string_view::npos ? text.size() : nl;
+                std::string_view line = text.substr(start, end - start);
                 if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
-                out.push_back(std::move(line));
+                    line.remove_suffix(1);
+                co_yield line;
+                if (nl == std::string_view::npos)
+                    break;
+                start = nl + 1;
             }
-            return out;
+        }
+        // trim ASCII whitespace from both ends (copies only on demand)
+        static std::string trim(std::string_view s)
+        {
+            size_t b = 0, e = s.size();
+            while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
+                b++;
+            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
+                e--;
+            return std::string(s.substr(b, e - b));
+        }
+        // strip a UTF-8 BOM in place and return the remaining view
+        static std::string_view strip_bom(std::string &s)
+        {
+            if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+                s.erase(0, 3);
+            return s;
         }
         // sanitize a string for terminal display: strip ANSI escape sequences and
         // control characters, and collapse newlines to spaces, so untrusted
@@ -492,10 +660,21 @@ namespace cell
         static std::string to_lower(std::string_view sv)
         {
             std::string out(sv);
-            for (auto &c : out)
-                if (c >= 'A' && c <= 'Z')
-                    c = c - 'A' + 'a';
+            lower_ascii(out);
             return out;
+        }
+        // normalize a command/binary token: strip surrounding quotes and ".exe"
+        static std::string normalize_bin(std::string b)
+        {
+            if (b.size() >= 2 && (b.front() == '"' || b.front() == '\'') &&
+                (b.back() == '"' || b.back() == '\''))
+            {
+                b.erase(b.begin());
+                b.pop_back();
+            }
+            if (b.size() > 4 && b.ends_with(".exe"))
+                b.resize(b.size() - 4);
+            return b;
         }
 
         // paths that tools must never touch: the runtime credential vault
@@ -504,6 +683,22 @@ namespace cell
         // system legitimately reads .cell/skills/*.md.
         bool is_sensitive_path(std::string_view path)
         {
+            // the canonical root prefix is computed once per root value (hot
+            // path: every tool call sandbox-check canonicalizes it)
+            static std::mutex rc_mx;
+            static std::filesystem::path rc_root;
+            static std::string rc_root_s;
+            std::string root_s;
+            {
+                std::lock_guard<std::mutex> lk(rc_mx);
+                if (rc_root != cell::root)
+                {
+                    std::error_code ec;
+                    rc_root = std::filesystem::absolute(cell::root, ec);
+                    rc_root_s = to_lower(rc_root.lexically_normal().generic_string());
+                }
+                root_s = rc_root_s;
+            }
             std::error_code ec;
             std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
             if (ec)
@@ -514,10 +709,6 @@ namespace cell
             if (!ec)
                 p = canon;
             std::string s = to_lower(p.lexically_normal().generic_string());
-            std::filesystem::path root_abs = std::filesystem::absolute(cell::root, ec);
-            if (ec)
-                return false;
-            std::string root_s = to_lower(root_abs.lexically_normal().generic_string());
             if (root_s.empty())
                 return false;
             if (s.rfind(root_s + "/skills", 0) == 0)
@@ -734,15 +925,7 @@ namespace cell
             };
             auto is_net_bin = [](const std::string &w) -> bool
             {
-                std::string b = w;
-                if (b.size() >= 2 && (b.front() == '"' || b.front() == '\'') &&
-                    (b.back() == '"' || b.back() == '\''))
-                {
-                    b.erase(b.begin());
-                    b.pop_back();
-                }
-                if (b.size() > 4 && b.ends_with(".exe"))
-                    b.resize(b.size() - 4);
+                std::string b = normalize_bin(w);
                 for (auto &nb : net_bins)
                     if (b == nb)
                         return true;
@@ -1043,15 +1226,7 @@ namespace cell
             auto toks = tokens(call);
             if (toks.empty())
                 return false;
-            std::string b = toks[0];
-            if (b.size() >= 2 && (b.front() == '"' || b.front() == '\'') &&
-                (b.back() == '"' || b.back() == '\''))
-            {
-                b.erase(b.begin());
-                b.pop_back();
-            }
-            if (b.size() > 4 && b.ends_with(".exe"))
-                b.resize(b.size() - 4);
+            std::string b = normalize_bin(toks[0]);
             static constexpr std::string_view interp[] = {
                 "python",
                 "python3",
@@ -1167,7 +1342,10 @@ namespace cell
         {
             std::string out = raw;
             if (out.size() > max_bytes)
-                out = out.substr(0, max_bytes) + std::format("\n[cell: output truncated: exceeded {} bytes]\n", max_bytes);
+            {
+                out.resize(max_bytes); // in-place truncation: no re-copy
+                out += std::format("\n[cell: output truncated: exceeded {} bytes]\n", max_bytes);
+            }
             static constexpr std::string_view fingerprints[] = {
                 "ignore all previous instructions",
                 "ignore any previous instructions",
@@ -1217,7 +1395,7 @@ namespace cell
             };
             // decode one UTF-8 codepoint at ln[i]; advances i past it and returns
             // the codepoint, or 0 (advancing one byte) on invalid input.
-            auto decode = [](const std::string &ln, size_t &i) -> unsigned
+            auto decode = [](std::string_view ln, size_t &i) -> unsigned
             {
                 unsigned char c = (unsigned char)ln[i];
                 if (c < 0x80)
@@ -1466,7 +1644,7 @@ namespace cell
             };
             // build a flattened matchable copy of one line: ASCII-lowercased, with
             // controls/format marks dropped, whitespace collapsed to single spaces
-            auto flatten = [&](const std::string &ln, std::string &flat)
+            auto flatten = [&](std::string_view ln, std::string &flat)
             {
                 flat.clear();
                 flat.reserve(ln.size());
@@ -1508,18 +1686,27 @@ namespace cell
                     return true;
                 return false;
             };
-            auto lines = text::split_lines(out);
-            std::vector<std::string> flats(lines.size());
-            std::vector<bool> bad(lines.size(), false);
-            for (size_t i = 0; i < lines.size(); i++)
-                flatten(lines[i], flats[i]);
+            // flatten every line lazily from the buffer (no per-line copies);
+            // the flattened forms are stored because window matching needs
+            // up to 6 adjacent lines at once
+            std::vector<std::string> flats;
+            std::vector<bool> bad;
+            {
+                std::string flat;
+                for (auto ln : text::lines(out))
+                {
+                    flatten(ln, flat);
+                    flats.push_back(flat);
+                    bad.push_back(false);
+                }
+            }
             // per-line match plus adjacent-line windows (2..6 consecutive lines
             // joined) so a fingerprint split across line breaks is still caught
-            for (size_t i = 0; i < lines.size(); i++)
+            for (size_t i = 0; i < flats.size(); i++)
             {
                 if (has_fingerprint(flats[i]))
                     bad[i] = true;
-                size_t win = std::min<size_t>(6, lines.size() - i);
+                size_t win = std::min<size_t>(6, flats.size() - i);
                 if (win < 2)
                     continue;
                 std::string joined;
@@ -1535,15 +1722,21 @@ namespace cell
             }
             int redacted = 0;
             std::string result;
-            for (size_t i = 0; i < lines.size(); i++)
+            result.reserve(out.size());
+            size_t idx = 0;
+            for (auto ln : text::lines(out))
             {
-                if (bad[i])
+                if (bad[idx])
                 {
-                    result += std::format("[cell: line {} redacted - possible prompt-injection content]\n", i + 1);
+                    result += std::format("[cell: line {} redacted - possible prompt-injection content]\n", idx + 1);
                     redacted++;
                 }
                 else
-                    result += lines[i] + "\n";
+                {
+                    result.append(ln);
+                    result += '\n';
+                }
+                idx++;
             }
             if (redacted > 0)
                 result += std::format("[cell: redacted {} line(s) flagged as possible prompt injection]\n", redacted);
@@ -1587,12 +1780,7 @@ namespace cell
         // confirmation before running: recursive/forced deletes and permission changes
         bool is_high_risk(std::string_view call)
         {
-            std::string lower = to_lower(call);
-            std::istringstream ss(lower);
-            std::vector<std::string> toks;
-            std::string t;
-            while (ss >> t)
-                toks.push_back(t);
+            auto toks = tokens(to_lower(call));
             for (size_t i = 0; i < toks.size(); i++)
             {
                 const std::string &w = toks[i];
@@ -1735,6 +1923,52 @@ namespace cell
             }
             return last.value_or(false);
         }
+        // collect and sort the entries of one directory (hidden entries kept; callers filter)
+        static std::vector<std::filesystem::directory_entry> collect_entries(const std::filesystem::path &dir, std::error_code &ec)
+        {
+            std::vector<std::filesystem::directory_entry> entries;
+            for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
+                if (!ec)
+                    entries.push_back(*it);
+            std::sort(entries.begin(), entries.end(),
+                      [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b)
+                      { return a.path().filename().string() < b.path().filename().string(); });
+            return entries;
+        }
+        // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
+        // path, is_directory) for every non-hidden entry, one level at a time, in
+        // sorted order. consumers break out of the range-for to stop early.
+        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
+        {
+            struct frame
+            {
+                std::vector<std::filesystem::directory_entry> entries;
+                size_t i = 0;
+                std::string prefix;
+            };
+            std::error_code ec;
+            std::vector<frame> stack;
+            stack.push_back({collect_entries(root_path, ec), 0, ""});
+            while (!stack.empty())
+            {
+                frame &top = stack.back();
+                if (top.i >= top.entries.size())
+                {
+                    stack.pop_back();
+                    continue;
+                }
+                const auto &e = top.entries[top.i++];
+                std::string name = e.path().filename().string();
+                if (name.empty() || name.front() == '.')
+                    continue; // hidden entries are skipped everywhere
+                std::string rel = top.prefix.empty() ? name : (top.prefix + "/" + name);
+                std::error_code ec2;
+                bool is_dir = e.is_directory(ec2);
+                co_yield std::tuple{e.path(), rel, is_dir};
+                if (is_dir)
+                    stack.push_back({collect_entries(e.path(), ec), 0, rel});
+            }
+        }
         // recursive content search: skips hidden entries and .gitignore'd paths,
         // caps at max_results, groups matches per file as "line: content"
         bool rg(std::string_view pattern, std::string_view root_path, size_t max_results, std::string &output)
@@ -1765,93 +1999,77 @@ namespace cell
                     output = std::format("rg: not a directory: {}", std::string(root_path));
                     return false;
                 }
+                // gitignore levels, root first (prefix ""); levels track walker depth
                 std::vector<ignore_level> stack;
+                {
+                    ignore_level lv;
+                    lv.prefix = "";
+                    if (std::filesystem::is_regular_file(root / ".gitignore", ec))
+                        lv.gi.load(root / ".gitignore");
+                    stack.push_back(std::move(lv));
+                }
                 size_t count = 0;
                 size_t scanned = 0; // scan budget: cap total lines read
                 bool truncated = false;
-                std::function<void(const std::filesystem::path &, const std::string &)> walk =
-                    [&](const std::filesystem::path &dir, const std::string &prefix)
+                for (auto &&[p, rel, is_dir] : walk_entries(root))
                 {
                     if (count >= max_results || scanned >= 8'000'000)
                     {
                         truncated = true;
-                        return;
+                        break;
                     }
-                    ignore_level lv;
-                    lv.prefix = prefix;
-                    std::filesystem::path gif = dir / ".gitignore";
-                    if (std::filesystem::is_regular_file(gif, ec))
-                        lv.gi.load(gif);
-                    stack.push_back(std::move(lv));
-                    std::vector<std::filesystem::directory_entry> entries;
-                    for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
-                        if (!ec)
-                            entries.push_back(*it);
-                    std::sort(entries.begin(), entries.end(),
-                              [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b)
-                              { return a.path().filename().string() < b.path().filename().string(); });
-                    for (auto &e : entries)
+                    while (stack.size() > 1 && !rel.starts_with(stack.back().prefix + "/"))
+                        stack.pop_back(); // walker left that directory
+                    if (ignored_by(stack, rel))
+                        continue;
+                    if (is_dir)
                     {
-                        if (count >= max_results)
+                        ignore_level lv;
+                        lv.prefix = rel;
+                        if (std::filesystem::is_regular_file(p / ".gitignore", ec))
+                            lv.gi.load(p / ".gitignore");
+                        stack.push_back(std::move(lv));
+                        continue;
+                    }
+                    if (std::filesystem::file_size(p, ec) > 1024 * 1024)
+                        continue; // skip large/binary candidates
+                    std::ifstream f(p);
+                    if (!f.is_open())
+                        continue;
+                    std::string line;
+                    size_t ln = 0;
+                    bool wrote_header = false;
+                    std::string header = std::format("\n=== {} ===", rel);
+                    while (std::getline(f, line))
+                    {
+                        ln++;
+                        scanned++;
+                        if (scanned >= 8'000'000)
                         {
                             truncated = true;
                             break;
                         }
-                        std::string name = e.path().filename().string();
-                        if (!name.empty() && name.front() == '.')
-                            continue; // hidden files and directories are skipped
-                        std::string rel = prefix.empty() ? name : (prefix + "/" + name);
-                        std::error_code ec2;
-                        bool is_dir = e.is_directory(ec2);
-                        if (ignored_by(stack, rel))
-                            continue;
-                        if (is_dir)
+                        if (!line.empty() && line.back() == '\r')
+                            line.pop_back();
+                        if (line.find('\0') != std::string::npos)
+                            break; // binary file, stop scanning
+                        if (std::regex_search(line, re))
                         {
-                            walk(e.path(), rel);
-                            continue;
-                        }
-                        if (e.file_size(ec2) > 1024 * 1024)
-                            continue; // skip large/binary candidates
-                        std::ifstream f(e.path());
-                        if (!f.is_open())
-                            continue;
-                        std::string line;
-                        size_t ln = 0;
-                        bool wrote_header = false;
-                        std::string header = std::format("\n=== {} ===", rel);
-                        while (std::getline(f, line))
-                        {
-                            ln++;
-                            scanned++;
-                            if (scanned >= 8'000'000)
+                            if (!wrote_header)
+                            {
+                                output += header + "\n";
+                                wrote_header = true;
+                            }
+                            output += std::format("{}: {}\n", ln, line);
+                            count++;
+                            if (count >= max_results)
                             {
                                 truncated = true;
                                 break;
                             }
-                            if (!line.empty() && line.back() == '\r')
-                                line.pop_back();
-                            if (line.find('\0') != std::string::npos)
-                                break; // binary file, stop scanning
-                            if (std::regex_search(line, re))
-                            {
-                                if (!wrote_header)
-                                {
-                                    output += header + "\n";
-                                    wrote_header = true;
-                                }
-                                output += std::format("{}: {}\n", ln, line);
-                                count++;
-                                if (count >= max_results)
-                                {
-                                    truncated = true;
-                                    break;
-                                }
-                            }
                         }
                     }
-                    stack.pop_back();
-                };
-                walk(root, "");
+                }
                 output += std::format("\n{} match(es){}", count, truncated ? " (truncated)" : "");
                 return true;
             }
@@ -1876,38 +2094,19 @@ namespace cell
                 const size_t cap = 500;
                 size_t count = 0;
                 bool truncated = false;
-                std::function<void(const std::filesystem::path &, const std::string &)> walk =
-                    [&](const std::filesystem::path &dir, const std::string &prefix)
+                for (auto &&[p, rel, is_dir] : walk_entries(root))
                 {
-                    std::vector<std::filesystem::directory_entry> entries;
-                    for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
-                        if (!ec)
-                            entries.push_back(*it);
-                    std::sort(entries.begin(), entries.end(),
-                              [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b)
-                              { return a.path().filename().string() < b.path().filename().string(); });
-                    for (auto &e : entries)
+                    if (count >= cap)
                     {
-                        if (count >= cap)
-                        {
-                            truncated = true;
-                            break;
-                        }
-                        std::string name = e.path().filename().string();
-                        if (!name.empty() && name.front() == '.')
-                            continue;
-                        std::string rel = prefix.empty() ? name : (prefix + "/" + name);
-                        std::error_code ec2;
-                        if (e.is_directory(ec2))
-                            walk(e.path(), rel);
-                        else if (std::regex_match(rel, rx))
-                        {
-                            output += rel + "\n";
-                            count++;
-                        }
+                        truncated = true;
+                        break;
                     }
-                };
-                walk(root, "");
+                    if (!is_dir && std::regex_match(rel, rx))
+                    {
+                        output += rel + "\n";
+                        count++;
+                    }
+                }
                 output += std::format("\n{} match(es){}", count, truncated ? " (truncated)" : "");
                 return true;
             }
@@ -1935,58 +2134,39 @@ namespace cell
                 auto now = std::filesystem::file_time_type::clock::now();
                 size_t count = 0;
                 bool truncated = false;
-                std::function<void(const std::filesystem::path &, const std::string &)> walk =
-                    [&](const std::filesystem::path &dir, const std::string &prefix)
+                for (auto &&[p, rel, is_dir] : walk_entries(root))
                 {
-                    std::vector<std::filesystem::directory_entry> entries;
-                    for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
-                        if (!ec)
-                            entries.push_back(*it);
-                    std::sort(entries.begin(), entries.end(),
-                              [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b)
-                              { return a.path().filename().string() < b.path().filename().string(); });
-                    for (auto &e : entries)
+                    if (count >= max_results)
                     {
-                        if (count >= max_results)
-                        {
-                            truncated = true;
-                            break;
-                        }
-                        std::string nm = e.path().filename().string();
-                        if (!nm.empty() && nm.front() == '.')
-                            continue;
-                        std::string rel = prefix.empty() ? nm : (prefix + "/" + nm);
-                        std::error_code ec2;
-                        if (e.is_directory(ec2))
-                        {
-                            walk(e.path(), rel);
-                            continue;
-                        }
-                        if (name_rx && !std::regex_match(nm, *name_rx))
-                            continue;
-                        auto mtime = e.last_write_time(ec2);
-                        if (ec2)
-                            continue;
-                        if (newer_hours > 0 &&
-                            (now - mtime) > std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::duration<double>(newer_hours * 3600.0)))
-                            continue;
-                        uintmax_t sz = e.file_size(ec2);
-                        if (ec2)
-                            continue;
-                        if (larger_bytes > 0 && (long long)sz < larger_bytes)
-                            continue;
-                        auto sys_t = std::chrono::file_clock::to_sys(mtime);
-                        std::time_t tt = std::chrono::system_clock::to_time_t(sys_t);
-                        std::tm tm{};
-                        if (std::tm *g = std::gmtime(&tt); g)
-                            tm = *g;
-                        char stamp[32];
-                        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
-                        output += std::format("{}  {:>10} bytes  {}\n", rel, (long long)sz, stamp);
-                        count++;
+                        truncated = true;
+                        break;
                     }
-                };
-                walk(root, "");
+                    if (is_dir)
+                        continue;
+                    if (name_rx && !std::regex_match(p.filename().string(), *name_rx))
+                        continue;
+                    std::error_code ec2;
+                    auto mtime = std::filesystem::last_write_time(p, ec2);
+                    if (ec2)
+                        continue;
+                    if (newer_hours > 0 &&
+                        (now - mtime) > std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::duration<double>(newer_hours * 3600.0)))
+                        continue;
+                    uintmax_t sz = std::filesystem::file_size(p, ec2);
+                    if (ec2)
+                        continue;
+                    if (larger_bytes > 0 && (long long)sz < larger_bytes)
+                        continue;
+                    auto sys_t = std::chrono::file_clock::to_sys(mtime);
+                    std::time_t tt = std::chrono::system_clock::to_time_t(sys_t);
+                    std::tm tm{};
+                    if (std::tm *g = std::gmtime(&tt); g)
+                        tm = *g;
+                    char stamp[32];
+                    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+                    output += std::format("{}  {:>10} bytes  {}\n", rel, (long long)sz, stamp);
+                    count++;
+                }
                 output += std::format("\n{} match(es){}", count, truncated ? " (truncated at max_results)" : "");
                 return true;
             }
@@ -2005,10 +2185,8 @@ namespace cell
                 output = std::format("ls: not a directory: {}", std::string(path));
                 return false;
             }
-            std::vector<std::filesystem::directory_entry> entries;
-            for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
-                if (!ec)
-                    entries.push_back(*it);
+            std::vector<std::filesystem::directory_entry> entries = collect_entries(dir, ec);
+            // ls sorts directories first, then case-insensitive by name
             std::sort(entries.begin(), entries.end(),
                       [](const std::filesystem::directory_entry &a, const std::filesystem::directory_entry &b)
                       {
@@ -2071,17 +2249,36 @@ namespace cell
             static std::mutex mx;
             return mx;
         }
-        // canonical, case-insensitive (on Windows) path key for the read log
+        // canonical, case-insensitive (on Windows) path key for the read log;
+        // weakly_canonical results are memoized per input path (hot path: every
+        // read tool call and edit check canonicalizes the same paths repeatedly)
+        static std::unordered_map<std::string, std::string> &canon_cache()
+        {
+            static std::unordered_map<std::string, std::string> c;
+            return c;
+        }
+        static std::mutex &canon_mx()
+        {
+            static std::mutex mx;
+            return mx;
+        }
         static std::string read_log_key(std::string_view path)
         {
+            {
+                std::lock_guard<std::mutex> lk(canon_mx());
+                if (auto it = canon_cache().find(std::string(path)); it != canon_cache().end())
+                    return it->second;
+            }
             std::error_code ec;
             std::filesystem::path p = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
             std::string s = p.lexically_normal().generic_string();
 #ifdef _WIN32
-            for (auto &c : s)
-                if (c >= 'A' && c <= 'Z')
-                    c = char(c - 'A' + 'a');
+            lower_ascii(s);
 #endif
+            {
+                std::lock_guard<std::mutex> lk(canon_mx());
+                canon_cache().emplace(std::string(path), s);
+            }
             return s;
         }
         // record that [start, end] (1-based inclusive; end == (size_t)-1 = EOF) of
@@ -2128,6 +2325,15 @@ namespace cell
             }
             return covered >= end;
         }
+        // 1-based line number of a byte offset within a text buffer
+        static size_t line_of(const std::string &content, size_t pos)
+        {
+            size_t line = 1;
+            for (size_t i = 0; i < pos && i < content.size(); i++)
+                if (content[i] == '\n')
+                    line++;
+            return line;
+        }
         bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false)
         {
             std::ifstream file(std::filesystem::path(path), std::ios::binary);
@@ -2149,26 +2355,35 @@ namespace cell
                     record_read(path, 1, (size_t)-1);
                 return true;
             }
-            auto lines = text::split_lines(output);
             if (start_line == 0)
                 start_line = 1;
-            if (end_line == 0)
-                end_line = lines.size();
-            if (start_line > lines.size())
+            // single pass over the buffer: slice the requested line range directly
+            // into a fresh string (no intermediate per-line copies)
+            std::string out;
+            out.reserve(size);
+            size_t nline = 0;
+            size_t line_begin = 0;
+            for (size_t i = 0; i < output.size(); i++)
             {
-                output.clear();
-                return true;
+                if (output[i] != '\n')
+                    continue;
+                nline++;
+                if (nline >= start_line && nline <= end_line)
+                    out.append(output, line_begin, i - line_begin + 1);
+                line_begin = i + 1;
             }
-            if (end_line > lines.size())
-                end_line = lines.size();
+            if (line_begin < output.size()) // trailing line without '\n'
+            {
+                nline++;
+                if (nline >= start_line && nline <= end_line)
+                {
+                    out.append(output, line_begin, output.size() - line_begin);
+                    out += '\n';
+                }
+            }
             if (track)
                 record_read(path, start_line, end_line);
-            output.clear();
-            for (size_t i = start_line - 1; i < end_line; i++)
-            {
-                output += lines[i];
-                output += '\n';
-            }
+            output = std::move(out);
             return true;
         }
         bool write(std::string_view path, std::string_view input)
@@ -2232,34 +2447,39 @@ namespace cell
             }
             if (pos.size() > 1)
             {
-                auto lines = text::split_lines(content);
+                // line start offsets (1-based line n spans [starts[n-1], starts[n]))
+                std::vector<size_t> starts{0};
+                for (size_t i = 0; i < content.size(); i++)
+                    if (content[i] == '\n')
+                        starts.push_back(i + 1);
+                auto line_view = [&](size_t n) -> std::string_view
+                {
+                    if (n < 1 || n > starts.size())
+                        return {};
+                    size_t s = starts[n - 1];
+                    size_t e = n < starts.size() ? starts[n] - 1 : content.size();
+                    return std::string_view(content).substr(s, e - s);
+                };
                 output = std::format("edit aborted: SEARCH block matched {} times — nothing was modified. Make the SEARCH block unique by adding more context lines.\n", pos.size());
                 for (size_t k = 0; k < pos.size(); k++)
                 {
-                    size_t line = 1;
-                    for (size_t i = 0; i < pos[k] && i < content.size(); i++)
-                        if (content[i] == '\n')
-                            line++;
+                    size_t line = line_of(content, pos[k]);
                     output += std::format("match #{} at line {}:\n", k + 1, line);
                     if (line >= 2)
-                        output += std::format("  {:>6} | {}\n", line - 1, lines[line - 2]);
-                    output += std::format(">>{:>6} | {}\n", line, lines[line - 1]);
-                    if (line < lines.size())
-                        output += std::format("  {:>6} | {}\n", line + 1, lines[line]);
+                        output += std::format("  {:>6} | {}\n", line - 1, line_view(line - 1));
+                    output += std::format(">>{:>6} | {}\n", line, line_view(line));
+                    if (line < starts.size())
+                        output += std::format("  {:>6} | {}\n", line + 1, line_view(line + 1));
                 }
                 return false;
             }
             // read-before-edit rule: the lines the SEARCH block touches must have
             // been returned by a previous read tool call, or the edit is refused
-            size_t first_line = 1;
-            for (size_t i = 0; i < pos[0] && i < content.size(); i++)
-                if (content[i] == '\n')
-                    first_line++;
+            size_t first_line = line_of(content, pos[0]);
             size_t last_line = first_line;
             size_t block_end = pos[0] + search.size();
-            for (size_t i = pos[0]; i < block_end && i < content.size(); i++)
-                if (content[i] == '\n')
-                    last_line++;
+            last_line += (size_t)std::count(content.begin() + pos[0],
+                                            content.begin() + std::min(block_end, content.size()), '\n');
             if (block_end > pos[0] && content[block_end - 1] == '\n')
                 last_line--;
             if (!read_covers(path, first_line, last_line))
@@ -2285,7 +2505,7 @@ namespace cell
             return n;
         }
 
-        using StreamCallback = std::function<void(std::span<const char>)>;
+        using StreamCallback = std::move_only_function<void(std::span<const char>)>;
         using XferCallback = int (*)(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
         size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
         {
@@ -2377,6 +2597,7 @@ namespace cell
             if (!curl || !url)
                 return false;
             curl_easy_reset(curl);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); // never raise SIGPIPE on POSIX
             if (timeout_sec > 0)
             {
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
@@ -2465,7 +2686,7 @@ namespace cell
                               const char *proxy = nullptr)
         {
             return perform(curl, url, post_data.c_str(), (curl_off_t)post_data.size(), proxy, headers,
-                           nullptr, on_token, on_xfer, xfer_data, http_code, nullptr);
+                           nullptr, std::move(on_token), on_xfer, xfer_data, http_code, nullptr);
         }
 
         // lightweight GET (used for connectivity probes); timeout_sec defaults to a short 5s
@@ -2557,6 +2778,8 @@ namespace cell
         {
         private:
             std::ofstream file;
+            std::mutex mx;             // probe/log calls can come from worker threads
+            std::string buf;           // buffered log lines; flushed on threshold / close
 
             logger()
             {
@@ -2577,10 +2800,34 @@ namespace cell
                 char stamp[32];
                 std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
                 std::string line = std::format("[{}] {:<5} [{:<5}] {}", stamp, level, cat, msg);
-                if (file.is_open())
                 {
-                    file << line << '\n';
-                    file.flush();
+                    std::lock_guard<std::mutex> lk(mx);
+                    if (file.is_open())
+                    {
+                        if (level == "ERROR")
+                        {
+                            // errors are crash-relevant: flush everything first, then
+                            // write and flush immediately
+                            if (!buf.empty())
+                            {
+                                file << buf;
+                                buf.clear();
+                            }
+                            file << line << '\n';
+                            file.flush();
+                        }
+                        else
+                        {
+                            buf += line;
+                            buf += '\n';
+                            if (buf.size() >= 16 * 1024)
+                            {
+                                file << buf;
+                                buf.clear();
+                                file.flush();
+                            }
+                        }
+                    }
                 }
                 if (console)
                     eprintln(c, "{}", line);
@@ -2637,10 +2884,30 @@ namespace cell
                 std::ofstream out(p, std::ios::trunc | std::ios::binary);
                 out << tail;
             }
+            // flush buffered log lines to the file (does not close it)
+            void flush()
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (file.is_open() && !buf.empty())
+                {
+                    file << buf;
+                    buf.clear();
+                    file.flush();
+                }
+            }
             void close()
             {
+                std::lock_guard<std::mutex> lk(mx);
                 if (file.is_open())
+                {
+                    if (!buf.empty())
+                    {
+                        file << buf;
+                        buf.clear();
+                    }
+                    file.flush();
                     file.close();
+                }
             }
             // console mirror policy: only agent-loop activity (llm/tool) reaches the terminal,
             // everything else lives in the log file; ERROR is always shown
@@ -2735,10 +3002,98 @@ namespace cell
             return scoped_exit<F>(std::move(fn));
         }
 
+        // dynamically-scaling worker pool: no workers at rest, spawns one whenever
+        // the queue depth exceeds the live worker count, up to max_workers
+        // (configured via config.json "thread_pool_size", default 16, hard cap 16).
+        class thread_pool
+        {
+        private:
+            std::mutex mx;
+            std::condition_variable cv;
+            std::deque<std::move_only_function<void()>> jobs;
+            size_t active = 0;      // submitted jobs not yet finished
+            size_t max_workers = 16;
+            bool stopping = false;
+            std::vector<std::jthread> workers;
+
+            void spawn_locked()
+            {
+                if (workers.size() >= max_workers)
+                    return;
+                workers.emplace_back([this] { worker_loop(); });
+            }
+            void worker_loop()
+            {
+                for (;;)
+                {
+                    std::move_only_function<void()> job;
+                    {
+                        std::unique_lock lk(mx);
+                        cv.wait(lk, [&] { return stopping || !jobs.empty(); });
+                        if (stopping && jobs.empty())
+                            return;
+                        job = std::move(jobs.front());
+                        jobs.pop_front();
+                    }
+                    job();
+                    {
+                        std::lock_guard lk(mx);
+                        active--;
+                    }
+                    cv.notify_all();
+                }
+            }
+
+        public:
+            explicit thread_pool(size_t max = 16) : max_workers(std::clamp<size_t>(max, 1, 16)) {}
+            ~thread_pool() { shutdown(); }
+            thread_pool(const thread_pool &) = delete;
+            thread_pool &operator=(const thread_pool &) = delete;
+
+            void submit(std::move_only_function<void()> job)
+            {
+                {
+                    std::lock_guard lk(mx);
+                    active++;
+                    jobs.push_back(std::move(job));
+                    if (active > workers.size()) // more work than workers: scale up
+                        spawn_locked();
+                }
+                cv.notify_one();
+            }
+            void wait_all()
+            {
+                std::unique_lock lk(mx);
+                cv.wait(lk, [&] { return active == 0; });
+            }
+            void shutdown()
+            {
+                {
+                    std::lock_guard lk(mx);
+                    stopping = true;
+                }
+                cv.notify_all();
+                for (auto &w : workers)
+                    w.join();
+                workers.clear();
+            }
+        };
+        // pool size is read from config.json before the pool is first used
+        inline size_t &pool_max_setting()
+        {
+            static size_t m = 16;
+            return m;
+        }
+        inline thread_pool &pool()
+        {
+            static thread_pool p(pool_max_setting());
+            return p;
+        }
+
         namespace detail
         {
             // state-persistence callback invoked by the signal handler before exit; set by main
-            inline std::function<void()> on_exit_signal;
+            inline std::move_only_function<void()> on_exit_signal;
         } // namespace detail
 
         // signal handler registered via std::signal: persist state, then terminate.
@@ -2853,7 +3208,8 @@ namespace cell
                 "- Never read or modify the .cell runtime directory (it stores your API keys and session data) - only .cell/skills is readable. The sandbox blocks it, so do not attempt workarounds.\n"
                 "When you finish a task, reply with a short summary of what was done.";
             std::string session_id;
-            size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
+            size_t log_max_lines = 1000; // keep at most this many lines in logs/cell.log
+            size_t max_threads = 16;     // concurrent read-only tool workers (1..16)
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
             bool empty() const { return providers.empty(); }
@@ -2998,6 +3354,7 @@ namespace cell
                 s.system_prompt = j.value("system", s.system_prompt);
                 s.session_id = j.value("session", s.session_id);
                 s.log_max_lines = j.value("log_max_lines", (size_t)1000);
+                s.max_threads = std::clamp(j.value("thread_pool_size", (size_t)16), (size_t)1, (size_t)16);
                 s.think = j.value("think", false);
                 s.tools = j.value("tools", true);
                 s.sandbox_mode = j.value("sandbox_mode", "git");
@@ -3029,6 +3386,7 @@ namespace cell
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
             j["log_max_lines"] = s.log_max_lines;
+            j["thread_pool_size"] = s.max_threads;
             if (!s.session_id.empty())
                 s.active_sessions[cwd_id()] = s.session_id;
             j["active_sessions"] = s.active_sessions;
@@ -3200,6 +3558,7 @@ namespace cell
             // map_key -> {"nonce": b64, "ct": b64(ciphertext||tag)}
             std::unordered_map<std::string, nlohmann::json> vault;
             std::filesystem::path key_file = root / ".key";
+            mutable std::mutex mx; // guards vault + aead_key: probes may read concurrently
 
             std::string salt; // raw crypto_pwhash_SALTBYTES bytes
             bool has_salt = false;
@@ -3406,6 +3765,7 @@ namespace cell
             ~crypt() { sodium_memzero(aead_key, sizeof aead_key); }
             secure_string get(const std::string &map_key)
             {
+                std::lock_guard<std::mutex> lk(mx);
                 auto it = vault.find(map_key);
                 if (it != vault.end())
                     return decrypt(it->second);
@@ -3413,6 +3773,7 @@ namespace cell
             }
             bool add(const std::string &map_key, const std::string &raw_value)
             {
+                std::lock_guard<std::mutex> lk(mx);
                 if (vault.find(map_key) != vault.end())
                     return false;
                 nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
@@ -3427,6 +3788,7 @@ namespace cell
             }
             size_t remove(const std::string &map_key)
             {
+                std::lock_guard<std::mutex> lk(mx);
                 size_t n = vault.erase(map_key);
                 if (n)
                     save();
@@ -3434,11 +3796,13 @@ namespace cell
             }
             bool has(const std::string &map_key) const
             {
+                std::lock_guard<std::mutex> lk(mx);
                 return vault.find(map_key) != vault.end();
             }
             // add or overwrite an existing entry
             bool set(const std::string &map_key, const std::string &raw_value)
             {
+                std::lock_guard<std::mutex> lk(mx);
                 nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
                 if (!e.is_object())
                     return false;
@@ -3467,9 +3831,8 @@ namespace cell
             const Policy permission = Policy::Ask;
 
         public:
-            tool(const size_t id, const std::string key, const Policy permission)
-                : id(id), key(key), permission(permission) {}
-            ~tool() {}
+tool(const size_t id, const std::string key, const Policy permission)
+            : id(id), key(key), permission(permission) {}
             virtual bool execute(const std::string &input, std::string &output)
             {
                 (void)input;
@@ -3488,14 +3851,13 @@ namespace cell
         class callable_tool : public tool
         {
         private:
-            using handler_t = std::function<bool(const std::string &input, std::string &output)>;
+            using handler_t = std::move_only_function<bool(const std::string &input, std::string &output)>;
             handler_t handler_;
 
         public:
             template <tool_handler F>
             callable_tool(size_t id, const std::string &key, Policy permission, F &&fn)
                 : tool(id, key, permission), handler_(std::forward<F>(fn)) {}
-            ~callable_tool() {}
             bool execute(const std::string &input, std::string &output) override
             {
                 if (policy() == Policy::Deny)
@@ -3750,16 +4112,16 @@ namespace cell
                         // chain-of-thought: reasoning models stream delta.reasoning_content
                         if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
                         {
-                            std::string t = delta["reasoning_content"].get<std::string>();
-                            reasoning += t;
+                            const std::string &t = delta["reasoning_content"].get_ref<const std::string &>();
+                            reasoning.append(t);
                             if (on_reason)
                                 on_reason(std::span<const char>(t));
                         }
                         if (delta.contains("content") && delta["content"].is_string())
                             [[likely]]
                         {
-                            std::string t = delta["content"].get<std::string>();
-                            text += t;
+                            const std::string &t = delta["content"].get_ref<const std::string &>();
+                            text.append(t);
                             on_token(std::span<const char>(t));
                         }
                         if (delta.contains("tool_calls") && delta["tool_calls"].is_array())
@@ -3786,7 +4148,7 @@ namespace cell
                 };
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (ok && http >= 400)
@@ -3930,32 +4292,36 @@ namespace cell
                             std::string dt = delta.value("type", "");
                             if (dt == "text_delta" && blocks[idx].value("type", "") == "text")
                             {
-                                if (!blocks[idx].contains("text") || !blocks[idx]["text"].is_string())
-                                    blocks[idx]["text"] = std::string();
-                                std::string t = delta.value("text", "");
-                                blocks[idx]["text"].get_ref<std::string &>() += t;
+                                auto &acc = blocks[idx]["text"];
+                                if (!acc.is_string())
+                                    acc = std::string();
+                                const std::string &t = delta["text"].get_ref<const std::string &>();
+                                acc.get_ref<std::string &>().append(t);
                                 on_token(std::span<const char>(t));
                             }
                             else if (dt == "thinking_delta" && blocks[idx].value("type", "") == "thinking")
                             {
-                                if (!blocks[idx].contains("thinking") || !blocks[idx]["thinking"].is_string())
-                                    blocks[idx]["thinking"] = std::string();
-                                std::string t = delta.value("thinking", "");
-                                blocks[idx]["thinking"].get_ref<std::string &>() += t;
+                                auto &acc = blocks[idx]["thinking"];
+                                if (!acc.is_string())
+                                    acc = std::string();
+                                const std::string &t = delta["thinking"].get_ref<const std::string &>();
+                                acc.get_ref<std::string &>().append(t);
                                 if (on_reason)
                                     on_reason(std::span<const char>(t));
                             }
                             else if (dt == "signature_delta" && blocks[idx].value("type", "") == "thinking")
                             {
-                                if (!blocks[idx].contains("signature") || !blocks[idx]["signature"].is_string())
-                                    blocks[idx]["signature"] = std::string();
-                                blocks[idx]["signature"].get_ref<std::string &>() += delta.value("signature", "");
+                                auto &acc = blocks[idx]["signature"];
+                                if (!acc.is_string())
+                                    acc = std::string();
+                                acc.get_ref<std::string &>().append(delta["signature"].get_ref<const std::string &>());
                             }
                             else if (dt == "input_json_delta" && blocks[idx].value("type", "") == "tool_use")
                             {
-                                if (!blocks[idx].contains("input") || !blocks[idx]["input"].is_string())
-                                    blocks[idx]["input"] = std::string();
-                                blocks[idx]["input"].get_ref<std::string &>() += delta.value("partial_json", "");
+                                auto &acc = blocks[idx]["input"];
+                                if (!acc.is_string())
+                                    acc = std::string();
+                                acc.get_ref<std::string &>().append(delta["partial_json"].get_ref<const std::string &>());
                             }
                         }
                     };
@@ -3963,7 +4329,7 @@ namespace cell
                 };
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think).dump(), hdrs, cb, on_xfer, xfer_data, &http, proxy_.c_str());
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think).dump(), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (ok && http >= 400)
@@ -3978,8 +4344,10 @@ namespace cell
                     err = "stream request failed";
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
-                reply["content"] = blocks.empty() ? nlohmann::json::array() : nlohmann::json(blocks);
-                for (auto &block : blocks)
+                reply["content"] = nlohmann::json::array();
+                for (auto &b : blocks)
+                    reply["content"].push_back(std::move(b)); // blocks are moved, not copied
+                for (auto &block : reply["content"])
                 {
                     if (block.value("type", "") != "tool_use")
                         continue;
@@ -4019,7 +4387,6 @@ namespace cell
             session(const std::string &id) : session_id(id), cwd(workdir().string()), file(session_path(session_id)) {}
             session(session &&) = default;
             session &operator=(session &&) = default;
-            ~session() {}
             void load()
             {
                 if (loaded)
@@ -4080,15 +4447,13 @@ namespace cell
             }
             void unload()
             {
-                std::error_code ec;
-                std::filesystem::create_directories(file.parent_path(), ec);
                 nlohmann::json j;
                 j["id"] = session_id;
                 j["cwd"] = cwd;
                 j["messages"] = messages;
-                std::ofstream f(file, std::ios::trunc);
-                if (f.is_open())
-                    f << j.dump(2);
+                // serialize on this thread, hand the bytes to the background writer;
+                // call async_io::flush() before reading session files back
+                async_io::submit(file, j.dump(2));
                 remember_cwd(session_prefix(session_id), cwd);
             }
             const std::string &id() const { return session_id; }
@@ -4107,8 +4472,7 @@ namespace cell
             std::string current = "current";
 
         public:
-            history(/* args */) {}
-            ~history() {}
+            history() = default;
             session &now()
             {
                 auto it = session_list.find(current);
@@ -4171,42 +4535,28 @@ namespace cell
             std::string description;
             std::string file; // filename under .cell/skills/
         };
-        static std::string trim(std::string_view s)
-        {
-            size_t b = 0, e = s.size();
-            while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
-                b++;
-            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
-                e--;
-            return std::string(s.substr(b, e - b));
-        }
-        static std::string strip_bom(std::string s)
-        {
-            if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
-                s.erase(0, 3);
-            return s;
-        }
-        static std::vector<std::string> lines(const std::string &text)
-        {
-            return text::split_lines(text);
-        }
         // parse optional YAML-style front matter: "---\nname: x\ndescription: y\n---\n body"
-        static bool parse_metadata(const std::string &raw, skill &s)
+        static bool parse_metadata(std::string_view raw, skill &s)
         {
-            std::string text = strip_bom(raw);
-            if (text.rfind("---", 0) != 0)
+            std::string owned; // only used when a BOM must be stripped
+            if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF && (unsigned char)raw[1] == 0xBB && (unsigned char)raw[2] == 0xBF)
+            {
+                owned = std::string(raw.substr(3));
+                raw = owned;
+            }
+            if (raw.rfind("---", 0) != 0)
                 return false;
-            size_t end = text.find("\n---");
+            size_t end = raw.find("\n---");
             if (end == std::string::npos)
                 return false;
-            std::string meta = text.substr(3, end - 3);
-            for (auto &line : lines(meta))
+            std::string_view meta = raw.substr(3, end - 3);
+            for (auto line : text::lines(meta))
             {
                 size_t colon = line.find(':');
                 if (colon == std::string::npos)
                     continue;
-                std::string key = trim(std::string_view(line).substr(0, colon));
-                std::string val = trim(std::string_view(line).substr(colon + 1));
+                std::string key = text::trim(line.substr(0, colon));
+                std::string val = text::trim(line.substr(colon + 1));
                 if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') || (val.front() == '\'' && val.back() == '\'')))
                     val = val.substr(1, val.size() - 2);
                 if (key == "name")
@@ -4225,12 +4575,12 @@ namespace cell
             }
             if (s.description.empty())
             {
-                std::string body = text.substr(end + 4);
-                for (auto &line : lines(body))
+                std::string_view body = raw.substr(end + 4);
+                for (auto line : text::lines(body))
                 {
-                    if (!trim(line).empty())
+                    if (!text::trim(line).empty())
                     {
-                        s.description = trim(line);
+                        s.description = text::trim(line);
                         if (s.description.size() > 120)
                             s.description = s.description.substr(0, 117) + "...";
                         break;
@@ -4294,12 +4644,12 @@ namespace cell
             std::string text;
             if (!box::read((root / "skills" / s.file).string(), text))
                 return false;
-            text = strip_bom(std::move(text));
+            text::strip_bom(text); // in-place, no copy
             if (text.rfind("---", 0) == 0)
             {
                 size_t end = text.find("\n---");
                 if (end != std::string::npos)
-                    text = text.substr(end + 4);
+                    text.erase(0, end + 4); // in-place strip
             }
             out = std::move(text);
             return true;
@@ -4325,31 +4675,35 @@ namespace cell
     namespace stats
     {
         static std::filesystem::path file() { return root / "usages.json"; }
-        static nlohmann::json load()
+        // in-memory canonical copy: loaded lazily once, mutated by add/remove/
+        // prune, persisted asynchronously through async_io (coalesced per path)
+        static nlohmann::json &mem()
         {
-            std::ifstream f(file());
-            if (!f.is_open())
+            static nlohmann::json j = []()
+            {
+                std::ifstream f(file());
+                if (f.is_open())
+                {
+                    try
+                    {
+                        auto jj = nlohmann::json::parse(f, nullptr, false);
+                        if (jj.is_object() && jj.contains("sessions") && jj.contains("models"))
+                            return jj;
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
                 return nlohmann::json{{"sessions", nlohmann::json::object()}, {"models", nlohmann::json::object()}};
-            try
-            {
-                auto j = nlohmann::json::parse(f, nullptr, false);
-                if (j.is_object() && j.contains("sessions") && j.contains("models"))
-                    return j;
-            }
-            catch (const std::exception &)
-            {
-            }
-            return nlohmann::json{{"sessions", nlohmann::json::object()}, {"models", nlohmann::json::object()}};
+            }();
+            return j;
         }
-        static bool save(const nlohmann::json &j)
+        static nlohmann::json load() { return mem(); }
+        static void save_async()
         {
             std::error_code ec;
             std::filesystem::create_directories(root, ec);
-            std::ofstream f(file(), std::ios::trunc);
-            if (!f.is_open())
-                return false;
-            f << j.dump(2);
-            return f.good();
+            async_io::submit(file(), mem().dump(2));
         }
         // record one llm request against a session + model
         static void add(const std::string &session_id, const std::string &model,
@@ -4358,7 +4712,7 @@ namespace cell
                         std::optional<long long> total_tokens,
                         long long messages = 0)
         {
-            nlohmann::json j = load();
+            auto &j = mem();
             auto bump = [&](nlohmann::json &rec)
             {
                 rec["requests"] = rec.value("requests", 0LL) + 1;
@@ -4381,22 +4735,22 @@ namespace cell
             if (!m.is_object())
                 m = nlohmann::json::object();
             bump(m);
-            save(j);
+            save_async();
         }
         // remove the usage record of one session (used when a session is deleted)
         static void remove(const std::string &session_id)
         {
-            nlohmann::json j = load();
+            auto &j = mem();
             if (j["sessions"].contains(session_id))
             {
                 j["sessions"].erase(session_id);
-                save(j);
+                save_async();
             }
         }
         // drop usage records whose session files no longer exist on disk; returns true if any were dropped
         static bool prune()
         {
-            nlohmann::json j = load();
+            auto &j = mem();
             auto &sess = j["sessions"];
             std::vector<std::string> gone;
             for (auto &[k, v] : sess.items())
@@ -4409,7 +4763,7 @@ namespace cell
                 return false;
             for (auto &k : gone)
                 sess.erase(k);
-            save(j);
+            save_async();
             return true;
         }
         static std::string fmt(const nlohmann::json &rec)
@@ -4504,10 +4858,10 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "string"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy,
-                   std::function<bool(const nlohmann::json &, std::string &)> fn)
+                   std::move_only_function<bool(const nlohmann::json &, std::string &)> fn)
     {
         list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy,
-                                                                  [fn = std::move(fn)](const std::string &in, std::string &out) -> bool
+                                                                  [fn = std::move(fn)](const std::string &in, std::string &out) mutable -> bool
                                                                   {
                                                                       nlohmann::json j;
                                                                       if (!json_args(in, j))
@@ -4986,12 +5340,60 @@ static int run_selftest()
         expect(sse_buf.size() < 64 * 1024, "sse_feed compacts consumed prefix");
     }
 
+    // walk_entries: shared lazy walker used by rg/glob/find
+    {
+        expect(cell::box::mkdir("walk_dir"), "walk dir");
+        expect(cell::box::mkdir("walk_dir/sub"), "walk subdir");
+        expect(cell::box::write("walk_dir/a.txt", "x\n"), "walk fixture a");
+        expect(cell::box::write("walk_dir/sub/b.txt", "x\n"), "walk fixture b");
+        expect(cell::box::write("walk_dir/.hidden.txt", "x\n"), "walk fixture hidden");
+        size_t files = 0, dirs = 0, hidden = 0;
+        for (auto &&[p, rel, is_dir] : cell::box::walk_entries("walk_dir"))
+        {
+            if (is_dir)
+                dirs++;
+            else
+                files++;
+            if (rel.find(".hidden") != std::string::npos)
+                hidden++;
+        }
+        expect(files == 2 && dirs == 1 && hidden == 0, "walk_entries skips hidden, visits all");
+        for (auto &&[p, rel, is_dir] : cell::box::walk_entries("walk_dir"))
+        {
+            if (rel == "a.txt")
+                break; // early break must terminate the generator cleanly
+        }
+        expect(cell::box::remove("walk_dir/sub/b.txt") && cell::box::remove("walk_dir/sub") &&
+                   cell::box::remove("walk_dir/a.txt") && cell::box::remove("walk_dir/.hidden.txt") &&
+                   cell::box::remove("walk_dir"),
+               "walk cleanup");
+    }
+
+    // thread pool: dynamic scaling + wait_all + jobs complete exactly once
+    {
+        cell::sys::pool_max_setting() = 4;
+        constexpr int N = 64;
+        std::array<std::atomic<int>, N> counters{};
+        for (int i = 0; i < N; i++)
+            cell::sys::pool().submit([&counters, i]
+                                     {
+                for (int k = 0; k < 1000; k++)
+                    counters[i].fetch_add(1, std::memory_order_relaxed); });
+        cell::sys::pool().wait_all();
+        bool all = true;
+        for (int i = 0; i < N; i++)
+            all = all && counters[i].load() == 1000;
+        expect(all, "thread pool runs every job exactly once");
+        cell::sys::pool_max_setting() = 16;
+    }
+
     auto &log = cell::sys::logger::instance();
     log.info("test", "selftest info");
     log.warn("test", "selftest warn");
     log.error("test", "selftest error");
     log.debug("test", "selftest debug");
     expect(cell::box::exist((cell::root / "logs" / "cell.log").string()), "logger writes log file");
+    log.flush(); // buffered writes must be on disk before reading back
     expect(cell::box::read((cell::root / "logs" / "cell.log").string(), out) && out.find("selftest debug") != std::string::npos, "logger debug writes to log file");
 
     bool threw = false;
@@ -5072,10 +5474,12 @@ static int run_selftest()
     cfg.tools = false;
     cfg.system_prompt = "sys";
     cfg.log_max_lines = 500;
+    cfg.max_threads = 8;
     expect(cell::config::save(cfg), "config::save providers");
     auto cfg_res = cell::config::load();
     expect(cfg_res.has_value() && cfg_res->providers.size() == 2, "config::load providers");
     expect(cfg_res.has_value() && cfg_res->log_max_lines == 500, "config log_max_lines roundtrip");
+    expect(cfg_res.has_value() && cfg_res->max_threads == 8, "config thread_pool_size roundtrip");
     expect(cfg_res.has_value() && cfg_res->current_provider == "claude" && cfg_res->current_model == "m2", "config current provider/model");
     expect(cfg_res.has_value() && cfg_res->think, "config think roundtrip");
     expect(cfg_res.has_value() && !cfg_res->tools, "config tools roundtrip");
@@ -5107,6 +5511,7 @@ static int run_selftest()
             auto &old = h2.now();
             old.append("user", "hello");
             old.unload();
+            cell::async_io::flush(); // durability barrier: unloads write asynchronously
             expect(cell::box::exist(cell::chat::session(sid).path().string()), "session unload writes file");
             h2.forget_current();
             auto &fresh = h2.now();
@@ -5122,6 +5527,7 @@ static int run_selftest()
         expect(cell::box::read(cell::chat::session(sid).path().string(), out) && out.find("\"cwd\"") != std::string::npos, "session file records its cwd");
         expect(cell::cwd_id() == cell::cwd_id(), "cwd_id is stable");
         // cwd hash -> path index written on unload
+        cell::async_io::flush(); // durability barrier: unloads write asynchronously
         expect(cell::box::exist((cell::root / "sessions" / "sessions.json").string()), "sessions index written on unload");
         expect(cell::cwd_for_key(cell::session_prefix(sid)) == cell::workdir().string(), "sessions index maps cwd hash to path");
     }
@@ -5224,6 +5630,7 @@ static int run_selftest()
     expect(cell::stats::summarize().find("openai:gpt-4o") != std::string::npos, "stats summarize");
 
     cell::sys::logger::instance().close();
+    cell::async_io::flush(); // drain queued stats/session writes before wiping the sandbox root
     std::filesystem::remove_all(cell::root, ec);
     cell::root = saved_root;
     cell::sys::println("selftest {}", ok ? "OK" : "FAILED");
@@ -5256,21 +5663,21 @@ int main(int argc, char const *argv[])
             return argv[++i];
         };
         if (arg == "--provider")
-            provider_arg = cell::skills::trim(value("--provider"));
+            provider_arg = cell::text::trim(value("--provider"));
         else if (arg == "--base")
-            base_arg = cell::skills::trim(value("--base"));
+            base_arg = cell::text::trim(value("--base"));
         else if (arg == "--model")
-            model_arg = cell::skills::trim(value("--model"));
+            model_arg = cell::text::trim(value("--model"));
         else if (arg == "--proxy")
-            proxy_arg = cell::skills::trim(value("--proxy"));
+            proxy_arg = cell::text::trim(value("--proxy"));
         else if (arg == "--key")
-            key_arg = cell::skills::trim(value("--key"));
+            key_arg = cell::text::trim(value("--key"));
         else if (arg == "--session")
             cfg.session_id = value("--session");
         else if (arg == "--system")
             cfg.system_prompt = value("--system");
         else if (arg == "--sandbox")
-            cfg.sandbox_mode = cell::skills::trim(value("--sandbox"));
+            cfg.sandbox_mode = cell::text::trim(value("--sandbox"));
         else if (arg == "--no-color")
             no_color = true;
         else if (arg == "--verbose")
@@ -5294,7 +5701,7 @@ int main(int argc, char const *argv[])
 
     // apply the exec sandbox mode from config/--sandbox (default: git-only)
     {
-        std::string m = cell::skills::trim(cfg.sandbox_mode);
+        std::string m = cell::text::trim(cfg.sandbox_mode);
         if (m == "git")
             cell::box::sandbox_mode() = cell::box::SandboxMode::GitOnly;
         else if (m == "safe")
@@ -5316,6 +5723,9 @@ int main(int argc, char const *argv[])
     auto t_start = cell::sys::detail::clock::now();
     long long total_llm_requests = 0;
     long long total_tool_calls = 0;
+
+    // configure the read-only tool worker pool from config.json before first use
+    cell::sys::pool_max_setting() = std::clamp(cfg.max_threads, (size_t)1, (size_t)16);
 
     // apply CLI overrides: --provider NAME selects an existing provider by name;
     // when it does not exist (or nothing is configured at all) the legacy behavior
@@ -5438,13 +5848,13 @@ int main(int argc, char const *argv[])
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, model, msgs, tools, on_tok, on_reason, reply, tc, usage, err, think, on_xfer, xfer_data);
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think, on_xfer, xfer_data);
             return client.chat(key, model, msgs, tools, reply, tc, usage, err, think);
         }
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
-            return client.chat_stream(key, model, msgs, tools, on_tok, on_reason, reply, tc, usage, err, on_xfer, xfer_data);
+            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data);
         return client.chat(key, model, msgs, tools, reply, tc, usage, err);
     };
 
@@ -5458,7 +5868,21 @@ int main(int argc, char const *argv[])
         return s.size() <= n ? s : s.substr(0, n) + "...";
     };
 
-    auto content_chars = [](const nlohmann::json &msgs) -> long long
+    // character count of any JSON value without building a serialized copy
+    auto json_chars = [](const nlohmann::json &j, auto &&self) -> long long
+    {
+        long long n = 0;
+        if (j.is_string())
+            n += (long long)j.get_ref<const std::string &>().size();
+        else if (j.is_array())
+            for (auto &e : j)
+                n += self(e, self);
+        else if (j.is_object())
+            for (auto &[k, v] : j.items())
+                n += (long long)k.size() + self(v, self);
+        return n;
+    };
+    auto content_chars = [&](const nlohmann::json &msgs) -> long long
     {
         long long n = 0;
         for (auto &m : msgs)
@@ -5466,10 +5890,7 @@ int main(int argc, char const *argv[])
             auto it = m.find("content");
             if (it == m.end())
                 continue;
-            if (it->is_string())
-                n += (long long)it->get_ref<const std::string &>().size();
-            else if (it->is_array())
-                n += (long long)it->dump().size();
+            n += json_chars(*it, json_chars);
         }
         return n;
     };
@@ -5492,7 +5913,17 @@ int main(int argc, char const *argv[])
     };
     auto reply_text_len = [&](const nlohmann::json &reply) -> long long
     {
-        return (long long)reply_text(reply).size();
+        auto it = reply.find("content");
+        if (it == reply.end())
+            return 0;
+        if (it->is_string())
+            return (long long)it->get_ref<const std::string &>().size();
+        long long n = 0;
+        if (it->is_array())
+            for (auto &b : *it)
+                if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                    n += (long long)b["text"].get_ref<const std::string &>().size();
+        return n;
     };
     auto usage_in = [](const nlohmann::json &u) -> std::optional<long long>
     {
@@ -5624,11 +6055,14 @@ int main(int argc, char const *argv[])
     {
         std::error_code ec;
         std::filesystem::current_path(sc, ec);
+        cell::reset_workdir_cache();
         if (ec)
             cell::sys::warn("session cwd unreachable: {} (staying in {})", sc, cell::workdir().string());
         else
             cell::sys::println("cwd -> {}", cell::workdir().string());
     }
+    // async connectivity probes (boot): joined on exit so curl_global_cleanup is safe
+    std::vector<std::thread> probe_threads;
     // RAII exit guard: persists the session + config and cleans up libcurl no matter how
     // main leaves this scope (normal /exception / Ctrl+C graceful exit).
     auto on_exit = cell::sys::make_scoped_exit([&]
@@ -5642,6 +6076,11 @@ int main(int argc, char const *argv[])
         }
         cfg.session_id = s->id();
         cell::config::save(cfg);
+        cell::async_io::flush(); // drain queued session/config/index writes
+        cell::sys::pool().shutdown(); // join tool workers before curl cleanup
+        for (auto &t : probe_threads) // curl handles may be in flight on these threads
+            if (t.joinable())
+                t.join();
         curl_global_cleanup(); });
     auto skills_all = cell::skills::list();
     std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
@@ -5713,6 +6152,11 @@ int main(int argc, char const *argv[])
             cell::sys::warn("[provider unreachable] {}: {}", p.name, why);
         }
     };
+    // boot-time probe runs in the background so startup never blocks on the network
+    auto probe_async = [&](const cell::config::provider_entry &p)
+    {
+        probe_threads.emplace_back([&, p] { probe_provider(p); });
+    };
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
     {
         std::string key_state = "missing";
@@ -5747,7 +6191,7 @@ int main(int argc, char const *argv[])
         cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
     ensure_prompt(s);
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
-        probe_provider(*p);
+        probe_async(*p); // background: startup never waits on the network
 
     auto list_providers = [&]()
     {
@@ -5890,6 +6334,7 @@ int main(int argc, char const *argv[])
             s->unload();
             cfg.session_id = s->id();
             cell::config::save(cfg);
+            cell::async_io::flush(); // persist queued writes before terminating
         };
         bool running = true;
         while (running)
@@ -5915,13 +6360,7 @@ int main(int argc, char const *argv[])
 
             if (input[0] == '/')
             {
-                std::vector<std::string> toks;
-                {
-                    std::istringstream ss(input);
-                    std::string t;
-                    while (ss >> t)
-                        toks.push_back(t);
-                }
+                std::vector<std::string> toks = cell::box::tokens(input);
                 std::string cmd = toks.empty() ? "" : toks[0];
                 log.info("cmd", std::format("command={} args={}", cmd, toks.size() - 1));
                 if (cmd == "/exit" || cmd == "/quit")
@@ -5934,6 +6373,7 @@ int main(int argc, char const *argv[])
                 if (cmd == "/save")
                 {
                     s->unload();
+                    cell::async_io::flush(); // /save promises durability now
                     log.info("sess", std::format("saved id={} msgs={}", s->id(), s->msg().size()));
                     cell::sys::println("session saved: {}", s->id());
                     continue;
@@ -5942,6 +6382,7 @@ int main(int argc, char const *argv[])
                 {
                     std::string old_id = s->id();
                     s->unload();
+                    cell::async_io::flush(); // the old session must survive a crash
                     h.forget_current();
                     s = &h.now();
                     ensure_prompt(s);
@@ -5958,6 +6399,7 @@ int main(int argc, char const *argv[])
                     cell::box::reset_read_log(); // context gone: recorded reads no longer apply
                     ensure_prompt(s);
                     s->unload();
+                    cell::async_io::flush();
                     log.info("sess", std::format("cleared id={} msgs_before={}", s->id(), before));
                     cell::sys::println("session cleared: {} (removed {} messages)", s->id(), before);
                     continue;
@@ -6057,10 +6499,10 @@ int main(int argc, char const *argv[])
                             else
                                 cell::sys::warn("ignoring token: {}", tt);
                         }
-                        base = cell::skills::trim(base);
-                        new_key = cell::skills::trim(new_key);
-                        new_proxy = cell::skills::trim(new_proxy);
-                        name_arg = cell::skills::trim(name_arg);
+                        base = cell::text::trim(base);
+                        new_key = cell::text::trim(new_key);
+                        new_proxy = cell::text::trim(new_proxy);
+                        name_arg = cell::text::trim(name_arg);
                         if (base.empty())
                         {
                             cell::sys::error("missing api base url: /provide add {}:URL", style);
@@ -6246,6 +6688,7 @@ int main(int argc, char const *argv[])
                 }
                 if (cmd == "/sessions")
                 {
+                    cell::async_io::flush(); // listings must reflect queued session writes
                     struct s_entry
                     {
                         std::string id, cwd, snippet;
@@ -6338,6 +6781,7 @@ int main(int argc, char const *argv[])
                             continue;
                         }
                         std::string target = toks[2];
+                        cell::async_io::flush(); // a queued write must not resurrect the file
                         std::error_code ec;
                         std::filesystem::path p = cell::session_path(target);
                         bool existed = std::filesystem::exists(p, ec);
@@ -6366,6 +6810,7 @@ int main(int argc, char const *argv[])
                         continue;
                     }
                     s->unload();
+                    cell::async_io::flush(); // the target file below must reflect all queued writes
                     // the target session may live under another cwd: follow it so the
                     // chat context and the process cwd stay consistent
                     std::string tcwd;
@@ -6382,6 +6827,7 @@ int main(int argc, char const *argv[])
                     {
                         std::error_code ec;
                         std::filesystem::current_path(tcwd, ec);
+                        cell::reset_workdir_cache();
                         if (ec)
                             cell::sys::warn("session cwd unreachable: {} (staying in {})", tcwd, cell::workdir().string());
                         else
@@ -6406,6 +6852,7 @@ int main(int argc, char const *argv[])
                     cell::sys::println("{}", compact(s));
                     cell::box::reset_read_log(); // compaction drops read tool results from context
                     s->unload();
+                    cell::async_io::flush();
                     cell::config::save(cfg);
                     continue;
                 }
@@ -6601,7 +7048,7 @@ int main(int argc, char const *argv[])
                 };
                 total_llm_requests++;
                 std::string err;
-                bool ok = do_chat(*p, key, cfg.current_model, s->msg(), true, tok_cb, reason_cb, reply, tool_calls, usage, err, cfg.tools, cfg.think, xfer_cb, &ui);
+                bool ok = do_chat(*p, key, cfg.current_model, s->msg(), true, std::move(tok_cb), std::move(reason_cb), reply, tool_calls, usage, err, cfg.tools, cfg.think, xfer_cb, &ui);
                 double total_sec = cell::sys::elapsed_ms(t0) / 1000.0;
                 double ttf_sec = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
                 if (ui.timer_line || ui.tok_line)
@@ -6656,7 +7103,8 @@ int main(int argc, char const *argv[])
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
                     // pass 1: read-only tools (Policy::Allow: ls/read/rg/glob/find) run concurrently
-                    std::vector<std::future<void>> futures;
+                    // on the shared worker pool (dynamically scaled up to max_threads)
+                    size_t allow_count = 0;
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
                         auto &tc = tool_calls[i];
@@ -6675,24 +7123,25 @@ int main(int argc, char const *argv[])
                         else if (it->second->policy() == cell::tools::Policy::Allow)
                         {
                             res[i].policy = "allow";
-                            futures.push_back(std::async(std::launch::async, [&res, it, i]
-                                                         {
+                            allow_count++;
+                            cell::sys::pool().submit([&res, it, i]
+                                                     {
                                 auto t0 = cell::sys::detail::clock::now();
                                 std::string o;
                                 if (it->second->execute(res[i].args, o))
                                 {
-                                    res[i].output = o;
+                                    res[i].output = std::move(o);
                                     res[i].status = "ok";
                                 }
-                                res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; }));
+                                res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
                         }
                         else
                         {
                             res[i].policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny" : "ask";
                         }
                     }
-                    for (auto &f : futures)
-                        f.wait();
+                    if (allow_count)
+                        cell::sys::pool().wait_all();
                     // pass 2: confirm-required tools (exec/write/edit) run sequentially, in order
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {

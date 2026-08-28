@@ -539,6 +539,10 @@ The tool creates a `.cell/` directory in your working directory:
 `log_max_lines` (default `1000`, minimum 10) controls how many lines `logs/cell.log` keeps — on
 every startup the file is trimmed to its tail before new entries are appended.
 
+`thread_pool_size` (default `16`, range 1–16) caps how many worker threads cell may spawn for
+concurrent read-only tool calls (ls/read/rg/glob/find). The pool scales up dynamically under load,
+so small values keep the machine quiet while larger ones speed up batched exploration.
+
 ## License
 
 MIT
