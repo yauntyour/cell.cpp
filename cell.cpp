@@ -643,6 +643,50 @@ namespace cell
         // control characters, and collapse newlines to spaces, so untrusted
         // tool-call JSON cannot manipulate the console (erase the confirmation
         // prompt, fake an approval, or hide a dangerous command).
+        // advance i past one ANSI escape sequence (CSI / OSC / lone ESC with
+        // following control bytes); returns the index of the sequence's final
+        // byte, so the caller's loop increment lands on the byte after it
+        static size_t skip_escape(std::string_view s, size_t i)
+        {
+            if (i + 1 < s.size() && s[i + 1] == '[')
+            {
+                i += 2; // ESC [
+                while (i < s.size())
+                {
+                    unsigned char cc = (unsigned char)s[i];
+                    if ((cc >= 0x20 && cc <= 0x2F) || (cc >= 0x30 && cc <= 0x3F))
+                    {
+                        i++; // parameter/intermediate byte
+                        continue;
+                    }
+                    break; // final byte or garbage
+                }
+            }
+            else if (i + 1 < s.size() && s[i + 1] == ']')
+            {
+                i += 2; // ESC ]
+                while (i < s.size())
+                {
+                    unsigned char cc = (unsigned char)s[i];
+                    if (cc == 0x07)
+                        break; // BEL
+                    if (cc == 0x1B && i + 1 < s.size() && s[i + 1] == '\\')
+                    {
+                        i++; // the '\' of the ST terminator
+                        break;
+                    }
+                    i++;
+                }
+            }
+            else
+            {
+                // lone ESC: drop it and any following control bytes
+                while (i + 1 < s.size() && (unsigned char)s[i + 1] < 0x20 &&
+                       (unsigned char)s[i + 1] != '\n' && (unsigned char)s[i + 1] != '\r')
+                    i++;
+            }
+            return i;
+        }
         static std::string display_safe(const std::string &s)
         {
             std::string out;
@@ -652,46 +696,7 @@ namespace cell
                 unsigned char c = (unsigned char)s[i];
                 if (c == 0x1B)
                 {
-                    // consume the escape sequence; leave i one byte before the
-                    // first byte to process next (the loop increment advances
-                    // one past it) so the char after the sequence is never eaten
-                    if (i + 1 < s.size() && s[i + 1] == '[')
-                    {
-                        i += 2; // ESC [
-                        while (i < s.size())
-                        {
-                            unsigned char cc = (unsigned char)s[i];
-                            if ((cc >= 0x20 && cc <= 0x2F) || (cc >= 0x30 && cc <= 0x3F))
-                            {
-                                i++; // parameter/intermediate byte
-                                continue;
-                            }
-                            break; // final byte or garbage: i stays on it
-                        }
-                        continue;
-                    }
-                    if (i + 1 < s.size() && s[i + 1] == ']')
-                    {
-                        // OSC ... terminated by BEL or ST (ESC \)
-                        i += 2; // ESC ]
-                        while (i < s.size())
-                        {
-                            unsigned char cc = (unsigned char)s[i];
-                            if (cc == 0x07)
-                                break; // BEL
-                            if (cc == 0x1B && i + 1 < s.size() && s[i + 1] == '\\')
-                            {
-                                i++; // the '\' of the ST terminator
-                                break;
-                            }
-                            i++;
-                        }
-                        continue;
-                    }
-                    // lone ESC: drop it and any following control bytes
-                    while (i + 1 < s.size() && (unsigned char)s[i + 1] < 0x20 &&
-                           (unsigned char)s[i + 1] != '\n' && (unsigned char)s[i + 1] != '\r')
-                        i++;
+                    i = skip_escape(s, i);
                     continue;
                 }
                 if (c == '\n' || c == '\r' || c == '\t')
@@ -702,6 +707,33 @@ namespace cell
                 }
                 if (c < 0x20)
                     continue; // remaining C0 controls (backspace, bell, ...)
+                out += (char)c;
+            }
+            return out;
+        }
+        // strip ANSI escape sequences and control characters for safe console
+        // display, preserving line structure — display_safe collapses whitespace
+        // for the one-line confirmation prompts, this keeps multi-line tool
+        // output intact (tool results are echoed back to the terminal in color)
+        static std::string console_safe(const std::string &s)
+        {
+            std::string out;
+            out.reserve(s.size());
+            for (size_t i = 0; i < s.size(); i++)
+            {
+                unsigned char c = (unsigned char)s[i];
+                if (c == 0x1B)
+                {
+                    i = skip_escape(s, i);
+                    continue;
+                }
+                if (c == '\n' || c == '\r' || c == '\t')
+                {
+                    out += (char)c;
+                    continue;
+                }
+                if (c < 0x20)
+                    continue; // remaining C0 controls
                 out += (char)c;
             }
             return out;
@@ -2854,6 +2886,7 @@ namespace cell
             red = 31,
             green = 32,
             yellow = 33,
+            cyan = 36,
         };
 
         template <std::formattable<char>... Args>
@@ -2894,6 +2927,18 @@ namespace cell
             s += '\n';
             std::fwrite(s.data(), 1, s.size(), stderr);
             std::fflush(stderr);
+        }
+        // colored println to stdout (chat/think stream plain or dim text there;
+        // tool-result echoes use this to stand out)
+        template <std::formattable<char>... Args>
+        void pprintln(color c, std::format_string<Args...> fmt, Args &&...args)
+        {
+            std::string s = std::format(fmt, std::forward<Args>(args)...);
+            if (detail::color_enabled)
+                s = std::format("\x1b[{}m{}\x1b[0m", (int)c, s);
+            s += '\n';
+            std::fwrite(s.data(), 1, s.size(), stdout);
+            std::fflush(stdout);
         }
         inline void eprintln(color)
         {
@@ -5245,6 +5290,11 @@ static int run_selftest()
         expect(es.find('\x1b') == std::string::npos, "display_safe strips ANSI escape sequences");
         std::string nl = cell::text::display_safe("line1\nline2");
         expect(nl.find('\n') == std::string::npos, "display_safe collapses newlines");
+        expect(cell::text::display_safe("x\x1b[31mY") == "xY", "display_safe never eats the char after a CSI sequence");
+        std::string cs1 = cell::text::console_safe("a\x1b[31mred\x1b[0m\nline2\n");
+        expect(cs1 == "ared\nline2\n", "console_safe strips ANSI, keeps newlines");
+        expect(cell::text::console_safe("\x1b]0;title\x07x") == "x", "console_safe strips OSC sequences");
+        expect(cell::text::console_safe(std::string("a\x01") + "b") == "ab", "console_safe drops C0 controls");
     }
 
     // sanitizer hardening: multi-line splits, word insertion, punctuation, homoglyphs, paraphrases
@@ -7419,6 +7469,32 @@ int main(int argc, char const *argv[])
                         {
                         }
                         std::string wrapped = cell::box::wrap_tool_output(res[i].name, marker, body);
+                        // console echo of the returned content: cyan, distinct
+                        // from chat (plain) and think (dim gray). terminal only —
+                        // never written to the log file so it cannot inflate it
+                        std::string shown = cell::text::console_safe(res[i].output);
+                        constexpr size_t kConsoleEchoMax = 16 * 1024;
+                        if (shown.size() > kConsoleEchoMax)
+                        {
+                            shown.resize(kConsoleEchoMax);
+                            shown += std::format("\n[console echo truncated: {} more chars]", (long long)(res[i].output.size() - kConsoleEchoMax));
+                        }
+                        if (!shown.empty() && shown.back() == '\n')
+                            shown.pop_back();
+                        cell::sys::pprintln(cell::sys::color::cyan, "tool #{}: {} ({:.2f}s, {} chars{})", tc_seq, res[i].name,
+                                            res[i].sec, (long long)res[i].output.size(),
+                                            marker.empty() ? "" : std::format(" | {}", cell::text::display_safe(marker)));
+                        if (!shown.empty())
+                        {
+                            if (cell::sys::detail::color_enabled)
+                            {
+                                std::string c = std::format("\x1b[36m{}\x1b[0m\n", shown);
+                                std::fwrite(c.data(), 1, c.size(), stdout);
+                                std::fflush(stdout);
+                            }
+                            else
+                                cell::sys::println("{}", shown);
+                        }
                         if (p->style == "openai")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
                         else
