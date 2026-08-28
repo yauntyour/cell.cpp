@@ -2453,14 +2453,30 @@ namespace cell
             }
             return covered >= end;
         }
-        // 1-based line number of a byte offset within a text buffer
-        static size_t line_of(const std::string &content, size_t pos)
+        // -------- edit file cache --------
+        // each file's bytes are cached under its canonical key and validated by
+        // (size, mtime) on every access: an external writer is always picked up,
+        // while consecutive edits to the same file never re-read the disk.
+        struct file_cache_entry
         {
-            size_t line = 1;
-            for (size_t i = 0; i < pos && i < content.size(); i++)
-                if (content[i] == '\n')
-                    line++;
-            return line;
+            std::string content;
+            std::filesystem::file_time_type mtime;
+            uintmax_t size = 0;
+        };
+        static std::unordered_map<std::string, file_cache_entry> &file_cache()
+        {
+            static std::unordered_map<std::string, file_cache_entry> c;
+            return c;
+        }
+        static std::mutex &file_cache_mx()
+        {
+            static std::mutex mx;
+            return mx;
+        }
+        static void cache_invalidate(std::string_view path)
+        {
+            std::lock_guard<std::mutex> lk(file_cache_mx());
+            file_cache().erase(read_log_key(path));
         }
         bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false, size_t offset = 0, size_t limit = 0)
         {
@@ -2563,6 +2579,61 @@ namespace cell
             file.write(input.data(), (std::streamsize)input.size());
             return file.good();
         }
+        // current on-disk content of path, served from the cache when the file's
+        // size+mtime are unchanged; false on I/O error (err carries the reason)
+        static bool load_file(std::string_view path, std::string &content, std::string &err)
+        {
+            std::error_code ec;
+            auto mtime = std::filesystem::last_write_time(path, ec);
+            auto size = std::filesystem::file_size(path, ec);
+            if (ec)
+            {
+                err = "file does not exist or is unreadable";
+                return false;
+            }
+            std::string key = read_log_key(path);
+            {
+                std::lock_guard<std::mutex> lk(file_cache_mx());
+                auto it = file_cache().find(key);
+                if (it != file_cache().end() && it->second.mtime == mtime && it->second.size == size)
+                {
+                    content = it->second.content;
+                    return true;
+                }
+            }
+            std::string fresh;
+            if (!read(path, fresh)) // whole-file mode, same 128M-char cap as read
+            {
+                err = "file is too large (over 128M chars) or unreadable";
+                return false;
+            }
+            // re-stat after reading so a writer that raced us cannot seed a
+            // stale cache entry; a failed stat just leaves the cache cold
+            auto mtime2 = std::filesystem::last_write_time(path, ec);
+            auto size2 = std::filesystem::file_size(path, ec);
+            {
+                std::lock_guard<std::mutex> lk(file_cache_mx());
+                if (!ec)
+                    file_cache()[key] = {fresh, mtime2, size2};
+            }
+            content = std::move(fresh);
+            return true;
+        }
+        // persist content and refresh the cache entry under its canonical key
+        static bool store_file(std::string_view path, std::string content, const std::string &key)
+        {
+            if (!write(path, content))
+                return false;
+            std::error_code ec;
+            auto mtime = std::filesystem::last_write_time(path, ec);
+            auto size = std::filesystem::file_size(path, ec);
+            if (!ec)
+            {
+                std::lock_guard<std::mutex> lk(file_cache_mx());
+                file_cache()[key] = {std::move(content), mtime, size};
+            }
+            return true;
+        }
         bool exist(std::string_view path)
         {
             std::error_code ec;
@@ -2571,6 +2642,11 @@ namespace cell
         // create a NEW file only: refuses overwrites and missing parent directories
         bool write_new(std::string_view path, std::string_view input, std::string &output)
         {
+            if (!check_path(path))
+            {
+                output = "write refused: path is blocked by the sandbox (path traversal or sensitive file).";
+                return false;
+            }
             if (exist(path))
             {
                 output = std::format("write refused: {} already exists. To modify an existing file, use the edit tool with a SEARCH/REPLACE block.", std::string(path));
@@ -2582,84 +2658,307 @@ namespace cell
                 output = std::format("write refused: parent directory does not exist: {}. Create it first with exec: mkdir -p {}", parent.string(), parent.string());
                 return false;
             }
-            return write(path, input);
+            if (!write(path, input))
+                return false;
+            // seed the edit cache so a follow-up edit skips re-reading the disk
+            std::error_code ec;
+            auto mtime = std::filesystem::last_write_time(path, ec);
+            auto size = std::filesystem::file_size(path, ec);
+            if (!ec)
+            {
+                std::lock_guard<std::mutex> lk(file_cache_mx());
+                file_cache()[read_log_key(path)] = {std::string(input), mtime, size};
+            }
+            return true;
         }
         bool remove(std::string_view path)
         {
             std::error_code ec;
-            return std::filesystem::remove(path, ec);
+            bool ok = std::filesystem::remove(path, ec);
+            if (ok)
+                cache_invalidate(path);
+            return ok;
         }
         bool mkdir(std::string_view dirpath)
         {
             std::error_code ec;
             return std::filesystem::create_directories(dirpath, ec);
         }
-        // edit a text file with a SEARCH/REPLACE block: the search text must match
-        // exactly once; multiple matches abort with every location reported
-        bool edit(std::string_view path, std::string_view search, std::string_view replace, std::string &output)
+        // edit a text file. modes:
+        //   replace (default) — the unique 'search' block is replaced by 'content'
+        //   insert            — 'content' is inserted right after the unique
+        //                       'search' block, or after line 'from_line' when
+        //                       search is empty
+        //   append            — 'content' is appended at the end of the file
+        //   delete            — the unique 'search' block is removed, or the
+        //                       inclusive line range from_line..to_line when
+        //                       search is empty
+        //   query             — locate 'search' and report every match with line
+        //                       numbers and context; read-only
+        // a non-unique search aborts with every match location reported. the
+        // read-before-edit rule still applies: only lines returned by an earlier
+        // read tool call may be touched.
+        bool edit(std::string_view path, std::string_view mode, std::string_view search,
+                  std::string_view content, size_t from_line, size_t to_line, std::string &output)
         {
-            std::string content;
-            if (!read(path, content))
-                return false;
-            if (search.empty())
+            // only the path field is sandbox-checked: search/content carry code
+            // text that may legally contain ">", "|" or ".."
+            if (!check_path(path))
             {
-                output = "edit failed: SEARCH block is empty. Provide the exact text to replace.";
-                return false;
-            }
-            std::vector<size_t> pos;
-            for (size_t p = content.find(search); p != std::string::npos; p = content.find(search, p + search.size()))
-                pos.push_back(p);
-            if (pos.empty())
-            {
-                output = "edit failed: SEARCH block not found in file. Provide the exact text as it appears (include surrounding context lines if needed).";
+                output = "edit refused: path is blocked by the sandbox (path traversal or sensitive file).";
                 return false;
             }
-            if (pos.size() > 1)
+            std::string file_key = read_log_key(path);
+            std::string buf, err;
+            if (!load_file(path, buf, err))
             {
-                // line start offsets (1-based line n spans [starts[n-1], starts[n]))
-                std::vector<size_t> starts{0};
-                for (size_t i = 0; i < content.size(); i++)
-                    if (content[i] == '\n')
-                        starts.push_back(i + 1);
-                auto line_view = [&](size_t n) -> std::string_view
-                {
-                    if (n < 1 || n > starts.size())
-                        return {};
-                    size_t s = starts[n - 1];
-                    size_t e = n < starts.size() ? starts[n] - 1 : content.size();
-                    return std::string_view(content).substr(s, e - s);
-                };
-                output = std::format("edit aborted: SEARCH block matched {} times — nothing was modified. Make the SEARCH block unique by adding more context lines.\n", pos.size());
+                output = std::format("edit failed: {} ({}).", err, std::string(path));
+                return false;
+            }
+            std::string m;
+            if (mode.empty())
+                m = "replace";
+            else
+            {
+                m = std::string(mode);
+                lower_ascii(m);
+            }
+            if (m != "replace" && m != "insert" && m != "append" && m != "delete" && m != "query")
+            {
+                output = std::format("edit failed: unknown mode '{}'. Supported modes: replace, insert, append, delete, query.", std::string(mode));
+                return false;
+            }
+            // 1-based line table: line n spans byte offsets [starts[n-1], starts[n])
+            std::vector<size_t> starts;
+            starts.reserve(buf.size() / 32 + 1);
+            starts.push_back(0);
+            for (size_t i = 0; i < buf.size(); i++)
+                if (buf[i] == '\n')
+                    starts.push_back(i + 1);
+            // line count: a trailing '\n' does not open a new line
+            size_t nlines = starts.size();
+            if (!buf.empty() && buf.back() == '\n')
+                nlines--;
+            auto line_view = [&](size_t n) -> std::string_view
+            {
+                if (n < 1 || n > starts.size())
+                    return {};
+                size_t s = starts[n - 1];
+                size_t e = n < starts.size() ? starts[n] - 1 : buf.size();
+                return std::string_view(buf).substr(s, e - s);
+            };
+            // byte offset -> 1-based line number (binary search, O(log n))
+            auto line_at = [&](size_t pos) -> size_t
+            {
+                return (size_t)(std::upper_bound(starts.begin(), starts.end(), pos) - starts.begin());
+            };
+            // 1-based lines spanned by the byte range [begin, end) of a block
+            auto span_lines = [&](size_t begin, size_t end) -> std::pair<size_t, size_t>
+            {
+                size_t fl = line_at(begin);
+                size_t ll = fl;
+                end = std::min(end, buf.size());
+                for (size_t i = begin; i < end; i++)
+                    if (buf[i] == '\n')
+                        ll++;
+                if (end > begin && buf[end - 1] == '\n')
+                    ll--;
+                return {fl, ll};
+            };
+            auto coverage_error = [&](size_t fl, size_t ll) -> std::string
+            {
+                return std::format("edit refused: lines {}-{} of {} were not read. Read the file first with the read tool (read the whole file, or at least lines {}-{}) before editing.", fl, ll, std::string(path), fl, ll);
+            };
+            auto require_coverage = [&](size_t fl, size_t ll) -> bool
+            {
+                if (read_covers(path, fl, ll))
+                    return true;
+                output = coverage_error(fl, ll);
+                return false;
+            };
+            auto report_matches = [&](const std::vector<size_t> &pos) -> std::string
+            {
+                std::string o = std::format("SEARCH block matched {} times — nothing was modified. Make the SEARCH block unique by adding more context lines.\n", pos.size());
                 for (size_t k = 0; k < pos.size(); k++)
                 {
-                    size_t line = line_of(content, pos[k]);
+                    size_t line = line_at(pos[k]);
+                    o += std::format("match #{} at line {}:\n", k + 1, line);
+                    if (line >= 2)
+                        o += std::format("  {:>6} | {}\n", line - 1, line_view(line - 1));
+                    o += std::format(">>{:>6} | {}\n", line, line_view(line));
+                    if (line < nlines)
+                        o += std::format("  {:>6} | {}\n", line + 1, line_view(line + 1));
+                }
+                return o;
+            };
+            auto find_unique = [&](std::vector<size_t> &pos) -> bool
+            {
+                pos.clear();
+                for (size_t p = buf.find(search); p != std::string::npos; p = buf.find(search, p + search.size()))
+                    pos.push_back(p);
+                if (pos.empty())
+                {
+                    output = "edit failed: SEARCH block not found in file. Provide the exact text as it appears (include surrounding context lines if needed).";
+                    return false;
+                }
+                if (pos.size() > 1)
+                {
+                    output = "edit aborted: " + report_matches(pos);
+                    return false;
+                }
+                return true;
+            };
+
+            if (m == "query")
+            {
+                if (search.empty())
+                {
+                    output = "edit failed (query): 'search' must not be empty.";
+                    return false;
+                }
+                std::vector<size_t> pos;
+                for (size_t p = buf.find(search); p != std::string::npos; p = buf.find(search, p + search.size()))
+                    pos.push_back(p);
+                if (pos.empty())
+                {
+                    output = "edit (query): SEARCH block not found in file.";
+                    return false;
+                }
+                output = std::format("edit (query): {} match(es) for a {}-char SEARCH block:\n", pos.size(), (long long)search.size());
+                for (size_t k = 0; k < pos.size(); k++)
+                {
+                    size_t line = line_at(pos[k]);
                     output += std::format("match #{} at line {}:\n", k + 1, line);
                     if (line >= 2)
                         output += std::format("  {:>6} | {}\n", line - 1, line_view(line - 1));
                     output += std::format(">>{:>6} | {}\n", line, line_view(line));
-                    if (line < starts.size())
+                    if (line < nlines)
                         output += std::format("  {:>6} | {}\n", line + 1, line_view(line + 1));
                 }
-                return false;
+                return true;
             }
-            // read-before-edit rule: the lines the SEARCH block touches must have
-            // been returned by a previous read tool call, or the edit is refused
-            size_t first_line = line_of(content, pos[0]);
-            size_t last_line = first_line;
-            size_t block_end = pos[0] + search.size();
-            last_line += (size_t)std::count(content.begin() + pos[0],
-                                            content.begin() + std::min(block_end, content.size()), '\n');
-            if (block_end > pos[0] && content[block_end - 1] == '\n')
-                last_line--;
-            if (!read_covers(path, first_line, last_line))
+
+            if (m == "append")
             {
-                output = std::format("edit refused: lines {}-{} of {} were not read. Read the file first with the read tool (read the whole file, or at least lines {}-{}) before editing.", first_line, last_line, std::string(path), first_line, last_line);
+                if (content.empty())
+                {
+                    output = "edit failed (append): 'content' must not be empty.";
+                    return false;
+                }
+                // appending touches the final line, which must have been read
+                size_t last_line = nlines > 0 ? nlines : 1;
+                if (!require_coverage(last_line, last_line))
+                    return false;
+                buf += content;
+                if (!store_file(path, std::move(buf), file_key))
+                {
+                    output = "edit failed: could not write the file.";
+                    return false;
+                }
+                output = std::format("edit ok: appended {} chars at end of file", (long long)content.size());
+                return true;
+            }
+
+            size_t at = std::string::npos; // byte offset of the unique SEARCH block
+            if (!search.empty())
+            {
+                std::vector<size_t> pos;
+                if (!find_unique(pos))
+                    return false;
+                at = pos[0];
+            }
+            if (m == "replace")
+            {
+                if (search.empty())
+                {
+                    output = "edit failed (replace): 'search' must not be empty.";
+                    return false;
+                }
+                auto [first_line, last_line] = span_lines(at, at + search.size());
+                if (!require_coverage(first_line, last_line))
+                    return false;
+                if (content == search)
+                {
+                    // no-op: identical blocks, skip the write entirely
+                    output = std::format("edit ok: SEARCH and REPLACE are identical — no change written ({} chars)", (long long)content.size());
+                    return true;
+                }
+                buf.replace(at, search.size(), content);
+                if (!store_file(path, std::move(buf), file_key))
+                {
+                    output = "edit failed: could not write the file.";
+                    return false;
+                }
+                output = std::format("edit ok: replaced 1 block ({} chars -> {} chars)", (long long)search.size(), (long long)content.size());
+                return true;
+            }
+            if (m == "insert")
+            {
+                size_t ins;
+                size_t anchor_line;
+                if (search.empty())
+                {
+                    if (from_line < 1 || from_line > nlines)
+                    {
+                        output = std::format("edit failed (insert): line {} is out of range (file has {} lines).", from_line, nlines);
+                        return false;
+                    }
+                    // starts[from_line] is the byte right after line from_line's
+                    // '\n' (or EOF when the file ends without a newline)
+                    ins = from_line < starts.size() ? starts[from_line] : buf.size();
+                    anchor_line = from_line;
+                    if (!require_coverage(anchor_line, anchor_line))
+                        return false;
+                }
+                else
+                {
+                    ins = at + search.size();
+                    auto [fl, ll] = span_lines(at, at + search.size());
+                    anchor_line = ll;
+                    if (!require_coverage(fl, ll))
+                        return false;
+                }
+                buf.insert(ins, content);
+                if (!store_file(path, std::move(buf), file_key))
+                {
+                    output = "edit failed: could not write the file.";
+                    return false;
+                }
+                output = std::format("edit ok: inserted {} chars after line {}", (long long)content.size(), anchor_line);
+                return true;
+            }
+            // delete
+            size_t del_begin, del_end; // byte range [del_begin, del_end) to remove
+            size_t first_line, last_line;
+            if (search.empty())
+            {
+                if (from_line < 1 || to_line < from_line || to_line > nlines)
+                {
+                    output = std::format("edit failed (delete): invalid line range {}-{} (file has {} lines).", from_line, to_line, nlines);
+                    return false;
+                }
+                del_begin = starts[from_line - 1];
+                del_end = to_line < starts.size() ? starts[to_line] : buf.size();
+                first_line = from_line;
+                last_line = to_line;
+            }
+            else
+            {
+                del_begin = at;
+                del_end = at + search.size();
+                auto [fl, ll] = span_lines(del_begin, del_end);
+                first_line = fl;
+                last_line = ll;
+            }
+            if (!require_coverage(first_line, last_line))
+                return false;
+            buf.erase(del_begin, del_end - del_begin);
+            if (!store_file(path, std::move(buf), file_key))
+            {
+                output = "edit failed: could not write the file.";
                 return false;
             }
-            content.replace(pos[0], search.size(), replace);
-            if (!write(path, content))
-                return false;
-            output = std::format("edit ok: replaced 1 block ({} chars)", (long long)replace.size());
+            output = std::format("edit ok: deleted {} chars (lines {}-{})", (long long)(del_end - del_begin), first_line, last_line);
             return true;
         }
     } // namespace box
@@ -5071,19 +5370,30 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         });
     add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).",
         {{"path", str_prop("file path")}, {"content", str_prop("text content")}},
-        {"path", "content"}, Policy::Ask,
+        {"path", "content"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
             return cell::box::write_new(j.value("path", ""), j.value("content", ""), out);
         });
-    add("edit", "Modify an existing file with a SEARCH/REPLACE block: find the exact 'search' text and replace it with 'replace'. If the search text matches multiple locations, nothing is modified and every match is reported with line numbers — retry with more surrounding context lines so the search block is unique. No other edit modes are supported. Rule: the file must have been read first — edit is refused for files (or line ranges) that were not returned by a previous read call, so read the whole file or the exact line range before editing.",
+    add("edit", "Modify an existing file. The 'mode' parameter selects the operation (default 'replace'):\n"
+                 "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
+                 "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
+                 "  append  — append 'content' at the end of the file.\n"
+                 "  delete  — delete the unique 'search' text; if 'search' is empty, delete the 1-based inclusive line range 'from'..'to'.\n"
+                 "  query   — locate 'search' and report every match with line numbers and surrounding context; read-only, never modifies.\n"
+                 "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.",
         {{"path", str_prop("file path")},
-         {"search", str_prop("exact text block to find (include enough context to be unique)")},
-         {"replace", str_prop("replacement text block")}},
-        {"path", "search", "replace"}, Policy::Ask,
+         {"mode", str_prop("replace | insert | append | delete | query (default replace)")},
+         {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")},
+         {"content", str_prop("replacement text (replace) or text to insert/append")},
+         {"from", str_prop("1-based line: insert-after line, or delete range start")},
+         {"to", str_prop("1-based inclusive end line for delete range")}},
+        {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::edit(j.value("path", ""), j.value("search", ""), j.value("replace", ""), out);
+            return cell::box::edit(j.value("path", ""), j.value("mode", "replace"),
+                                   j.value("search", ""), j.value("content", ""),
+                                   num_arg(j, "from", 0), num_arg(j, "to", 0), out);
         });
     add("rg", "Search file contents recursively. Skips hidden files/directories (names starting with '.') and paths matched by .gitignore. Returns up to max_results matches grouped by file as 'line: content'. Prefer this when searching by content.",
         {{"pattern", str_prop("regex pattern")},
@@ -5407,26 +5717,54 @@ static int run_selftest()
     std::string edit_out;
     cell::box::reset_read_log();
     expect(cell::box::write("edit_test.txt", "aaa\nbbb\nccc\n"), "edit fixture");
-    expect(!cell::box::edit("edit_test.txt", "bbb", "BBB", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses unread file");
+    expect(!cell::box::edit("edit_test.txt", "replace", "bbb", "BBB", 0, 0, edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses unread file");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "aaa\nbbb\nccc\n", "edit fixture read");
-    expect(cell::box::edit("edit_test.txt", "bbb", "BBB", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit search/replace");
+    expect(cell::box::edit("edit_test.txt", "replace", "bbb", "BBB", 0, 0, edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit search/replace");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "aaa\nBBB\nccc\n", "box::edit result");
     expect(cell::box::write("edit_test.txt", "dup\ndup\n"), "edit ambiguity fixture");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true), "edit ambiguity fixture read");
-    expect(!cell::box::edit("edit_test.txt", "dup", "X", edit_out) && edit_out.find("matched 2") != std::string::npos, "box::edit ambiguity warns");
+    expect(!cell::box::edit("edit_test.txt", "replace", "dup", "X", 0, 0, edit_out) && edit_out.find("matched 2") != std::string::npos, "box::edit ambiguity warns");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "dup\ndup\n", "box::edit no change on ambiguity");
-    expect(!cell::box::edit("edit_test.txt", "nope", "X", edit_out) && edit_out.find("not found") != std::string::npos, "box::edit no-match error");
-    expect(cell::box::edit("edit_test.txt", "dup\ndup", "X\ndup", edit_out), "box::edit multi-line search");
+    expect(!cell::box::edit("edit_test.txt", "replace", "nope", "X", 0, 0, edit_out) && edit_out.find("not found") != std::string::npos, "box::edit no-match error");
+    expect(cell::box::edit("edit_test.txt", "replace", "dup\ndup", "X\ndup", 0, 0, edit_out), "box::edit multi-line search");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "X\ndup\n", "box::edit multi-line result");
     cell::box::reset_read_log();
     expect(cell::box::write("edit_test.txt", "a\nb\nc\nd\n"), "edit range fixture");
     expect(cell::box::read("edit_test.txt", out, 2, 3, true) && out == "b\nc\n", "edit partial read");
-    expect(!cell::box::edit("edit_test.txt", "d", "D", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses lines outside read range");
-    expect(cell::box::edit("edit_test.txt", "c", "C", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows lines inside read range");
+    expect(!cell::box::edit("edit_test.txt", "replace", "d", "D", 0, 0, edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refuses lines outside read range");
+    expect(cell::box::edit("edit_test.txt", "replace", "c", "C", 0, 0, edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows lines inside read range");
     expect(cell::box::read("edit_test.txt", out, 0, 0, true), "edit full read after partial");
-    expect(cell::box::edit("edit_test.txt", "d", "D", edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows after full read");
+    expect(cell::box::edit("edit_test.txt", "replace", "d", "D", 0, 0, edit_out) && edit_out.find("replaced 1 block") != std::string::npos, "box::edit allows after full read");
     cell::box::reset_read_log();
-    expect(!cell::box::edit("edit_test.txt", "a", "A", edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refused after reset_read_log");
+    expect(!cell::box::edit("edit_test.txt", "replace", "a", "A", 0, 0, edit_out) && edit_out.find("refused") != std::string::npos, "box::edit refused after reset_read_log");
+
+    // insert mode: after a unique search block, then after a line number
+    cell::box::reset_read_log();
+    expect(cell::box::write("edit_test.txt", "a\nb\nc\n"), "insert fixture");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true), "insert fixture read");
+    expect(cell::box::edit("edit_test.txt", "insert", "b\n", "B1\nB2\n", 0, 0, edit_out) && edit_out.find("inserted 6 chars") != std::string::npos, "box::edit insert after search");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nb\nB1\nB2\nc\n", "box::edit insert after search result");
+    expect(cell::box::edit("edit_test.txt", "insert", "", "X\n", 2, 0, edit_out) && edit_out.find("inserted 2 chars") != std::string::npos, "box::edit insert after line");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nb\nX\nB1\nB2\nc\n", "box::edit insert after line result");
+
+    // append mode
+    expect(cell::box::edit("edit_test.txt", "append", "", "z\n", 0, 0, edit_out) && edit_out.find("appended 2 chars") != std::string::npos, "box::edit append");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nb\nX\nB1\nB2\nc\nz\n", "box::edit append result");
+
+    // delete mode: unique search block, then a line range
+    expect(cell::box::edit("edit_test.txt", "delete", "B1\n", "", 0, 0, edit_out) && edit_out.find("deleted 3 chars") != std::string::npos, "box::edit delete search");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nb\nX\nB2\nc\nz\n", "box::edit delete search result");
+    expect(cell::box::edit("edit_test.txt", "delete", "", "", 2, 3, edit_out) && edit_out.find("deleted") != std::string::npos, "box::edit delete range");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nB2\nc\nz\n", "box::edit delete range result");
+
+    // query mode: read-only locate with line numbers
+    expect(cell::box::edit("edit_test.txt", "query", "B2", "", 0, 0, edit_out) && edit_out.find("1 match") != std::string::npos && edit_out.find("line 2") != std::string::npos, "box::edit query");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nB2\nc\nz\n", "box::edit query is read-only");
+
+    // unknown mode rejected; identical replace is a no-op (no write)
+    expect(!cell::box::edit("edit_test.txt", "bogus", "a", "b", 0, 0, edit_out) && edit_out.find("unknown mode") != std::string::npos, "box::edit unknown mode");
+    expect(cell::box::edit("edit_test.txt", "replace", "B2", "B2", 0, 0, edit_out) && edit_out.find("no change") != std::string::npos, "box::edit identical replace is a no-op");
+    expect(cell::box::read("edit_test.txt", out, 0, 0, true) && out == "a\nB2\nc\nz\n", "box::edit no-op leaves file untouched");
     expect(cell::box::remove("edit_test.txt"), "edit cleanup");
 
     {
@@ -5455,10 +5793,10 @@ static int run_selftest()
                    tool_list["find"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["ls"]->policy() == cell::tools::Policy::Allow,
                "read-only tool policies are Allow");
-        expect(tool_list["write"]->policy() == cell::tools::Policy::Ask &&
-                   tool_list["edit"]->policy() == cell::tools::Policy::Ask &&
+        expect(tool_list["write"]->policy() == cell::tools::Policy::Allow &&
+                   tool_list["edit"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["exec"]->policy() == cell::tools::Policy::Ask,
-               "mutating tool policies are Ask");
+               "mutating tool policies: write/edit Allow, exec Ask");
         for (auto &d : tool_defs)
             expect(d.contains("name") ? d.contains("description")
                                       : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
@@ -7387,6 +7725,15 @@ int main(int argc, char const *argv[])
                         }
                         else if (it->second->policy() == cell::tools::Policy::Allow)
                         {
+                            // write/edit are Allow but deferred to pass 2: every
+                            // read in the same message must complete first
+                            // (read-before-edit rule) and two edits of one file
+                            // must never race each other
+                            if (res[i].name == "write" || res[i].name == "edit")
+                            {
+                                res[i].policy = "defer"; // sequential, no prompt
+                                continue;
+                            }
                             res[i].policy = "allow";
                             allow_count++;
                             cell::sys::pool().submit([&res, it, i]
@@ -7412,10 +7759,11 @@ int main(int argc, char const *argv[])
                     }
                     if (allow_count)
                         cell::sys::pool().wait_all();
-                    // pass 2: confirm-required tools (exec/write/edit) run sequentially, in order
+                    // pass 2: deferred file mutators (write/edit — no prompt) and
+                    // confirm-required tools (exec) run sequentially, in order
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
-                        if (res[i].policy != "ask" && res[i].policy != "deny")
+                        if (res[i].policy != "defer" && res[i].policy != "ask" && res[i].policy != "deny")
                             continue;
                         auto t0 = cell::sys::detail::clock::now();
                         auto it = tool_list.find(res[i].name);

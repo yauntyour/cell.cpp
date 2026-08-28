@@ -104,14 +104,13 @@ context: loaded 7 message(s) from disk
 | **glob** | 按文件名模式查找文件（如 `**/*.ts`） |
 | **find** | 按元数据筛选文件（名称、修改时间、大小等） |
 | **write** | 创建新文件（不能覆盖已存在的文件） |
-| **edit** | 修改已有文件（通过 SEARCH/REPLACE 块，需确保搜索文本唯一；编辑前必须先 read 过该文件/行） |
+| **edit** | 修改已有文件（多模式：replace 整段/精准替换、insert 插入、append 追加、delete 删除、query 定位查询；编辑前必须先 read 过该文件/行） |
 | **exec** | 执行 shell 命令（默认超时 30 秒，最大 300 秒） |
 
 工具使用规则要点：
-- edit 前必须先读取原内容：edit 只允许修改 read 工具已返回过的文件（或行范围），未读过的文件/行会被拒绝；
+- edit 前必须先读取原内容：edit 只允许修改 read 工具已返回过的文件（或行范围），未读过的文件/行会被拒绝；edit 的 `query` 模式为只读定位，不受此限制；
+- edit 支持 replace / insert / append / delete / query 五种模式：replace 用小段唯一文本做精准替换、多行块做整段替换，insert 在唯一文本（或指定行）之后插入，append 在文件末尾追加，delete 删除唯一文本或行区间，query 定位所有匹配并报告行号与上下文；
 - 使用 write 前需确保父目录已存在（可用 `exec` + `mkdir -p` 创建）；
-- 单次 edit 不得涉及 3 个以上无关联的代码块；
-- 未先读取文件内容时不得连续调用超过 3 次 rg；
 - `exec` 后需根据返回值判断成功与否。
 
 需要我用这些工具做什么？比如继续查看刚才目录里的某个项目？
@@ -469,12 +468,11 @@ During a conversation the model may call one of 8 tools:
 | `rg` | Recursive content search (skips hidden files and `.gitignore` paths, max 500 matches) | read-only, runs automatically |
 | `glob` | Find files by name pattern (e.g. `**/*.test.ts`) | read-only, runs automatically |
 | `find` | Filter files by metadata (name, size, modification time) | read-only, runs automatically |
-| `write` | Create a **new** file (refuses to overwrite; refuses if the parent directory is missing) | confirmation required |
-| `edit` | Modify an existing file via a SEARCH/REPLACE block (ambiguous matches abort with all locations reported). **Requires a prior read**: edits may only touch files/lines returned by an earlier `read` call, otherwise refused | confirmation required |
+| `write` | Create a **new** file (refuses to overwrite; refuses if the parent directory is missing) | runs automatically (path sandbox-checked) |
+| `edit` | Modify an existing file in 5 modes: `replace` (unique SEARCH block → replacement; short snippet for precise tweaks, multi-line block for whole rewrites), `insert` (after a unique text or a line), `append` (end of file), `delete` (unique text or a line range), `query` (read-only locate with line numbers). Ambiguous searches abort with every match reported. **Requires a prior read**: edits may only touch files/lines returned by an earlier `read` call, otherwise refused | runs automatically (path sandbox-checked) |
 | `exec` | Run build/test/git commands (default 30s timeout; result ends with `exitcode=N`) | confirmation required |
 
-Read-only tools run without asking and may execute **concurrently** within one round; `write`,
-`edit` and `exec` run sequentially and show an interactive prompt before every execution:
+Read-only tools run without asking and may execute **concurrently** within one round; `write` and `edit` also run without asking but are executed sequentially (after the concurrent pass, in call order) so edits to the same file never race and same-message reads always complete first. Only `exec` shows an interactive prompt before every execution:
 
 ```
 allow exec({"cmd":"g++ -std=c++26 -O2 -o cell.exe cell.cpp"})? [y/N]
@@ -491,7 +489,7 @@ paths containing `..`, or anything matching the dangerous command deny-list (`fo
 The entire application lives in a single `cell.cpp` file, organized into clean namespaces:
 
 ```
-cell::box      ─ Sandboxed system operations (file I/O, exec, rg, glob, find, SEARCH/REPLACE edit)
+cell::box      ─ Sandboxed system operations (file I/O, exec, rg, glob, find, multi-mode edit)
 cell::net      ─ HTTP networking via libcurl (GET, POST, SSE streaming)
 cell::sys      ─ Console output, logger, exceptions
 cell::config   ─ Configuration persistence (.cell/config.json)
