@@ -27,7 +27,6 @@
 #include <optional>
 #include <concepts>
 #include <csignal>
-#include <generator>
 #include <expected>
 #include <source_location>
 #include <exception>
@@ -606,22 +605,58 @@ namespace cell
     {
         // lazy line views over a text buffer (zero-copy): strips a trailing '\r'
         // from each line, yields string_views into the source. never copies bytes.
-        static std::generator<std::string_view> lines(std::string_view text)
+        class line_range
         {
-            size_t start = 0;
-            while (start < text.size())
+        public:
+            class iterator
             {
-                size_t nl = text.find('\n', start);
-                size_t end = nl == std::string_view::npos ? text.size() : nl;
-                std::string_view line = text.substr(start, end - start);
-                if (!line.empty() && line.back() == '\r')
-                    line.remove_suffix(1);
-                co_yield line;
-                if (nl == std::string_view::npos)
-                    break;
-                start = nl + 1;
-            }
-        }
+            public:
+                using iterator_category = std::input_iterator_tag;
+                using value_type = std::string_view;
+                using difference_type = std::ptrdiff_t;
+                using pointer = const std::string_view *;
+                using reference = std::string_view;
+
+                iterator() = default;
+                explicit iterator(std::string_view text) : text_(text) { advance(); }
+
+                std::string_view operator*() const { return cur_; }
+                iterator &operator++()
+                {
+                    advance();
+                    return *this;
+                }
+                bool operator==(const iterator &o) const { return done_ && o.done_; }
+                bool operator!=(const iterator &o) const { return !(*this == o); }
+
+            private:
+                std::string_view text_;
+                std::string_view cur_;
+                size_t start_ = 0;
+                bool done_ = false;
+                void advance()
+                {
+                    if (start_ >= text_.size())
+                    {
+                        done_ = true;
+                        return;
+                    }
+                    size_t nl = text_.find('\n', start_);
+                    size_t end = nl == std::string_view::npos ? text_.size() : nl;
+                    cur_ = text_.substr(start_, end - start_);
+                    if (!cur_.empty() && cur_.back() == '\r')
+                        cur_.remove_suffix(1);
+                    start_ = nl == std::string_view::npos ? text_.size() : nl + 1;
+                }
+            };
+            explicit line_range(std::string_view text) : text_(text) {}
+            iterator begin() const { return iterator(text_); }
+            iterator end() const { return iterator(); }
+
+        private:
+            std::string_view text_;
+        };
+        static line_range lines(std::string_view text) { return line_range(text); }
         // trim ASCII whitespace from both ends (copies only on demand)
         static std::string trim(std::string_view s)
         {
@@ -2045,37 +2080,86 @@ namespace cell
         // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
         // path, is_directory) for every non-hidden entry, one level at a time, in
         // sorted order. consumers break out of the range-for to stop early.
-        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
+        // (hand-rolled iterator: the termux toolchain lacks std::generator)
+        class walk_range
         {
-            struct frame
+        public:
+            struct entry
             {
-                std::vector<std::filesystem::directory_entry> entries;
-                size_t i = 0;
-                std::string prefix;
+                std::filesystem::path path;
+                std::string rel;
+                bool is_dir;
             };
-            std::error_code ec;
-            std::vector<frame> stack;
-            stack.push_back({collect_entries(root_path, ec), 0, ""});
-            while (!stack.empty())
+            class iterator
             {
-                frame &top = stack.back();
-                if (top.i >= top.entries.size())
+            public:
+                using iterator_category = std::input_iterator_tag;
+                using value_type = entry;
+                using difference_type = std::ptrdiff_t;
+                using pointer = const entry *;
+                using reference = const entry &;
+
+                iterator() = default;
+                explicit iterator(const std::filesystem::path &root_path)
                 {
-                    stack.pop_back();
-                    continue;
+                    std::error_code ec;
+                    stack_.push_back({collect_entries(root_path, ec), 0, ""});
+                    advance();
                 }
-                const auto &e = top.entries[top.i++];
-                std::string name = e.path().filename().string();
-                if (name.empty() || name.front() == '.')
-                    continue; // hidden entries are skipped everywhere
-                std::string rel = top.prefix.empty() ? name : (top.prefix + "/" + name);
-                std::error_code ec2;
-                bool is_dir = e.is_directory(ec2);
-                co_yield std::tuple{e.path(), rel, is_dir};
-                if (is_dir)
-                    stack.push_back({collect_entries(e.path(), ec), 0, rel});
-            }
-        }
+
+                const entry &operator*() const { return cur_; }
+                iterator &operator++()
+                {
+                    advance();
+                    return *this;
+                }
+                bool operator==(const iterator &o) const { return done_ && o.done_; }
+                bool operator!=(const iterator &o) const { return !(*this == o); }
+
+            private:
+                struct frame
+                {
+                    std::vector<std::filesystem::directory_entry> entries;
+                    size_t i = 0;
+                    std::string prefix;
+                };
+                std::vector<frame> stack_;
+                entry cur_;
+                bool done_ = false;
+                void advance()
+                {
+                    std::error_code ec;
+                    while (!stack_.empty())
+                    {
+                        frame &top = stack_.back();
+                        if (top.i >= top.entries.size())
+                        {
+                            stack_.pop_back();
+                            continue;
+                        }
+                        const auto &e = top.entries[top.i++];
+                        std::string name = e.path().filename().string();
+                        if (name.empty() || name.front() == '.')
+                            continue; // hidden entries are skipped everywhere
+                        std::string rel = top.prefix.empty() ? name : (top.prefix + "/" + name);
+                        std::error_code ec2;
+                        bool is_dir = e.is_directory(ec2);
+                        cur_ = {e.path(), std::move(rel), is_dir};
+                        if (is_dir)
+                            stack_.push_back({collect_entries(e.path(), ec), 0, cur_.rel});
+                        return;
+                    }
+                    done_ = true;
+                }
+            };
+            explicit walk_range(std::filesystem::path root) : root_(std::move(root)) {}
+            iterator begin() const { return iterator(root_); }
+            iterator end() const { return iterator(); }
+
+        private:
+            std::filesystem::path root_;
+        };
+        static walk_range walk_entries(const std::filesystem::path &root_path) { return walk_range(root_path); }
         // recursive content search: skips hidden entries and .gitignore'd paths,
         // caps at max_results, groups matches per file as "line: content"
         bool rg(std::string_view pattern, std::string_view root_path, size_t max_results, std::string &output)
@@ -4449,31 +4533,70 @@ namespace cell
             }
             return std::string::npos;
         }
-        // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
-        static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
+        // lazy SSE parser: yields parsed JSON events without copying line bytes
+        // (hand-rolled iterator: the termux toolchain lacks std::generator)
+        class sse_range
         {
-            std::string_view payload;
-            size_t pos = consumed;
-            while (true)
+        public:
+            class iterator
             {
-                size_t next = sse_next_payload(buf, pos, payload);
-                if (next == std::string::npos)
-                    co_return;
-                pos = next;
-                consumed = next;
-                nlohmann::json j;
-                try
+            public:
+                using iterator_category = std::input_iterator_tag;
+                using value_type = nlohmann::json;
+                using difference_type = std::ptrdiff_t;
+                using pointer = const nlohmann::json *;
+                using reference = const nlohmann::json &;
+
+                iterator() = default;
+                iterator(const std::string &buf, size_t &consumed) : buf_(&buf), consumed_(&consumed), pos_(consumed) { advance(); }
+
+                const nlohmann::json &operator*() const { return cur_; }
+                iterator &operator++()
                 {
-                    j = nlohmann::json::parse(payload);
+                    advance();
+                    return *this;
                 }
-                catch (const std::exception &)
+                bool operator==(const iterator &o) const { return done_ && o.done_; }
+                bool operator!=(const iterator &o) const { return !(*this == o); }
+
+            private:
+                const std::string *buf_ = nullptr;
+                size_t *consumed_ = nullptr;
+                size_t pos_ = 0;
+                nlohmann::json cur_;
+                bool done_ = false;
+                void advance()
                 {
+                    std::string_view payload;
+                    size_t next = sse_next_payload(*buf_, pos_, payload);
+                    if (next == std::string::npos)
+                    {
+                        done_ = true;
+                        return;
+                    }
+                    pos_ = next;
+                    *consumed_ = next;
+                    try
+                    {
+                        cur_ = nlohmann::json::parse(payload);
+                    }
+                    catch (const std::exception &)
+                    {
+                        cur_ = nlohmann::json::object();
+                    }
+                    if (!cur_.is_object())
+                        cur_ = nlohmann::json::object();
                 }
-                if (!j.is_object())
-                    j = nlohmann::json::object();
-                co_yield j;
-            }
-        }
+            };
+            sse_range(const std::string &buf, size_t &consumed) : buf_(buf), consumed_(consumed) {}
+            iterator begin() const { return iterator(buf_, consumed_); }
+            iterator end() const { return iterator(); }
+
+        private:
+            const std::string &buf_;
+            size_t &consumed_;
+        };
+        static sse_range sse_events(const std::string &buf, size_t &consumed) { return sse_range(buf, consumed); }
         // incremental SSE consumer: append a chunk, deliver complete events to on_event via the
         // zero-copy offset cursor, and compact the buffer only after a large prefix has been
         // consumed (avoids an O(n) erase per chunk).
