@@ -42,6 +42,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>
 #include <termios.h>
 #endif
 
@@ -508,11 +509,11 @@ namespace cell
         static bool sodium_ready = false;
         if (!sodium_ready)
             sodium_ready = sodium_init() != -1;
-        unsigned char digest[crypto_hash_sha3256_BYTES];
-        crypto_hash_sha3256(digest, (const unsigned char *)s.data(), s.size());
+        unsigned char digest[crypto_hash_sha256_BYTES];
+        crypto_hash_sha256(digest, (const unsigned char *)s.data(), s.size());
         std::string out;
-        out.reserve(crypto_hash_sha3256_BYTES * 2);
-        for (size_t i = 0; i < crypto_hash_sha3256_BYTES; i++)
+        out.reserve(crypto_hash_sha256_BYTES * 2);
+        for (size_t i = 0; i < crypto_hash_sha256_BYTES; i++)
             out += std::format("{:02x}", digest[i]);
         out.resize(16);
         cached_wd = std::move(wd);
@@ -1387,9 +1388,9 @@ namespace cell
             {
                 for (const char *sep : {"/", "\\"})
                 {
-                    if (!root_s.empty() && lower.find(root_s + sep + t) != std::string::npos)
+                    if (!root_s.empty() && lower.find(root_s + sep + std::string(t)) != std::string::npos)
                         return true;
-                    if (!root_name.empty() && lower.find(root_name + sep + t) != std::string::npos)
+                    if (!root_name.empty() && lower.find(root_name + sep + std::string(t)) != std::string::npos)
                         return true;
                 }
             }
