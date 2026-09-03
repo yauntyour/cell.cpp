@@ -6525,7 +6525,7 @@ int main(int argc, char const *argv[])
     else
         log.info("boot", std::format("providers=0 active=none session={} skills={} prompt_chars={}",
                                      s->id(), skills_all.size(), cfg.system_prompt.size()));
-    cell::sys::println("cell: session={} model={} sandbox={}{}{}", s->id(), cfg.model_label(),
+    cell::sys::println("cell: cwd={} session={} model={} sandbox={}{}{}", cell::workdir().string(), s->id(), cfg.model_label(),
                        cell::box::mode_name(cell::box::sandbox_mode()),
                        cfg.think ? " think=on" : "", cfg.tools ? "" : " tools=off");
     if (cfg.providers.empty())
@@ -6736,7 +6736,7 @@ int main(int argc, char const *argv[])
                     s = &h.now();
                     ensure_prompt(s);
                     log.info("sess", std::format("new id={} previous={} kept=true", s->id(), old_id));
-                    cell::sys::println("new session: {}", s->id());
+                    cell::sys::println("new session: {} cwd={}", s->id(), cell::workdir().string());
                     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
                         probe_provider(*p);
                     continue;
@@ -7148,7 +7148,7 @@ int main(int argc, char const *argv[])
                             h.forget_current();
                             s = &h.now();
                             ensure_prompt(s);
-                            cell::sys::println("session deleted: {} (usage stats removed); new session: {}", target, s->id());
+                            cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, s->id(), cell::workdir().string());
                         }
                         else
                             cell::sys::println("session deleted: {} (usage stats removed)", target);
@@ -7188,7 +7188,7 @@ int main(int argc, char const *argv[])
                     s = &h.now();
                     ensure_prompt(s);
                     log.info("sess", std::format("switched to={} msgs={} previous={}", target, s->msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
-                    cell::sys::println("switched to session {} ({} message(s))", s->id(), s->msg().size());
+                    cell::sys::println("switched to session {} cwd={} ({} message(s))", s->id(), cell::workdir().string(), s->msg().size());
                     continue;
                 }
                 if (cmd == "/usages")
