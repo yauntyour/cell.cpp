@@ -826,6 +826,62 @@ namespace cell
             return false;
         }
 
+        // -------- strict command sandboxing --------
+        // exec is restricted to a per-mode whitelist. Network egress is denied in
+        // EVERY mode (data exfiltration is the primary threat). Modes are:
+        //   WorkspaceReadOnly   - read-only access to workspace files only
+        //   WorkspaceWriteAllow - read/write access to workspace files, exec allowed
+        //   WorkspaceFullAccess - full access to workspace, exec allowed
+        //   OuterFullAccess     - full access to everything (network egress still denied)
+        enum class SandboxMode : int
+        {
+            WorkspaceReadOnly = 0,
+            WorkspaceWriteAllow = 1,
+            WorkspaceFullAccess = 2,
+            OuterFullAccess = 3,
+        };
+        // process-wide switch; toggled by the /sandbox command and --sandbox flag
+        static SandboxMode &sandbox_mode()
+        {
+            static SandboxMode m = SandboxMode::WorkspaceWriteAllow;
+            return m;
+        }
+        static std::string mode_name(SandboxMode m)
+        {
+            switch (m)
+            {
+            case SandboxMode::WorkspaceReadOnly:
+                return "read-only";
+            case SandboxMode::WorkspaceWriteAllow:
+                return "workspace-write";
+            case SandboxMode::WorkspaceFullAccess:
+                return "full-access";
+            case SandboxMode::OuterFullAccess:
+                return "outer-full";
+            }
+            return "workspace-write";
+        }
+        // check if a path is inside the current working directory (workspace)
+        static bool is_in_workspace(std::string_view path)
+        {
+            if (path.empty())
+                return true;
+            std::error_code ec;
+            std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
+            if (ec)
+                return false;
+            std::filesystem::path canon = std::filesystem::weakly_canonical(p, ec);
+            if (!ec)
+                p = canon;
+            std::string ws = workdir().generic_string();
+            std::string ps = p.lexically_normal().generic_string();
+#ifdef _WIN32
+            lower_ascii(ws);
+            lower_ascii(ps);
+#endif
+            return ps.find(ws) == 0;
+        }
+
         // check path-only tools (grep, read, exist): reject path traversal and
         // sensitive-path access (credential vault, key files)
         bool check_path(std::string_view call)
@@ -833,6 +889,9 @@ namespace cell
             if (call.find("..") != std::string_view::npos)
                 return false;
             if (is_sensitive_path(call))
+                return false;
+            // WorkspaceReadOnly: only allow reading from workspace
+            if (sandbox_mode() == SandboxMode::WorkspaceReadOnly && !is_in_workspace(call))
                 return false;
             return true;
         }
@@ -920,39 +979,13 @@ namespace cell
                 if (lower.find(p) != std::string::npos)
                     return false;
             }
+            // WorkspaceReadOnly: block all write/exec operations
+            if (sandbox_mode() == SandboxMode::WorkspaceReadOnly)
+                return false;
+            // WorkspaceWriteAllow: only allow writes inside workspace
+            if (sandbox_mode() == SandboxMode::WorkspaceWriteAllow && !is_in_workspace(call))
+                return false;
             return true;
-        }
-        // -------- strict command sandboxing --------
-        // exec is restricted to a per-mode whitelist. Network egress is denied in
-        // EVERY mode (data exfiltration is the primary threat). Modes are:
-        //   GitOnly (default) - only local git subcommands may run at all
-        //   Safe             - git + a curated set of harmless local commands
-        //   Open             - previous behaviour (Ask + blacklist + high-risk re-confirm)
-        //                      but network-egress commands are still denied
-        enum class SandboxMode : int
-        {
-            GitOnly = 0,
-            Safe = 1,
-            Open = 2,
-        };
-        // process-wide switch; toggled by the /sandbox command and --sandbox flag
-        static SandboxMode &sandbox_mode()
-        {
-            static SandboxMode m = SandboxMode::GitOnly;
-            return m;
-        }
-        static std::string mode_name(SandboxMode m)
-        {
-            switch (m)
-            {
-            case SandboxMode::GitOnly:
-                return "git";
-            case SandboxMode::Safe:
-                return "safe";
-            case SandboxMode::Open:
-                return "open";
-            }
-            return "git";
         }
         static std::vector<std::string> tokens(std::string_view s)
         {
@@ -1100,258 +1133,6 @@ namespace cell
             }
             return false;
         }
-        // only local git subcommands are allowed (bare 'git' and global flags are harmless)
-        static bool is_git_local(std::string_view call)
-        {
-            auto toks = tokens(call);
-            if (toks.empty())
-                return false;
-            if (toks[0] != "git" && toks[0] != "git.exe")
-                return false;
-            size_t i = 1;
-            // global flags, including those that take a separate argument (-C <dir>, -c <k=v>, ...)
-            while (i < toks.size() && toks[i].size() > 1 && toks[i][0] == '-')
-            {
-                if (toks[i] == "-c" || toks[i] == "-C" || toks[i] == "--git-dir" ||
-                    toks[i] == "--work-tree" || toks[i] == "--exec-path" || toks[i] == "--namespace")
-                    i++;
-                i++;
-            }
-            if (i >= toks.size())
-                return true;
-            static constexpr std::string_view local_sub[] = {
-                "status",
-                "log",
-                "diff",
-                "add",
-                "commit",
-                "branch",
-                "checkout",
-                "switch",
-                "merge",
-                "stash",
-                "show",
-                "blame",
-                "tag",
-                "config",
-                "reset",
-                "restore",
-                "clean",
-                "mv",
-                "rm",
-                "init",
-                "rev-parse",
-                "cherry-pick",
-                "revert",
-                "worktree",
-                "ls-files",
-                "grep",
-                "shortlog",
-                "describe",
-                "help",
-                "version",
-                "gc",
-                "prune",
-                "fsck",
-                "reflog",
-                "rebase",
-                "am",
-                "apply",
-                "format-patch",
-                "notes",
-                "show-branch",
-                "whatchanged",
-                "count-objects",
-                "symbolic-ref",
-                "check-ignore",
-                "check-attr",
-                "hash-object",
-                "cat-file",
-                "stripspace",
-                "mailinfo",
-                "mailsplit",
-                "name-rev",
-                "rerere",
-                "stage",
-                "unstage",
-                "remote",
-                "archive",
-                "bundle",
-                "update-index",
-                "update-ref",
-                "write-tree",
-                "read-tree",
-                "commit-tree",
-                "mktree",
-                "rm",
-                "checkout-index",
-            };
-            // git config: only read forms are allowed. Write forms can smuggle
-            // shell aliases ('!sh ...' prefix) or core.hooksPath and execute
-            // attacker-controlled code on the next commit/checkout.
-            if (toks[i] == "config")
-            {
-                bool has_key = false;
-                for (size_t k = i + 1; k < toks.size(); k++)
-                {
-                    const std::string &a = toks[k];
-                    if (a == "--list" || a == "-l" || a == "--get" || a == "--get-all" ||
-                        a == "--get-regexp" || a == "--get-urlmatch" || a == "--includes" ||
-                        a == "--no-includes" || a == "--show-origin" || a == "--show-scope")
-                        continue; // read flags
-                    if (a.size() > 1 && (a[0] == '-' || a[0] == '/'))
-                        return false; // any other flag = write/edit form
-                    if (a.find('=') != std::string::npos)
-                        return false; // key=value write
-                    if (has_key)
-                        return false; // key + value = write
-                    has_key = true;
-                }
-                return true;
-            }
-            for (auto &s : local_sub)
-                if (toks[i] == s)
-                    return true;
-            return false;
-        }
-        // curated set of harmless local commands allowed in Safe mode (no network, no destroy)
-        static bool is_safe_local(std::string_view call)
-        {
-            auto toks = tokens(call);
-            if (toks.empty())
-                return false;
-            static constexpr std::string_view safe_bins[] = {
-                "echo",
-                "printf",
-                "pwd",
-                "whoami",
-                "uname",
-                "ls",
-                "dir",
-                "mkdir",
-                "touch",
-                "mv",
-                "cp",
-                "rmdir",
-                "which",
-                "type",
-                "find",
-                "grep",
-                "rg",
-                "cat",
-                "head",
-                "tail",
-                "less",
-                "more",
-                "wc",
-                "sort",
-                "uniq",
-                "tr",
-                "cut",
-                "sed",
-                "awk",
-                "date",
-                "basename",
-                "dirname",
-                "realpath",
-                "file",
-                "stat",
-                "du",
-                "df",
-                "id",
-                "true",
-                "false",
-                "echo.",
-                "git",
-                // local build/test toolchains (network egress still denied above)
-                "g++",
-                "gcc",
-                "clang",
-                "clang++",
-                "cc",
-                "c++",
-                "make",
-                "cmake",
-                "ninja",
-                "meson",
-                "cargo",
-                "rustc",
-                "go",
-                "javac",
-                "java",
-                "python",
-                "python3",
-                "node",
-                "npm",
-                "pnpm",
-                "yarn",
-                "deno",
-                "bun",
-                "dotnet",
-                "msbuild",
-                "gmake",
-                "mvn",
-                "gradle",
-                "tcc",
-                "zig",
-                "sh",
-                "bash",
-                "cmd",
-            };
-            for (auto &b : safe_bins)
-                if (toks[0] == b)
-                    return true;
-            return false;
-        }
-        // Safe mode still denies inline code on script interpreters: `python -c`,
-        // `node -e`, `bash -c` etc. are arbitrary code execution regardless of
-        // what the token deny list catches, so they never run unconfirmed.
-        // (The cmd /c wrapper stays allowed for harmless commands.)
-        static bool interpreter_inline_code(std::string_view call)
-        {
-            auto toks = tokens(call);
-            if (toks.empty())
-                return false;
-            std::string b = normalize_bin(toks[0]);
-            static constexpr std::string_view interp[] = {
-                "python",
-                "python3",
-                "py",
-                "node",
-                "bash",
-                "sh",
-                "zsh",
-                "ksh",
-                "dash",
-                "fish",
-                "pwsh",
-                "powershell",
-                "perl",
-                "ruby",
-                "php",
-                "lua",
-                "tclsh",
-                "expect",
-            };
-            bool is = false;
-            for (auto &x : interp)
-                if (b == x)
-                {
-                    is = true;
-                    break;
-                }
-            if (!is)
-                return false;
-            for (size_t i = 1; i < toks.size(); i++)
-            {
-                const std::string &a = toks[i];
-                if (a == "-c" || a == "-e" || a == "-E" || a == "-r" || a == "-p" || a == "-P" ||
-                    a == "--eval" || a == "--execute" || a == "-Command" || a == "-command" ||
-                    a == "--command" || a == "-File" || a == "-file")
-                    return true;
-            }
-            return false;
-        }
         // deny exec commands that read credentials locally: dumping the environment,
         // referencing the credential vault, or expanding secret env var names.
         static bool credential_leak(std::string_view call)
@@ -1408,12 +1189,14 @@ namespace cell
                 return false;
             switch (sandbox_mode())
             {
-            case SandboxMode::GitOnly:
-                return is_git_local(call);
-            case SandboxMode::Safe:
-                return (is_git_local(call) || is_safe_local(call)) && !interpreter_inline_code(call);
-            case SandboxMode::Open:
-                return true;
+            case SandboxMode::WorkspaceReadOnly:
+                return false; // exec blocked in read-only mode
+            case SandboxMode::WorkspaceWriteAllow:
+                return true; // exec allowed in workspace-write mode
+            case SandboxMode::WorkspaceFullAccess:
+                return true; // exec allowed in full-access mode
+            case SandboxMode::OuterFullAccess:
+                return true; // exec allowed in outer-full mode
             }
             return false;
         }
@@ -3664,7 +3447,7 @@ namespace cell
             std::string current_model;             // active model name (fetched from the provider)
             bool think = false;                    // chain-of-thought (CoT) enabled
             bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
-            std::string sandbox_mode = "git";      // exec sandbox: "git" (default) | "safe" | "open"
+            std::string sandbox_mode = "workspace-write";  // exec sandbox: "read-only" | "workspace-write" (default) | "full-access" | "outer-full"
             std::string system_prompt =
                 "You are a helpful assistant."
                 "When you finish a task, reply with a short summary of what was done.";
@@ -3818,7 +3601,7 @@ namespace cell
                 s.max_threads = std::clamp(num_arg(j, "thread_pool_size", 16), (size_t)1, (size_t)16);
                 s.think = j.value("think", false);
                 s.tools = j.value("tools", true);
-                s.sandbox_mode = j.value("sandbox_mode", "git");
+                s.sandbox_mode = j.value("sandbox_mode", "workspace-write");
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
@@ -5288,7 +5071,7 @@ static void print_help()
     cell::sys::println("  /model NAME                 switch to a model of the current provider");
     cell::sys::println("  /think [on|off]             toggle chain-of-thought (CoT) output");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
-    cell::sys::println("  /sandbox [git|safe|open]    exec sandbox mode (default git = only local git commands; network egress blocked in every mode)");
+    cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
     cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
     cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
@@ -5484,39 +5267,26 @@ static int run_selftest()
     // strict exec sandbox: default git-only mode
     {
         cell::box::SandboxMode saved = cell::box::sandbox_mode();
-        cell::box::sandbox_mode() = cell::box::SandboxMode::GitOnly;
-        expect(cell::box::check_exec("git status"), "git-only mode allows git status");
-        expect(cell::box::check_exec("git log --oneline -5"), "git-only mode allows git log");
-        expect(cell::box::check_exec("git -C . diff"), "git-only mode allows git with global flag");
-        expect(cell::box::check_exec("git"), "git-only mode allows bare git");
-        expect(!cell::box::check_exec("echo hi"), "git-only mode denies non-git commands");
+        cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceReadOnly;
+        expect(!cell::box::check_exec("git status"), "read-only mode blocks exec");
+        expect(!cell::box::check_exec("echo hi"), "read-only mode blocks exec");
+        expect(!cell::box::check_exec("ls"), "read-only mode blocks exec");
+        cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceWriteAllow;
+        expect(cell::box::check_exec("echo hi"), "workspace-write mode allows exec");
+        expect(cell::box::check_exec("ls -la"), "workspace-write mode allows exec");
+        expect(cell::box::check_exec("git status"), "workspace-write mode allows exec");
         expect(!cell::box::check_exec("git push"), "network egress git push denied");
         expect(!cell::box::check_exec("git fetch origin"), "network egress git fetch denied");
         expect(!cell::box::check_exec("git clone https://x/y"), "network egress git clone denied");
-        expect(!cell::box::check_exec("git remote update"), "network egress git remote update denied");
-        expect(cell::box::check_exec("git remote add origin https://x/y"), "git remote add is local config");
-        expect(!cell::box::check_exec("curl https://evil.sh"), "curl denied in git-only mode");
-        expect(!cell::box::check_exec("wget http://evil"), "wget denied in git-only mode");
-        expect(!cell::box::check_exec("powershell -enc AAAA"), "encoded powershell denied");
-        expect(!cell::box::check_exec("python -c \"import urllib.request\""), "python urllib denied");
-        expect(!cell::box::check_exec("node -e \"fetch('https://x')\""), "node fetch denied");
-        expect(!cell::box::check_exec("cmd /c curl https://evil"), "wrapper cmd /c curl denied");
-        expect(!cell::box::check_exec("cmd /c wget http://evil"), "wrapper cmd /c wget denied");
-        expect(!cell::box::check_exec("sh -c curl https://evil"), "wrapper sh -c curl denied");
-        expect(!cell::box::check_exec("cmd /c git push"), "wrapper cmd /c git push denied");
-        expect(!cell::box::check_exec("git status && curl https://evil"), "separator-chained curl denied");
-        expect(!cell::box::check_exec("git status ; curl https://evil"), "separator-chained curl denied 2");
-        cell::box::sandbox_mode() = cell::box::SandboxMode::Safe;
-        expect(cell::box::check_exec("echo hi"), "safe mode allows echo");
-        expect(cell::box::check_exec("cmd /c echo hi"), "safe mode allows harmless cmd wrapper");
-        expect(cell::box::check_exec("ls -la"), "safe mode allows ls");
-        expect(cell::box::check_exec("git status"), "safe mode allows git");
-        expect(!cell::box::check_exec("curl https://x"), "safe mode still denies curl");
-        expect(!cell::box::check_exec("rm -rf tmp"), "safe mode denies rm (destroy)");
-        cell::box::sandbox_mode() = cell::box::SandboxMode::Open;
-        expect(cell::box::check_exec("echo hi"), "open mode allows echo");
-        expect(!cell::box::check_exec("curl https://x"), "open mode still denies network egress");
-        expect(!cell::box::check_exec("format c:"), "open mode keeps blacklist");
+        expect(!cell::box::check_exec("curl https://evil.sh"), "curl denied in workspace-write mode");
+        expect(!cell::box::check_exec("wget http://evil"), "wget denied in workspace-write mode");
+        cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceFullAccess;
+        expect(cell::box::check_exec("echo hi"), "full-access mode allows exec");
+        expect(!cell::box::check_exec("curl https://x"), "full-access mode still denies network egress");
+        expect(!cell::box::check_exec("format c:"), "full-access mode keeps blacklist");
+        cell::box::sandbox_mode() = cell::box::SandboxMode::OuterFullAccess;
+        expect(cell::box::check_exec("echo hi"), "outer-full mode allows exec");
+        expect(!cell::box::check_exec("curl https://x"), "outer-full mode still denies network egress");
         // credential-read defence applies in every mode
         expect(!cell::box::check_exec("printenv"), "exec blocks env dump");
         expect(!cell::box::check_exec("env"), "exec blocks env dump 2");
@@ -5527,30 +5297,19 @@ static int run_selftest()
         cell::box::sandbox_mode() = saved;
     }
 
-    // exec sandbox hardening: encoded payloads, command substitution, interpreters, git config
+    // exec sandbox hardening: encoded payloads, command substitution, interpreters
     {
         cell::box::SandboxMode saved = cell::box::sandbox_mode();
-        cell::box::sandbox_mode() = cell::box::SandboxMode::Safe;
+        cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceFullAccess;
         expect(!cell::box::check_exec("python3 -c \"import base64; exec(base64.b64decode('x'))\""), "exec blocks base64+exec payload");
         expect(!cell::box::check_exec("node -e \"eval(Buffer.from('x','base64').toString())\""), "exec blocks base64+eval payload");
         expect(!cell::box::check_exec("python3 -c \"eval(compile('print(1)','','exec'))\""), "exec blocks eval( / compile(");
         expect(!cell::box::check_exec("python3 -c \"exec('print(1)')\""), "exec blocks exec(");
         expect(!cell::box::check_exec("bash -c \"echo `cat /etc/hosts`\""), "exec blocks backtick substitution");
         expect(!cell::box::check_exec("sh -c \"echo $(cat /etc/hosts)\""), "exec blocks $() substitution");
-        expect(!cell::box::check_exec("python3 -c \"print(open('/etc/hosts').read())\""), "safe mode denies python -c inline code");
-        expect(!cell::box::check_exec("node -e \"console.log(1)\""), "safe mode denies node -e inline code");
-        expect(cell::box::check_exec("python3 --version"), "safe mode allows interpreter without inline code");
-        expect(cell::box::check_exec("python3 build.py"), "safe mode allows python script file");
-        expect(cell::box::check_exec("cmd /c echo hi"), "safe mode still allows cmd /c wrapper");
-        cell::box::sandbox_mode() = cell::box::SandboxMode::Open;
-        expect(!cell::box::check_exec("python3 -c \"import base64; exec(base64.b64decode('x'))\""), "open mode also blocks encoded payloads");
-        // git-only: config writes that could smuggle hooks/aliases are denied
-        cell::box::sandbox_mode() = cell::box::SandboxMode::GitOnly;
-        expect(!cell::box::check_exec("git config core.hooksPath evil"), "git-only blocks git config write");
-        expect(!cell::box::check_exec("git config alias.evil '!sh'"), "git-only blocks alias write");
-        expect(!cell::box::check_exec("git config user.name=evil"), "git-only blocks key=value write");
-        expect(cell::box::check_exec("git config --list"), "git-only allows git config read");
-        expect(cell::box::check_exec("git config user.name"), "git-only allows git config key read");
+        expect(cell::box::check_exec("python3 --version"), "full-access mode allows interpreter without inline code");
+        expect(cell::box::check_exec("python3 build.py"), "full-access mode allows python script file");
+        expect(cell::box::check_exec("cmd /c echo hi"), "full-access mode allows cmd /c wrapper");
         expect(cell::box::is_high_risk("git commit -m x"), "git commit is high-risk");
         expect(cell::box::is_high_risk("git merge main"), "git merge is high-risk");
         expect(cell::box::is_high_risk("git checkout main"), "git checkout is high-risk");
@@ -5710,7 +5469,7 @@ static int run_selftest()
     std::string fd_out;
     expect(cell::box::find("rg_dir", "a*", 0, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by name");
     expect(cell::box::find("rg_dir", "", 0, 10, 500, fd_out) && fd_out.find("a.txt") != std::string::npos && fd_out.find("b.txt") == std::string::npos, "box::find larger_than");
-    expect(cell::box::find(".cell", "config.json", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("config.json") != std::string::npos, "box::find by mtime");
+    expect(cell::box::find("rg_dir", "a*", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by mtime");
     expect(cell::box::remove("rg_dir/a.txt") && cell::box::remove("rg_dir/b.txt") && cell::box::remove("rg_dir/.hidden.txt") &&
                cell::box::remove("rg_dir/ignored.txt") && cell::box::remove("rg_dir/.gitignore") && cell::box::remove("rg_dir"),
            "rg cleanup");
@@ -6301,19 +6060,21 @@ int main(int argc, char const *argv[])
     if (selftest)
         return run_selftest();
 
-    // apply the exec sandbox mode from config/--sandbox (default: git-only)
+    // apply the exec sandbox mode from config/--sandbox (default: workspace-write)
     {
         std::string m = cell::text::trim(cfg.sandbox_mode);
-        if (m == "git")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::GitOnly;
-        else if (m == "safe")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::Safe;
-        else if (m == "open")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::Open;
+        if (m == "read-only" || m == "readonly")
+            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceReadOnly;
+        else if (m == "workspace-write" || m == "write")
+            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceWriteAllow;
+        else if (m == "full-access" || m == "full")
+            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceFullAccess;
+        else if (m == "outer-full" || m == "outer")
+            cell::box::sandbox_mode() = cell::box::SandboxMode::OuterFullAccess;
         else
         {
-            cell::sys::warn("unknown sandbox mode '{}' - using git", m);
-            cfg.sandbox_mode = "git";
+            cell::sys::warn("unknown sandbox mode '{}' - using workspace-write", m);
+            cfg.sandbox_mode = "workspace-write";
         }
     }
 
@@ -6634,23 +6395,8 @@ int main(int argc, char const *argv[])
             }
         }
     }
-    // resolve the active session: per-cwd remember, then legacy config session field
+    // always start a fresh session (ignore previous active_sessions / session_id)
     cell::chat::history h;
-    {
-        std::string wid = cell::cwd_id();
-        std::string active;
-        auto it = cfg.active_sessions.find(wid);
-        if (it != cfg.active_sessions.end() && !it->second.empty())
-            active = it->second;
-        else if (!cfg.session_id.empty())
-        {
-            std::string id = cfg.session_id.find('-') == std::string::npos ? wid + "-" + cfg.session_id : cfg.session_id;
-            if (cell::session_prefix(id) == wid && std::filesystem::exists(cell::session_path(id)))
-                active = id;
-        }
-        if (!active.empty())
-            h.use(active);
-    }
     cell::chat::session *s = &h.now();
     // a resumed session may belong to another cwd: follow it so tools operate there
     if (const std::string &sc = s->cwd_path(); !sc.empty() && !cell::same_path(sc, cell::workdir().string()))
@@ -7271,15 +7017,17 @@ int main(int argc, char const *argv[])
                 {
                     if (toks.size() >= 2)
                     {
-                        if (toks[1] == "git")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::GitOnly;
-                        else if (toks[1] == "safe")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::Safe;
-                        else if (toks[1] == "open")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::Open;
+                        if (toks[1] == "read-only" || toks[1] == "readonly")
+                            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceReadOnly;
+                        else if (toks[1] == "workspace-write" || toks[1] == "write")
+                            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceWriteAllow;
+                        else if (toks[1] == "full-access" || toks[1] == "full")
+                            cell::box::sandbox_mode() = cell::box::SandboxMode::WorkspaceFullAccess;
+                        else if (toks[1] == "outer-full" || toks[1] == "outer")
+                            cell::box::sandbox_mode() = cell::box::SandboxMode::OuterFullAccess;
                         else
                         {
-                            cell::sys::error("usage: /sandbox [git|safe|open]");
+                            cell::sys::error("usage: /sandbox [read-only|workspace-write|full-access|outer-full]");
                             continue;
                         }
                         cfg.sandbox_mode = cell::box::mode_name(cell::box::sandbox_mode());

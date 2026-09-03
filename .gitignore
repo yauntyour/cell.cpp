@@ -2,4 +2,4 @@ etc
 .vscode
 *.exe
 *cell
-workspace
+bin
