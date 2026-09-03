@@ -25,7 +25,7 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 | 🔧 | **8 Built-in Tools** | `ls`, `read`, `write`, `edit`, `rg`, `exec`, `glob`, `find` |
 | 🔒 | **Encrypted Vault** | libsodium-based credential storage with secure memory handling |
 | 💬 | **Session Persistence** | Chat history saved and restored across sessions |
-| 🛡️ | **Security Sandbox** | Blocks dangerous commands (`rm -rf`, `shutdown`, path traversal...) |
+| 🛡️ | **Security Sandbox** | Three access modes (`read-only` / `workspace-write` / `full-access`) plus dangerous-path and dangerous-command blocks |
 | 🎨 | **Colored Output** | ANSI escape codes with Windows Virtual Terminal support |
 | ⚡ | **Agent Loop** | Up to 8 rounds of tool calls per user message |
 | 🧠 | **Chain of Thought** | `/think` streams reasoning output (OpenAI `reasoning_content` / Anthropic `thinking`) |
@@ -152,6 +152,7 @@ usage: cell [options]
 | `--key` | API key | none | Never stored in plaintext — encrypted with libsodium into `.cell/.crypt` |
 | `--session` | session ID | last used session | Resumes chat history from `.cell/sessions/<ID>.json` |
 | `--system` | prompt text | built-in coding-agent prompt | Replaces the system prompt entirely |
+| `--sandbox` | `read-only` \| `workspace-write` \| `full-access` | `workspace-write` | Sandbox access mode: how much of the machine tools may reach |
 | `--no-color` | flag (no value) | off | Disables ANSI colors in log output |
 | `--verbose` | flag (no value) | off | Also prints DEBUG-level logs to the console (DEBUG logs always go to the log file) |
 | `--selftest` | flag (no value) | off | Runs the built-in test suite instead of entering the chat |
@@ -282,6 +283,7 @@ sent to the model.
 | `/model NAME` | Switch to a model of the current provider |
 | `/think [on\|off]` | Toggle chain-of-thought (CoT) output |
 | `/tool [on\|off]` | Toggle tool calls (off = plain chat, no tools sent to the model) |
+| `/sandbox [mode]` | Switch the sandbox access mode (`read-only` / `workspace-write` / `full-access`) |
 | `/sessions` | List saved sessions |
 | `/session ID` | Switch to another saved session |
 | `/usages` | Show per-model and per-session usage statistics |
@@ -480,9 +482,33 @@ allow exec({"cmd":"g++ -std=c++26 -O2 -o cell.exe cell.cpp"})? [y/N]
 
 Answer `y` or `Y` to allow; anything else (including plain Enter) rejects that call.
 High-risk commands (`rm -rf`, `chmod`, `chown`, `del /s`, ...) pass the sandbox but demand a
-**second** confirmation. Before execution, every tool's arguments also pass a sandbox check:
-paths containing `..`, or anything matching the dangerous command deny-list (`format`, `shutdown`,
-`taskkill`, ...) are rejected outright.
+**second** confirmation.
+
+##### Sandbox Access Modes
+
+`/sandbox [mode]` or `--sandbox MODE` picks how much of the machine the tools may reach.
+The choice is persisted in `config.json` under `sandbox_mode`.
+
+| Mode | `write` / `edit` | `exec` | Network egress (`curl`, `wget`, `git push`...) |
+|---|---|---|---|
+| `read-only` | refused (except `edit` in `query` mode, which never writes) | refused entirely | refused |
+| `workspace-write` (default) | allowed inside the current working directory only | allowed | refused |
+| `full-access` | allowed anywhere | allowed | allowed |
+
+Two floors hold in **every** mode:
+
+- **Dangerous paths** — `..` traversal, the `.cell` runtime directory (vault, keys, config,
+  sessions, logs) and well-known credential stores (`~/.ssh/id_*`, `~/.aws/credentials`,
+  `~/.netrc`, `~/.git-credentials`, `~/.docker/config.json`, ...) stay unreachable. Symlinks are
+  resolved first, so a link pointing at one of those is blocked too.
+- **Dangerous commands** — the deny-list (`format`, `mkfs`, `fdisk`, `diskpart`, `shutdown`,
+  `reboot`, `taskkill`, `reg delete`, `net user`, `icacls`, `takeown`, `dd if=`, fork bombs,
+  `eval`/`exec(`/`compile(`, base64 payloads, `powershell -enc`) plus shell pipelines, `>`
+  redirects, backtick substitution and `$(...)` command substitution are rejected outright.
+
+Reading credentials is also denied in every mode: dumping the environment (`env`, `printenv`,
+`cmd /c set`) or expanding a secret variable name (`$OPENAI_API_KEY`, `$CELL_MASTERKEY`, ...)
+never runs.
 
 ## Architecture
 

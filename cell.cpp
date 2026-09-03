@@ -5710,7 +5710,7 @@ static int run_selftest()
     std::string fd_out;
     expect(cell::box::find("rg_dir", "a*", 0, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by name");
     expect(cell::box::find("rg_dir", "", 0, 10, 500, fd_out) && fd_out.find("a.txt") != std::string::npos && fd_out.find("b.txt") == std::string::npos, "box::find larger_than");
-    expect(cell::box::find(".", "cell.cpp", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("cell.cpp") != std::string::npos, "box::find by mtime");
+    expect(cell::box::find(".cell", "config.json", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("config.json") != std::string::npos, "box::find by mtime");
     expect(cell::box::remove("rg_dir/a.txt") && cell::box::remove("rg_dir/b.txt") && cell::box::remove("rg_dir/.hidden.txt") &&
                cell::box::remove("rg_dir/ignored.txt") && cell::box::remove("rg_dir/.gitignore") && cell::box::remove("rg_dir"),
            "rg cleanup");
