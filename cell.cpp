@@ -7517,12 +7517,13 @@ llm_start:
                     }
                     return u->cancelled ? 1 : 0;
                 };
-                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries
+                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries (attempt resets on success)
                 constexpr int kMaxRetries = 5;
                 constexpr double kRetryDelaySec = 5.0;
                 bool ok = false;
                 std::string err;
-                for (int attempt = 0; attempt < kMaxRetries; attempt++)
+                int attempt = 0;
+                while (attempt < kMaxRetries)
                 {
                     if (attempt > 0)
                     {
@@ -7647,7 +7648,8 @@ llm_start:
                     }
                     if (ok)
                     {
-                        // success: log and break out of retry loop
+                        // success: reset attempt count and break out of retry loop
+                        attempt = 0;
                         double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
                         double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
                         log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={} attempts={}",
@@ -7663,6 +7665,7 @@ llm_start:
                     if (attempt < kMaxRetries - 1)
                     {
                         log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
+                        attempt++;
                     }
                     else
                     {
