@@ -3410,17 +3410,31 @@ namespace cell
         // (GET {base}/models or {base}/v1/models) and only the active model name is kept.
         struct provider_entry
         {
-            std::string name;             // unique id, e.g. "openai", "claude", "deepseek"
-            std::string style = "openai"; // "openai" | "anthropic"
-            std::string base;             // api base url
-            std::string key_id;           // vault map key for the api key (optional)
-            std::string proxy;            // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+            std::string name;                      // unique id, e.g. "openai", "claude", "deepseek"
+            std::string style = "openai";          // "openai" | "anthropic" (legacy, kept for backward compat)
+            std::string api_style;                 // "openai-chat" | "openai-responses" | "anthropic" (derived from style if empty)
+            std::string base;                      // api base url
+            std::string key_id;                    // vault map key for the api key (optional)
+            std::string proxy;                     // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+
+            // derive api_style from legacy style field; called after construction when api_style is not set
+            void normalize_api_style()
+            {
+                if (api_style == "openai-chat" || api_style == "openai-responses" || api_style == "anthropic")
+                    return;
+                // legacy style field: "openai" -> "openai-chat", "anthropic" -> "anthropic"
+                if (style == "anthropic")
+                    api_style = "anthropic";
+                else
+                    api_style = "openai-chat";
+            }
 
             nlohmann::json to_json() const
             {
                 nlohmann::json j;
                 j["name"] = name;
                 j["style"] = style;
+                j["api_style"] = api_style;
                 if (!base.empty())
                     j["base"] = base;
                 if (!key_id.empty())
@@ -3434,9 +3448,12 @@ namespace cell
                 provider_entry e;
                 e.name = j.value("name", "");
                 e.style = j.value("style", "openai");
+                e.api_style = j.value("api_style", "");
                 e.base = j.value("base", "");
                 e.key_id = j.value("key", "");
                 e.proxy = j.value("proxy", "");
+                if (e.api_style.empty())
+                    e.normalize_api_style();
                 return e;
             }
         };
@@ -3576,6 +3593,7 @@ namespace cell
                             e.base = mj.value("base", "");
                             e.key_id = mj.value("key", "");
                             e.proxy = mj.value("proxy", "");
+                            e.normalize_api_style();
                             legacy.push_back({std::move(e), mj.value("model", "")});
                         }
                         if (cur >= legacy.size())
@@ -3618,6 +3636,7 @@ namespace cell
                         e.base = j.value("base", "");
                         e.key_id = j.value("key", "");
                         e.proxy = j.value("proxy", "");
+                        e.normalize_api_style();
                         e.name = unique_name(s, e.style);
                         s.providers.push_back(std::move(e));
                         s.current_provider = s.providers.back().name;
@@ -4541,6 +4560,319 @@ namespace cell
                 return ok;
             }
         };
+
+        // OpenAI Responses API client: POST {base}/v1/responses
+        // Handles the newer Responses API format with typed input/output items.
+        class OpenAIResponses
+        {
+        private:
+            const std::string api_base;
+            std::string proxy_;
+            CURL *curl = curl_easy_init();
+
+            static std::vector<std::string> headers(const encrypt::secure_string &api_key)
+            {
+                std::string auth = "Authorization: Bearer ";
+                auth.append(api_key.data(), api_key.size());
+                return {"Content-Type: application/json", std::move(auth)};
+            }
+
+            // convert Chat Completions messages to Responses API input items + extract instructions
+            static std::pair<nlohmann::json, std::string> convert_input(const nlohmann::json &messages)
+            {
+                nlohmann::json input = nlohmann::json::array();
+                std::string instructions;
+                for (auto &m : messages)
+                {
+                    std::string role = m.value("role", "");
+                    if (role == "system")
+                    {
+                        // collect system messages into instructions
+                        if (m.contains("content") && m["content"].is_string())
+                        {
+                            if (!instructions.empty())
+                                instructions += "\n";
+                            instructions += m["content"].get<std::string>();
+                        }
+                        continue;
+                    }
+                    if (role == "user")
+                    {
+                        nlohmann::json item;
+                        item["role"] = "user";
+                        if (m.contains("content") && m["content"].is_string())
+                            item["content"] = {{{"type", "input_text"}, {"text", m["content"]}}};
+                        else if (m.contains("content") && m["content"].is_array())
+                        {
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (auto &b : m["content"])
+                            {
+                                if (b.is_object() && b.value("type", "") == "text")
+                                    arr.push_back({{"type", "input_text"}, {"text", b.value("text", "")}});
+                                else
+                                    arr.push_back(b); // pass through other content types
+                            }
+                            item["content"] = std::move(arr);
+                        }
+                        input.push_back(std::move(item));
+                    }
+                    else if (role == "assistant")
+                    {
+                        nlohmann::json item;
+                        item["role"] = "assistant";
+                        if (m.contains("content") && m["content"].is_string())
+                            item["content"] = {{{"type", "output_text"}, {"text", m["content"]}}};
+                        else if (m.contains("content") && m["content"].is_array())
+                        {
+                            // reasoning model format: array of {type:"reasoning",...} and {type:"text",...}
+                            nlohmann::json arr = nlohmann::json::array();
+                            for (auto &b : m["content"])
+                            {
+                                std::string bt = b.value("type", "");
+                                if (bt == "text" && b.contains("text"))
+                                    arr.push_back({{"type", "output_text"}, {"text", b["text"]}});
+                                else if (bt == "reasoning")
+                                    continue; // reasoning items are not passed back in input
+                                else
+                                    arr.push_back(b);
+                            }
+                            item["content"] = std::move(arr);
+                        }
+                        if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                        {
+                            // tool_calls become function_call items in the input
+                            nlohmann::json content = item.contains("content") ? item["content"] : nlohmann::json::array();
+                            for (auto &tc : m["tool_calls"])
+                            {
+                                nlohmann::json fc;
+                                fc["type"] = "function_call";
+                                fc["name"] = tc.value("function", nlohmann::json()).value("name", "");
+                                fc["arguments"] = tc.value("function", nlohmann::json()).value("arguments", "");
+                                fc["call_id"] = tc.value("id", "");
+                                content.push_back(std::move(fc));
+                            }
+                            item["content"] = std::move(content);
+                        }
+                        input.push_back(std::move(item));
+                    }
+                    else if (role == "tool")
+                    {
+                        // tool result -> function_call_output
+                        nlohmann::json item;
+                        item["role"] = "user";
+                        nlohmann::json content = nlohmann::json::array();
+                        nlohmann::json output;
+                        output["type"] = "function_call_output";
+                        output["call_id"] = m.value("tool_call_id", "");
+                        output["output"] = m.contains("content") && m["content"].is_string() ? m["content"] : "";
+                        content.push_back(std::move(output));
+                        item["content"] = std::move(content);
+                        input.push_back(std::move(item));
+                    }
+                }
+                return {std::move(input), instructions};
+            }
+
+            // build request body for Responses API
+            static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
+            {
+                auto [input, instructions] = convert_input(messages);
+                nlohmann::json b;
+                b["model"] = model;
+                b["input"] = std::move(input);
+                if (!instructions.empty())
+                    b["instructions"] = std::move(instructions);
+                if (tools.is_array() && !tools.empty())
+                    b["tools"] = tools;
+                b["stream"] = stream;
+                if (stream)
+                    b["stream_options"] = {{"include_usage", true}};
+                return b;
+            }
+
+            // convert Responses API output items to Chat Completions-compatible reply + tool_calls
+            static void parse_output(const nlohmann::json &resp, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage)
+            {
+                reply["role"] = "assistant";
+                tool_calls = nlohmann::json::array();
+                if (resp.contains("usage") && resp["usage"].is_object())
+                    usage = resp["usage"];
+                if (!resp.contains("output") || !resp["output"].is_array())
+                    return;
+                nlohmann::json content = nlohmann::json::array();
+                for (auto &item : resp["output"])
+                {
+                    std::string type = item.value("type", "");
+                    if (type == "message")
+                    {
+                        if (item.contains("content") && item["content"].is_array())
+                        {
+                            for (auto &c : item["content"])
+                            {
+                                std::string ct = c.value("type", "");
+                                if (ct == "output_text")
+                                    content.push_back({{"type", "text"}, {"text", c.value("text", "")}});
+                                else
+                                    content.push_back(c);
+                            }
+                        }
+                    }
+                    else if (type == "function_call")
+                    {
+                        nlohmann::json tc;
+                        tc["id"] = item.value("call_id", "");
+                        tc["type"] = "function";
+                        tc["function"]["name"] = item.value("name", "");
+                        tc["function"]["arguments"] = item.value("arguments", "");
+                        tool_calls.push_back(std::move(tc));
+                    }
+                }
+                if (content.size() == 1 && content[0].value("type", "") == "text")
+                    reply["content"] = content[0]["text"];
+                else if (!content.empty())
+                    reply["content"] = std::move(content);
+                else
+                    reply["content"] = nullptr;
+                if (!tool_calls.empty())
+                    reply["tool_calls"] = tool_calls;
+            }
+
+        public:
+            OpenAIResponses(const std::string &api_base) : api_base(api_base) {}
+            ~OpenAIResponses() { curl_easy_cleanup(curl); }
+            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
+
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
+            {
+                tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
+                std::string buf;
+                std::string url = api_base + "/responses";
+                std::vector<std::string> hdrs = headers(api_key);
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(), buf, hdrs, &err, proxy_.c_str());
+                for (auto &h : hdrs)
+                    encrypt::wipe(h);
+                if (!ok)
+                    return false;
+                try
+                {
+                    auto j = nlohmann::json::parse(buf);
+                    parse_output(j, reply, tool_calls, usage);
+                    return true;
+                }
+                catch (const std::exception &e)
+                {
+                    err = std::format("response parse error: {}", e.what());
+                    return false;
+                }
+            }
+
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            {
+                (void)on_reason; // Responses API uses encrypted reasoning, not plaintext deltas
+                tool_calls = nlohmann::json::array();
+                usage = nlohmann::json::object();
+                std::string text;
+                std::string sse_buf;
+                size_t sse_base = 0;
+                // track function_call deltas by call_id
+                std::unordered_map<std::string, std::string> func_call_args;
+                std::unordered_map<std::string, std::string> func_call_names;
+                std::string url = api_base + "/responses";
+                net::StreamCallback cb = [&](std::span<const char> data)
+                {
+                    auto handle = [&](const nlohmann::json &ev)
+                    {
+                        std::string type = ev.value("type", "");
+                        if (type == "response.completed" && ev.contains("response"))
+                        {
+                            auto &resp = ev["response"];
+                            if (resp.contains("usage") && resp["usage"].is_object())
+                                usage = resp["usage"];
+                        }
+                        else if (type == "response.output_text.delta")
+                        {
+                            if (ev.contains("delta") && ev["delta"].is_string())
+                            {
+                                const std::string &t = ev["delta"].get_ref<const std::string &>();
+                                text.append(t);
+                                on_token(std::span<const char>(t));
+                            }
+                        }
+                        else if (type == "response.function_call_arguments.delta")
+                        {
+                            if (ev.contains("call_id") && ev["call_id"].is_string())
+                            {
+                                std::string call_id = ev["call_id"].get_ref<const std::string &>();
+                                if (ev.contains("delta") && ev["delta"].is_string())
+                                    func_call_args[call_id] += ev["delta"].get_ref<const std::string &>();
+                            }
+                        }
+                        else if (type == "response.function_call_arguments.done")
+                        {
+                            if (ev.contains("call_id") && ev["call_id"].is_string())
+                            {
+                                std::string call_id = ev["call_id"].get_ref<const std::string &>();
+                                if (ev.contains("arguments") && ev["arguments"].is_string())
+                                    func_call_args[call_id] = ev["arguments"].get_ref<const std::string &>();
+                            }
+                        }
+                        else if (type == "response.completed" && ev.contains("response"))
+                        {
+                            // extract function_call names from the completed response
+                            auto &resp = ev["response"];
+                            if (resp.contains("output") && resp["output"].is_array())
+                            {
+                                for (auto &item : resp["output"])
+                                {
+                                    if (item.value("type", "") == "function_call")
+                                    {
+                                        std::string cid = item.value("call_id", "");
+                                        func_call_names[cid] = item.value("name", "");
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    sse_feed(sse_buf, sse_base, data, handle);
+                };
+                std::vector<std::string> hdrs = headers(api_key);
+                long http = 0;
+                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
+                for (auto &h : hdrs)
+                    encrypt::wipe(h);
+                if (ok && http >= 400)
+                {
+                    ok = false;
+                    sse_finish(sse_buf, sse_base);
+                    err = net::error_message(sse_buf);
+                    if (err.empty())
+                        err = std::format("HTTP error {}", http);
+                }
+                if (!ok && err.empty())
+                    err = "stream request failed";
+                // assemble the reply in Chat Completions-compatible format
+                reply["role"] = "assistant";
+                if (text.empty() && func_call_args.empty())
+                    reply["content"] = nullptr;
+                else
+                    reply["content"] = text;
+                // assemble tool_calls from accumulated deltas
+                for (auto &[call_id, args] : func_call_args)
+                {
+                    nlohmann::json tc;
+                    tc["id"] = call_id;
+                    tc["type"] = "function";
+                    tc["function"]["name"] = func_call_names.count(call_id) ? func_call_names[call_id] : "";
+                    tc["function"]["arguments"] = args;
+                    tool_calls.push_back(std::move(tc));
+                }
+                if (!tool_calls.empty())
+                    reply["tool_calls"] = tool_calls;
+                return ok;
+            }
+        };
+
         class Anthropic
         {
         private:
@@ -5185,12 +5517,13 @@ static void print_help()
     cell::sys::println("commands:");
     cell::sys::println("  /provides                   list configured providers");
     cell::sys::println("  /provide NAME               select a provider (persistent across sessions)");
-    cell::sys::println("  /provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]   add a provider (openai|anthropic API style)");
+    cell::sys::println("  /provide add openai:URL [api_style:openai-chat|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]   add a provider");
     cell::sys::println("  /provide rm NAME            delete a provider (removes its stored key too)");
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
+    cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 api_style:openai-responses key:sk-xxx");
     cell::sys::println("  /models                     fetch the model list from the current provider");
     cell::sys::println("  /model NAME                 switch to a model of the current provider");
-    cell::sys::println("  /think [off|low|med|high|max]  cycle or set chain-of-thought level (default off)");
+    cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
     cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands (full-access only)");
@@ -5222,7 +5555,7 @@ static bool json_args(const std::string &in, nlohmann::json &j)
     }
 }
 
-static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic)
+static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false)
 {
     using cell::tools::Policy;
     std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> list;
@@ -5258,7 +5591,9 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                                                       }
                                                                   });
         nlohmann::json schema = {{"type", "object"}, {"properties", props}, {"required", required}};
-        if (anthropic)
+        if (responses_api)
+            defs.push_back({{"type", "function"}, {"name", name}, {"description", desc}, {"parameters", schema}});
+        else if (anthropic)
             defs.push_back({{"name", name}, {"description", desc}, {"input_schema", schema}});
         else
             defs.push_back({{"type", "function"}, {"function", {{"name", name}, {"description", desc}, {"parameters", schema}}}});
@@ -5933,12 +6268,14 @@ static int run_selftest()
     cell::config::provider_entry a;
     a.name = "openai";
     a.style = "openai";
+    a.api_style = "openai-chat";
     a.base = "http://x/v1";
     a.key_id = "k1";
     a.proxy = "http://user:pass@p:8080";
     cell::config::provider_entry b;
     b.name = "claude";
     b.style = "anthropic";
+    b.api_style = "anthropic";
     b.base = "http://y";
     cfg.providers = {a, b};
     cfg.current_provider = "claude";
@@ -5957,6 +6294,8 @@ static int run_selftest()
     expect(cfg_res.has_value() && cfg_res->think_level == 2, "config think_level roundtrip");
     expect(cfg_res.has_value() && !cfg_res->tools, "config tools roundtrip");
     expect(cfg_res.has_value() && cfg_res->providers[0].name == "openai" && cfg_res->providers[0].style == "openai", "config provider fields");
+    expect(cfg_res.has_value() && cfg_res->providers[0].api_style == "openai-chat", "config api_style roundtrip");
+    expect(cfg_res.has_value() && cfg_res->providers[1].api_style == "anthropic", "config api_style anthropic");
     expect(cfg_res.has_value() && cfg_res->providers[0].proxy == "http://user:pass@p:8080", "config proxy roundtrip");
     expect(cfg_res.has_value() && cfg_res->providers[1].proxy.empty(), "config proxy default empty");
     expect(cfg_res.has_value() && cfg_res->model_label() == "claude:m2", "config model_label");
@@ -5964,6 +6303,7 @@ static int run_selftest()
     cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
     auto legacy_res = cell::config::load();
     expect(legacy_res.has_value() && legacy_res->providers.size() == 1 && legacy_res->providers[0].style == "anthropic" && legacy_res->providers[0].name == "anthropic", "config legacy flat load");
+    expect(legacy_res.has_value() && legacy_res->providers[0].api_style == "anthropic", "config legacy api_style derived");
     expect(legacy_res.has_value() && legacy_res->current_model == "legacy", "config legacy current model");
     expect(legacy_res.has_value() && legacy_res->session_id == "s1", "config legacy session");
     cell::box::write((cell::root / "config.json").string(), "{\"models\":[{\"provider\":\"openai\",\"model\":\"m1\",\"base\":\"http://a\"},{\"provider\":\"anthropic\",\"model\":\"m2\",\"base\":\"http://b\"}],\"current_model\":1}");
@@ -6263,6 +6603,7 @@ int main(int argc, char const *argv[])
             cell::config::provider_entry ne;
             ne.name = provider_arg;
             ne.style = provider_arg; // "openai" | "anthropic" style, matched by name
+            ne.normalize_api_style();
             cfg.providers.push_back(std::move(ne));
             cfg.current_provider = provider_arg;
         }
@@ -6283,6 +6624,7 @@ int main(int argc, char const *argv[])
             cell::config::provider_entry ne;
             ne.name = "openai";
             ne.style = "openai";
+            ne.api_style = "openai-chat";
             ne.base = base_arg;
             ne.proxy = proxy_arg;
             cfg.providers.push_back(std::move(ne));
@@ -6301,17 +6643,20 @@ int main(int argc, char const *argv[])
         }
     }
 
-    // tool definitions for both API styles
+    // tool definitions for all API styles
     auto tools_o = build_tools(false);
     auto tools_a = build_tools(true);
+    auto tools_r = build_tools(false, true); // Responses API format
     auto &tool_list = tools_o.first;
     const nlohmann::json &tool_defs_openai = tools_o.second;
     const nlohmann::json &tool_defs_anthropic = tools_a.second;
+    const nlohmann::json &tool_defs_responses = tools_r.second;
 
     // per-(provider, base) client cache
     struct client_cache
     {
         std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAI>> openai;
+        std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAIResponses>> openai_responses;
         std::unordered_map<std::string, std::unique_ptr<cell::llm::Anthropic>> anthropic;
         cell::llm::OpenAI &o(const std::string &base)
         {
@@ -6324,6 +6669,19 @@ int main(int argc, char const *argv[])
             cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai base={}", base));
             auto &p = openai[base];
             p = std::make_unique<cell::llm::OpenAI>(base);
+            return *p;
+        }
+        cell::llm::OpenAIResponses &r(const std::string &base)
+        {
+            auto it = openai_responses.find(base);
+            if (it != openai_responses.end())
+            {
+                cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=openai-responses base={}", base));
+                return *it->second;
+            }
+            cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai-responses base={}", base));
+            auto &p = openai_responses[base];
+            p = std::make_unique<cell::llm::OpenAIResponses>(base);
             return *p;
         }
         cell::llm::Anthropic &a(const std::string &base)
@@ -6349,7 +6707,7 @@ int main(int argc, char const *argv[])
             if (!k.empty())
                 return k;
         }
-        const char *env = std::getenv(p.style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+        const char *env = std::getenv(p.api_style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
         if (env && *env)
             return cell::encrypt::secure_string(env);
         return vault.get("api_key");
@@ -6363,17 +6721,27 @@ int main(int argc, char const *argv[])
                        bool with_tools = true, int think_level = 0,
                        cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
-        bool ap = p.style == "anthropic";
         nlohmann::json no_tools = nlohmann::json::array();
-        const nlohmann::json &tools = with_tools ? (ap ? tool_defs_anthropic : tool_defs_openai) : no_tools;
-        if (ap)
+        if (p.api_style == "anthropic")
         {
+            const nlohmann::json &tools = with_tools ? tool_defs_anthropic : no_tools;
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
                 return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data);
             return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level);
         }
+        if (p.api_style == "openai-responses")
+        {
+            const nlohmann::json &tools = with_tools ? tool_defs_responses : no_tools;
+            auto &client = cache.r(p.base);
+            client.set_proxy(p.proxy);
+            if (stream)
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data);
+            return client.chat(key, model, msgs, tools, reply, tc, usage, err);
+        }
+        // default: openai-chat (Chat Completions)
+        const nlohmann::json &tools = with_tools ? tool_defs_openai : no_tools;
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
@@ -6611,9 +6979,9 @@ int main(int argc, char const *argv[])
         out.clear();
         err.clear();
         cell::encrypt::secure_string key = resolve_key(p);
-        std::string url = p.base + (p.style == "anthropic" ? "/v1/models" : "/models");
+        std::string url = p.base + (p.api_style == "anthropic" ? "/v1/models" : "/models");
         std::vector<std::string> hdrs;
-        if (p.style == "anthropic")
+        if (p.api_style == "anthropic")
             hdrs = {"x-api-key: " + std::string(key.data(), key.size()), "anthropic-version: 2023-06-01"};
         else
             hdrs = {"Authorization: Bearer " + std::string(key.data(), key.size())};
@@ -6714,9 +7082,10 @@ int main(int argc, char const *argv[])
             auto &p = cfg.providers[i];
             bool cur = (p.name == cfg.current_provider) || (cfg.current_provider.empty() && i == 0);
             cell::sys::println("  [{}] {}{}", i, p.name, cur ? "  <current>" : "");
-            cell::sys::println("       style: {}", p.style);
+            cell::sys::println("       style:     {}", p.style);
+            cell::sys::println("       api_style: {}", p.api_style);
             if (!p.base.empty())
-                cell::sys::println("       base:  {}", p.base);
+                cell::sys::println("       base:      {}", p.base);
             if (!p.proxy.empty())
                 cell::sys::println("       proxy: {}", p.proxy);
             if (!p.key_id.empty())
@@ -6990,11 +7359,11 @@ int main(int argc, char const *argv[])
                     {
                         if (toks.size() < 3)
                         {
-                            cell::sys::error("usage: /provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]");
+                            cell::sys::error("usage: /provide add openai:URL [api_style:openai-chat|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]");
                             continue;
                         }
                         std::string style, base;
-                        std::string name_arg, new_key, new_proxy;
+                        std::string name_arg, new_key, new_proxy, new_api_style;
                         size_t ti = 2;
                         // parse "style:URL" (tolerant spaced form "style: URL" also accepted)
                         std::string t = toks[ti];
@@ -7002,7 +7371,7 @@ int main(int argc, char const *argv[])
                         if (colon != std::string::npos && colon > 0)
                         {
                             std::string s = t.substr(0, colon);
-                            if (s == "openai" || s == "anthropic")
+                            if (s == "openai" || s == "anthropic" || s == "openai-responses")
                             {
                                 style = s;
                                 if (colon + 1 < t.size())
@@ -7014,7 +7383,7 @@ int main(int argc, char const *argv[])
                         }
                         if (style.empty())
                         {
-                            cell::sys::error("usage: /provide add openai:URL | anthropic:URL (the prefix selects the API style)");
+                            cell::sys::error("usage: /provide add openai:URL | anthropic:URL | openai-responses:URL (the prefix selects the API style)");
                             continue;
                         }
                         for (; ti < toks.size(); ti++)
@@ -7026,6 +7395,8 @@ int main(int argc, char const *argv[])
                                 new_proxy = tt.size() > 6 ? tt.substr(6) : (ti + 1 < toks.size() ? toks[++ti] : "");
                             else if (tt.rfind("name:", 0) == 0)
                                 name_arg = tt.size() > 5 ? tt.substr(5) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                            else if (tt.rfind("api_style:", 0) == 0)
+                                new_api_style = tt.size() > 10 ? tt.substr(10) : (ti + 1 < toks.size() ? toks[++ti] : "");
                             else
                                 cell::sys::warn("ignoring token: {}", tt);
                         }
@@ -7047,6 +7418,15 @@ int main(int argc, char const *argv[])
                         cell::config::provider_entry ne;
                         ne.name = name;
                         ne.style = style;
+                        // derive api_style from prefix or explicit parameter
+                        if (!new_api_style.empty())
+                            ne.api_style = new_api_style;
+                        else if (style == "anthropic")
+                            ne.api_style = "anthropic";
+                        else if (style == "openai-responses")
+                            ne.api_style = "openai-responses";
+                        else
+                            ne.api_style = "openai-chat";
                         ne.base = base;
                         ne.proxy = new_proxy;
                         if (!new_key.empty())
@@ -7065,8 +7445,9 @@ int main(int argc, char const *argv[])
                                                          reg.proxy.empty() ? "(none)" : reg.proxy,
                                                          reg.key_id.empty() ? "none" : "stored"));
                         cell::sys::println("provider added: {}", reg.name);
-                        cell::sys::println("       style: {}", reg.style);
-                        cell::sys::println("       base:  {}", reg.base);
+                        cell::sys::println("       style:     {}", reg.style);
+                        cell::sys::println("       api_style: {}", reg.api_style);
+                        cell::sys::println("       base:      {}", reg.base);
                         cell::sys::println("       proxy: {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
                         cell::sys::println("       key:   {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
                         std::vector<std::string> models;
@@ -7163,11 +7544,9 @@ int main(int argc, char const *argv[])
                             continue;
                         }
                         cfg.think_level = level;
+                        cell::config::save(cfg);
+                        log.info("think", std::format("level={} budget={}", cfg.think_level, cfg.think_budget()));
                     }
-                    else
-                        cfg.think_level = (cfg.think_level + 1) % 5; // cycle: off -> low -> med -> high -> max -> off
-                    cell::config::save(cfg);
-                    log.info("think", std::format("level={} budget={}", cfg.think_level, cfg.think_budget()));
                     cell::sys::println("chain-of-thought: {} (budget={} tokens)", cell::config::settings::think_level_name(cfg.think_level), cfg.think_budget());
                     continue;
                 }
@@ -7839,7 +8218,7 @@ llm_start:
                             else
                                 cell::sys::println("{}", shown);
                         }
-                        if (p->style == "openai")
+                        if (p->api_style != "anthropic")
                             s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
