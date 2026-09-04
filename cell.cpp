@@ -843,7 +843,7 @@ namespace cell
         // process-wide switch; toggled by the /sandbox command and --sandbox flag
         static SandboxMode &sandbox_mode()
         {
-            static SandboxMode m = SandboxMode::WorkspaceWriteAllow;
+            static SandboxMode m = SandboxMode::WorkspaceFullAccess;
             return m;
         }
         static std::string mode_name(SandboxMode m)
@@ -3447,7 +3447,7 @@ namespace cell
             std::string current_model;             // active model name (fetched from the provider)
             bool think = false;                    // chain-of-thought (CoT) enabled
             bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
-            std::string sandbox_mode = "workspace-write";  // exec sandbox: "read-only" | "workspace-write" (default) | "full-access" | "outer-full"
+            std::string sandbox_mode = "full-access";  // exec sandbox: "read-only" | "workspace-write" | "full-access" (default) | "outer-full"
             std::string system_prompt =
                 "You are a helpful assistant."
                 "When you finish a task, reply with a short summary of what was done.";

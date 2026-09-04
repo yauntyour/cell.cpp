@@ -2,11 +2,14 @@
 
 # cell.cpp
 
-**A lightweight AI coding agent written in modern C++26**
+**A single-file AI coding agent in modern C++26**
 
-Connect to OpenAI or Anthropic, chat with your codebase, and let the LLM read, write, edit, and execute — all sandboxed.
+One translation unit, one executable: talk to OpenAI- or Anthropic-compatible endpoints, let the
+model read / write / edit / search / execute inside a strict sandbox, and keep every credential in an
+encrypted on-disk vault.
 
 [![C++26](https://img.shields.io/badge/C%2B%2B-26-blue?logo=cplusplus)](https://isocpp.org/)
+[![Single file](https://img.shields.io/badge/layout-single%20translation%20unit-orange)](cell.cpp)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ```
@@ -17,556 +20,563 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Command-line options](#command-line-options)
+- [Slash commands](#slash-commands)
+- [Tools](#tools)
+- [Security model](#security-model)
+- [Sessions and the working-directory model](#sessions-and-the-working-directory-model)
+- [Configuration file](#configuration-file)
+- [Runtime data layout](#runtime-data-layout)
+- [Architecture](#architecture)
+- [The agent loop](#the-agent-loop)
+- [Streaming UI and keyboard control](#streaming-ui-and-keyboard-control)
+- [Logging, signals and exit codes](#logging-signals-and-exit-codes)
+- [Self-test](#self-test)
+- [Implementation notes](#implementation-notes)
+
 ## Features
 
-| | Feature | Description |
+| | Feature | Where it lives |
 |---|---|---|
-| 🤖 | **Dual LLM Support** | OpenAI and Anthropic APIs, streaming & non-streaming |
-| 🔧 | **8 Built-in Tools** | `ls`, `read`, `write`, `edit`, `rg`, `exec`, `glob`, `find` |
-| 🔒 | **Encrypted Vault** | libsodium-based credential storage with secure memory handling |
-| 💬 | **Session Persistence** | Chat history saved and restored across sessions |
-| 🛡️ | **Security Sandbox** | Three access modes (`read-only` / `workspace-write` / `full-access`) plus dangerous-path and dangerous-command blocks |
-| 🎨 | **Colored Output** | ANSI escape codes with Windows Virtual Terminal support |
-| ⚡ | **Agent Loop** | Up to 8 rounds of tool calls per user message |
-| 🧠 | **Chain of Thought** | `/think` streams reasoning output (OpenAI `reasoning_content` / Anthropic `thinking`) |
-| 🧪 | **Self-Test** | Built-in test suite — run with `--selftest` |
+| 🤖 | **Two API styles** — OpenAI (`{base}/chat/completions`) and Anthropic (`{base}/v1/messages`), both streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
+| 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
+| 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `glob`, `find` | `cell::box`, `cell::tools` |
+| 🛡️ | **Four sandbox modes** — `read-only`, `workspace-write`, `full-access`, `outer-full`; network egress and credential reads are denied in *every* mode | `cell::box::check_exec` |
+| 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
+| 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
+| 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
+| 🧠 | **Chain of thought** — `/think` streams `reasoning_content` (OpenAI) or `thinking_delta` (Anthropic) in dim text | `cell::llm` |
+| 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
+| 📊 | **Usage statistics** — per-model and per-session request/token/character counters with prompt-cache hit rate | `cell::stats` |
+| ⚡ | **Async I/O** — session/config/stats writes are coalesced and flushed by one background thread; a dynamic worker pool runs read-only tool calls concurrently | `cell::async_io`, `cell::sys::thread_pool` |
+| 🖥️ | **Cross-platform** — Windows (Job Objects, `cmd.exe`, UTF-8 codepage, virtual terminal) and POSIX (`fork`/`exec`, `termios`); all OS-specific code is isolated in one namespace | `cell::plat` |
+| 🧪 | **Self-test** — a few hundred assertions covering the sandbox, editor, sanitizer, crypto, config, sessions, skills, stats and the tool registry | `--selftest` |
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- **Compiler:** GCC (MSYS2 UCRT64) or any C++26-capable compiler
-- **Libraries:** libcurl, nlohmann/json, libsodium
-- **Package manager (recommended):** [vcpkg](https://github.com/microsoft/vcpkg)
-
-Install dependencies via vcpkg:
+- A **C++26 toolchain** with library support for `<format>`, `<expected>`, `<generator>`,
+  `<span>`, `<concepts>` and `std::move_only_function` — e.g. GCC 15+ (MSYS2 UCRT64) or a recent
+  MSVC/Clang. This is bleeding-edge: use a recent standard library, not an LTS one.
+- **libcurl** (any recent backend), **libsodium**, **nlohmann/json** (header-only).
+- Recommended package manager: [vcpkg](https://github.com/microsoft/vcpkg)
 
 ```bash
-vcpkg install curl nlohmann-json libsodium:x64-windows
+vcpkg install curl nlohmann-json libsodium
 ```
 
 ### Build
 
 ```bash
-g++ -std=c++26 -O2 -o cell.exe cell.cpp -lcurl -lsodium
+# POSIX / MSYS2
+g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
+
+# MSVC
+cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib
 ```
 
 ### Run
 
 ```bash
-# Interactive mode (creates an openai provider + stores the key in the encrypted vault)
-cell.exe --provider openai --base https://api.openai.com/v1 --model gpt-4o --key YOUR_API_KEY
+# first launch: register a provider (the key goes into the encrypted vault)
+bin/cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key YOUR_API_KEY
 
-# Use Anthropic
-cell.exe --provider anthropic --base https://api.anthropic.com --model claude-sonnet-4-20250514 --key YOUR_API_KEY
+# Anthropic-style endpoint
+bin/cell --provider anthropic --base https://api.anthropic.com --model claude-sonnet-4-20250514 --key YOUR_API_KEY
 
-# Inside the REPL, providers are managed with /provide:
-#   /provide add openai:https://api.openai.com/v1 key:YOUR_API_KEY   add + select a provider
-#   /provides                                                        list providers
-#   /models                                                          fetch the model list
-#   /model gpt-4o                                                    switch model
-#   /think                                                           toggle chain-of-thought
+# any OpenAI-compatible gateway (Ollama, vLLM, One-API, ...)
+bin/cell --base http://localhost:11434/v1 --model qwen2.5-coder
 
-# Resume a saved session
-cell.exe --provider openai --model gpt-4o --session my-session
+# non-interactive: stdin is one message, reply is printed, then exit
+echo "explain what this repo does" | bin/cell
 
-# Run built-in tests
-cell.exe --selftest
+# verify the build
+bin/cell --selftest
 ```
 
-### Example
+Inside the REPL, providers are managed without restarting:
 
-```bash
-cell: session=6333a2b6f7084f1a-1787819024 model=openai:Qwen3.8-27B
-context: loaded 7 message(s) from disk
-> /sessions
-  > cwd: C:\Users\yaunt
-    6333a2b6f7084f1a-1787819024 *  messages=7  "你好，请介绍一下你自己"
+```
+/provide add openai:https://api.openai.com/v1 key:YOUR_API_KEY
+/models
+/model gpt-4o
+/think on
+```
+
+### Session example
+
+```
+cell: cwd=D:\work\demo session=6333a2b6f7084f1a-1787819024 model=openai:Qwen3.8-27B sandbox=full-access
+context: injected system_prompt=1740chars
 > 还记得前面聊了什么吗
 记得呀，咱们前面聊了这些内容：
-
-1. **你让我介绍自己** —— 我介绍了我是千问（Qwen），由阿里巴巴研发的大语言模型，具备长文理解、逻辑推理、多任务能力等特性。
-
-2. **你让我查看当前目录下的项目** —— 我列出了目录内容，发现这是一个 Windows 用户主目录（包含 `Desktop`、`Documents`、`source`、各种开发工具配置目录如 `.cargo`、`.pnpm`、`.gradle` 等），而不是某个具体的项目根目录。我还提到了一些零散文件，比如一个约 790MB 的 `java_error_in_studio.hprof` 崩溃转储文件。
-
-我最后还问你是否需要进一步查看某个具体目录（比如 `source` 或 `Documents`）。
-
-接下来想继续做什么呢？😊
+1. **你让我介绍自己** …
+2. **你让我查看当前目录下的项目** —— 我列出了目录内容 …
 [2026-08-27 08:31:55] INFO  [llm  ] round=1 model=openai:Qwen3.8-27B stream=true ctx_msgs=8 tok_in=3424 tok_out=393 cache=92.6% time=19.95s ttf=11.06s tools=0
-> 检查工具列表
-以下是我当前拥有的工具列表：
-
-| 工具 | 说明 |
-|------|------|
-| **ls** | 列出目录内容（单级，分页，每页最多 500 条） |
-| **read** | 读取文件内容（单次最大 1MB，支持按行号分段读取） |
-| **rg** | 递归搜索文件内容（跳过隐藏文件和 .gitignore 路径） |
-| **glob** | 按文件名模式查找文件（如 `**/*.ts`） |
-| **find** | 按元数据筛选文件（名称、修改时间、大小等） |
-| **write** | 创建新文件（不能覆盖已存在的文件） |
-| **edit** | 修改已有文件（多模式：replace 整段/精准替换、insert 插入、append 追加、delete 删除、query 定位查询；编辑前必须先 read 过该文件/行） |
-| **exec** | 执行 shell 命令（默认超时 30 秒，最大 300 秒） |
-
-工具使用规则要点：
-- edit 前必须先读取原内容：edit 只允许修改 read 工具已返回过的文件（或行范围），未读过的文件/行会被拒绝；edit 的 `query` 模式为只读定位，不受此限制；
-- edit 支持 replace / insert / append / delete / query 五种模式：replace 用小段唯一文本做精准替换、多行块做整段替换，insert 在唯一文本（或指定行）之后插入，append 在文件末尾追加，delete 删除唯一文本或行区间，query 定位所有匹配并报告行号与上下文；
-- 使用 write 前需确保父目录已存在（可用 `exec` + `mkdir -p` 创建）；
-- `exec` 后需根据返回值判断成功与否。
-
-需要我用这些工具做什么？比如继续查看刚才目录里的某个项目？
-[2026-08-27 08:32:52] INFO  [llm  ] round=1 model=openai:Qwen3.8-27B stream=true ctx_msgs=10 tok_in=3625 tok_out=417 cache=94.3% time=21.24s ttf=5.53s tools=0
+> /sessions
+  > cwd: D:\work\demo
+    6333a2b6f7084f1a-1787819024 *  messages=7  "你好，请介绍一下你自己"
 > /compact
-context already small (10 messages to aggregate)
-> /clear
-context: injected system_prompt=1740chars
-session cleared: 6333a2b6f7084f1a-1787819024 (removed 11 messages)
+context compacted: aggregated 31 message(s) into 1 summary, 2 message(s) remain
 > /quit
 ```
 
-## Usage
-
-### 1. Command-Line Options
+## Command-line options
 
 ```
 usage: cell [options]
-  --provider NAME              select an existing provider, or create one (style = NAME)
-  --base URL                   api base url for the current provider
-  --model MODEL                default model name
-  --proxy URL                  http(s) proxy for the current provider
-  --key KEY                    api key (saved to the encrypted vault)
-  --session ID                 resume an existing session
-  --system TEXT                system prompt
-  --no-color                   disable colored log output
-  --verbose                    enable DEBUG-level log output on console
-  --selftest                   run internal self tests
+  --provider NAME             select an existing provider, or create one (style = NAME)
+  --base URL                  api base url for the current provider
+  --model MODEL               default model name
+  --proxy URL                 http(s) proxy for the current provider
+  --key KEY                   api key (saved to the encrypted vault)
+  --session ID                resume an existing session (switches to its working directory)
+  --system TEXT               system prompt
+  --sandbox MODE              exec sandbox mode (see below)
+  --no-color                  disable colored log output
+  --verbose                   enable DEBUG-level log output on console
+  --selftest                  run internal self tests
 ```
 
-#### 1.1 Option Reference
-
-| Option | Value | Default | Description |
-|---|---|---|---|
-| `--provider` | provider name (`openai` \| `anthropic` \| any alias) | none | Selects an existing provider; if it does not exist, one is created (the value doubles as the API style) |
-| `--base` | URL | see below | API base URL — works with the official APIs or any OpenAI/Anthropic-compatible gateway |
-| `--model` | model name string | none | Model name, e.g. `gpt-4o-mini`, `claude-3-5-haiku-latest` |
-| `--proxy` | URL | none | HTTP(S) proxy for the current provider, e.g. `http://user:pass@proxy:8080`; localhost/loopback traffic always bypasses it |
-| `--key` | API key | none | Never stored in plaintext — encrypted with libsodium into `.cell/.crypt` |
-| `--session` | session ID | last used session | Resumes chat history from `.cell/sessions/<ID>.json` |
-| `--system` | prompt text | built-in coding-agent prompt | Replaces the system prompt entirely |
-| `--sandbox` | `read-only` \| `workspace-write` \| `full-access` | `workspace-write` | Sandbox access mode: how much of the machine tools may reach |
-| `--no-color` | flag (no value) | off | Disables ANSI colors in log output |
-| `--verbose` | flag (no value) | off | Also prints DEBUG-level logs to the console (DEBUG logs always go to the log file) |
-| `--selftest` | flag (no value) | off | Runs the built-in test suite instead of entering the chat |
-
-#### 1.2 Configuration Load & Override Order
-
-At startup the final configuration is assembled as follows:
-
-1. `.cell/config.json` is loaded (provider list + current provider/model + system prompt + last session ID + log cap);
-2. A fresh install ships with **no providers and no models** — on first launch cell prints a hint and
-   you register a provider with `/provide add openai:URL key:KEY` (inside the REPL) or via the CLI
-   options below;
-3. `--provider` selects an existing provider by name, or (legacy behavior) creates one from
-   `--base` / `--model` / `--proxy`; non-empty fields are applied in place onto the current provider;
-4. `--key` is written to the encrypted vault and bound to the current provider; `--session` /
-   `--system` directly replace the corresponding fields.
-
-> Note: CLI overrides happen after the config is loaded, and the merged result is **written back** to
-> `config.json` on exit — so provider/base/model changes passed on the command line are persistent
-> and still apply on the next launch without arguments.
-
-#### 1.3 Option Details
-
-**`--provider` / `--base` / `--model` / `--proxy`**
-
-These modify the *current provider entry*. `--provider` selects an existing provider by name; when
-the name does not exist it is created and its name doubles as the API style (`openai` or
-`anthropic`). You don't need to pass all of them — for example, switching only the style:
-
-```bash
-cell.exe --provider anthropic          # keeps current base/model, changes protocol only
-```
-
-Use `--base` to target third-party OpenAI-compatible services:
-
-```bash
-# local Ollama / vLLM / One-API etc.
-cell.exe --base http://localhost:11434/v1 --model qwen2.5-coder
-```
-
-Use `--proxy` to route API traffic through an HTTP(S) proxy (credentials may be embedded in the
-URL); `localhost`, `127.0.0.1` and `::1` are always excluded:
-
-```bash
-cell.exe --proxy http://user:pass@proxy.example.com:8080
-```
-
-If a provider's base is empty, OpenAI defaults to `https://api.openai.com/v1` and Anthropic defaults
-to `https://api.anthropic.com` — give providers you configure yourself an explicit base instead.
-
-**`--key`**
-
-The key is encrypted and stored in `.cell/.crypt` under the id `provider:<name>`
-(e.g. `provider:openai`) and bound to the current provider entry. Passing a key again for the
-same provider overwrites the old value; the plaintext is securely zeroed in memory right after.
-
-**API Key resolution priority** (decided per request)
-
-1. The vault key bound to the current provider (written by `--key` or `/provide add ... key:KEY`);
-2. The environment variable `OPENAI_API_KEY` (openai style) or `ANTHROPIC_API_KEY` (anthropic style);
-3. The generic vault key `api_key`.
-
-If none of the three is available, the first turn fails with an error explaining how to set one.
-
-**`--session`**
-
-Loads `.cell/sessions/<ID>.json`; a missing file simply starts a fresh session. Because the session
-ID is written back to `config.json` on exit, **the next launch automatically resumes the previous
-conversation**. To force a new one, pass any new `--session <ID>` or run `/new` inside the REPL.
-
-**`--system`**
-
-Fully replaces the default system prompt (which instructs the model to act as a coding agent that
-uses tools and replies with a short summary when done). Quote it if it contains spaces:
-
-```bash
-cell.exe --system "You are a code assistant that answers in English only"
-```
-
-**`--no-color` / `--verbose`**
-
-- Logs are always appended to `.cell/logs/cell.log`;
-- By default the console shows INFO/WARN/ERROR only; with `--verbose`, DEBUG logs (cache hits,
-  prompt injection, session persistence, ...) are printed too;
-- `--no-color` disables ANSI colors (on Windows this also depends on virtual terminal support).
-
-**`--selftest`**
-
-Runs unit tests for the sandbox, editor, crypto, config, skills and stats subsystems inside an
-isolated `.cell-selftest/` directory, which is cleaned up afterwards. Handy for a quick check after
-building; exit code `0` means everything passed.
-
-#### 1.4 Error Handling & Exit Codes
-
-| Case | Behavior | Exit code |
+| Option | Value | Effect |
 |---|---|---|
-| Normal exit / self-test passed | — | `0` |
-| Unknown option | Error message + usage text | `1` |
-| Missing option value (e.g. bare `--model`) | `missing value for --model` | `1` |
-| Fatal error at runtime | Logged and printed as `fatal: ...` | `1` |
+| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`). |
+| `--base` | URL | Sets `base` on the current provider. There is **no built-in default base** — an empty base means the provider is unusable until you set one. |
+| `--model` | string | Active model name, stored as-is (it need not appear in `/models`; a mismatch only warns). |
+| `--proxy` | URL | HTTP(S) proxy for the current provider, credentials may be embedded. `localhost`, `127.0.0.1`, `::1` always bypass it (`CURLOPT_NOPROXY`); HTTPS targets are tunnelled with `CONNECT`. |
+| `--key` | secret | Encrypted into `.cell/.crypt` under the id `provider:<name>` and bound to the current provider; the plaintext copy is zeroed (`sodium_memzero`) immediately. |
+| `--session` | id | Stored as `cfg.session_id`. See [Implementation notes](#implementation-notes): startup always opens a fresh session, so resume with `/session ID`. |
+| `--system` | text | Replaces the system prompt entirely. |
+| `--sandbox` | `read-only`/`readonly`, `workspace-write`/`write`, `full-access`/`full`, `outer-full`/`outer` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `workspace-write`, but leaves the live mode at the built-in default (see [implementation notes](#implementation-notes)). |
+| `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
+| `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
+| `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
 
-#### 1.5 Non-Interactive (Pipe) Mode
+**Load order.** `.cell/config.json` is read first (a parse error is reported as a warning and the
+program continues with defaults); legacy config shapes are migrated on the fly. CLI flags are then
+applied on top of the loaded settings. On exit the merged configuration is written back, so
+`--base` / `--model` / `--proxy` / `--sandbox` changes are persistent.
 
-When stdin is not a terminal (pipe or redirection), the program treats **all of stdin as a single
-message**, prints the reply, and exits automatically — useful in scripts:
+**API key resolution** (per request, first match wins):
 
-```bash
-echo "explain what this code does" | cell.exe
-cell.exe < review-request.txt
-git diff | cell.exe        # chain with other commands in a pipeline
-```
+1. the vault entry bound to the current provider (`provider:<name>`);
+2. the environment variable `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (chosen by the provider style);
+3. the generic vault entry `api_key`.
 
-### 2. Slash Commands
+If none is available the turn fails with a message explaining how to set one.
 
-Inside the REPL, input starting with `/` is parsed as a command (split on whitespace) and is never
-sent to the model.
+**Numeric arguments.** Config fields and tool arguments accept both JSON numbers and quoted numeric
+strings (`"log_max_lines": "500"`, `{"offset": "85"}`); garbage or missing values fall back to the
+default instead of throwing.
 
-#### 2.1 Command Overview
+## Slash commands
+
+Input starting with `/` is split on whitespace and handled locally — it is never sent to the model.
 
 | Command | Description |
-|---------|-------------|
-| `/help` | Show all commands |
-| `/provides` | List configured providers |
-| `/provide NAME` | Select a provider (persists across sessions) |
-| `/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]` | Add a provider (openai or anthropic API style) |
-| `/provide rm NAME` | Delete a provider (also removes its stored vault key) |
-| `/models` | Fetch the model list from the current provider |
-| `/model NAME` | Switch to a model of the current provider |
-| `/think [on\|off]` | Toggle chain-of-thought (CoT) output |
-| `/tool [on\|off]` | Toggle tool calls (off = plain chat, no tools sent to the model) |
-| `/sandbox [mode]` | Switch the sandbox access mode (`read-only` / `workspace-write` / `full-access`) |
-| `/sessions` | List saved sessions |
-| `/session ID` | Switch to another saved session |
-| `/usages` | Show per-model and per-session usage statistics |
-| `/compact` | Compress the current session context |
+|---|---|
+| `/help` | Print the command list |
+| `/provides` | List configured providers (style, base, proxy, key state, model) |
+| `/provide NAME` | Select a provider (persisted immediately) |
+| `/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style (a spaced `openai: URL` form is accepted). After adding, the model list is fetched once as a connectivity probe. |
+| `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
+| `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
+| `/model NAME` | Switch model; warns if the name is not in the fetched list |
+| `/think [on\|off]` | Toggle chain-of-thought output (persisted) |
+| `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
+| `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |
+| `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
+| `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
+| `/session rm ID` | Delete a session file and its usage record |
+| `/usages` | Print per-model and per-session usage statistics (orphaned records are pruned first) |
+| `/compact` | Aggregate the conversation into one summary message |
 | `/skills` | List available skills |
-| `/skill NAME` | Load a skill into the current session |
-| `/save` | Save the current session immediately |
-| `/clear` | Clear the current session context (keeps the session id) |
-| `/new` | Start a fresh session (old sessions are kept on disk) |
-| `/exit` \| `/quit` | Exit the program |
+| `/skill NAME` | Inject a skill body into the current session as a system message |
+| `/save` | Persist the current session now (flushes the async writer) |
+| `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
+| `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
+| `/exit`, `/quit` | Exit |
 
-#### 2.2 `/provides` and `/provide` — Providers
+**Chain of thought (`/think`).** For OpenAI-style providers nothing extra is sent — reasoning models
+already stream `delta.reasoning_content`, and `/think on` displays it dim ahead of the answer, so
+non-reasoning models are unaffected. For Anthropic-style providers the request body gains
+`thinking: {"type":"enabled","budget_tokens":2048}` (with `max_tokens` raised from 4096 to 8192) and
+the streamed `thinking_delta` / `signature_delta` blocks are rendered dim; the thinking blocks stay in
+the stored assistant message, which Anthropic requires when a tool call follows a thinking turn.
 
-A **provider** is one API endpoint in one API style. The style prefix selects the protocol and
-endpoint format (`openai` → `{base}/chat/completions`, `anthropic` → `{base}/v1/messages`).
-Models are **not** stored in the config — they are fetched from the provider's models endpoint
-(`GET {base}/models` / `GET {base}/v1/models`); only the active model name is persisted.
-
-```
-/provides                              # list providers
-/provide NAME                          # select a provider (persists across sessions)
-/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]
-/provide rm NAME
-```
-
-`/provides` example output:
-
-```
-  [0] openai  <current>
-       style: openai
-       base:  https://api.openai.com/v1
-       key:   stored
-       model: gpt-4o-mini
-  [1] claude
-       style: anthropic
-       base:  https://api.anthropic.com
-```
-
-- Adding a provider: the prefix (`openai:` / `anthropic:`) selects the API style, the rest of the
-  token is the base URL (a spaced form `openai: URL` is accepted too). The provider is named after
-  the style unless `name:ALIAS` is given, and it becomes the current provider immediately;
-- `key:KEY` is stored encrypted in the vault under `provider:<name>`; without it, resolution falls
-  back to the environment variable or the generic `api_key`;
-- `proxy:URL` routes that provider's API traffic through the given HTTP(S) proxy;
-- `/provide rm NAME` removes the provider and its vault key; if it was the current provider, the
-  selection moves to the first remaining one (and the model name is cleared, since it belonged to
-  the removed provider);
-- Selecting a provider is written back to `.cell/config.json` immediately, so it survives restarts.
-
-#### 2.3 `/models` and `/model` — Models
-
-`/models` fetches the model list from the current provider's models endpoint and prints it with
-`<current>` marking the active model:
-
-```
-provider openai (openai) - current model: gpt-4o-mini
-  gpt-4o-mini  <current>
-  gpt-4o
-  gpt-4.1-mini
-```
-
-A failed fetch (network error, wrong key, HTTP error) prints the reason; the REPL keeps running.
-
-`/model NAME` switches the current model by name and persists it:
-
-```
-/model gpt-4o              # switch to gpt-4o under the current provider
-```
-
-The name is stored as-is (it is not required to appear in the fetched list — a warning is printed
-when it does not, since some gateways accept arbitrary names). There is no registration/delete
-form: adding a provider is done with `/provide add`, and deleting one with `/provide rm`.
-
-**Connectivity probe**: at startup, after `/new`, after `/provide add`, and after every `/model`
-change, cell performs a lightweight GET on the provider's models endpoint (OpenAI:
-`GET {base}/models`; Anthropic: `GET {base}/v1/models`; 5s timeout) and logs the result. A failure
-prints `[provider unreachable] <name>: <reason>` as a warning but does not block the REPL.
-
-#### 2.4 `/think` — Chain of Thought
-
-`/think` toggles CoT output; `/think on` and `/think off` set it explicitly. The flag is persisted
-in `config.json`.
-
-- **OpenAI-style providers**: reasoning models already stream `delta.reasoning_content`; with
-  `/think` on it is displayed dim/gray ahead of the answer (no extra request parameters are sent,
-  so non-reasoning models are unaffected);
-- **Anthropic-style providers**: the request body gains `thinking: {type:"enabled",
-  budget_tokens:2048}` (max_tokens is raised accordingly) and the streamed `thinking_delta` blocks
-  are displayed dim/gray. The thinking blocks are kept in the stored assistant message, which
-  Anthropic requires when tool calls follow a thinking turn.
-
-The reasoning text is display-only — it is not fed back to the model on later turns (except for
-Anthropic's thinking blocks, which must be echoed verbatim).
-
-#### 2.5 `/tool` — Tool Calls
-
-`/tool off` disables tool calling: the tool definitions are no longer sent with the request, so
-the model answers as a plain chat without touching the filesystem; `/tool on` re-enables them
-(the flag is persisted in `config.json`). `/tool` alone toggles the state. The current state is
-shown on the startup line (`tools=off` when disabled).
-
-#### 2.6 `/sessions` — Session List
-
-Scans `.cell/sessions/*.json` and prints one line per session: session ID, message count, and a
-snippet of the first user message (≤60 chars); `*` marks the current session:
-
-```
-  1756160000 *  messages=42  "migrate this project to C++20"
-  1756089312    messages=7   "fix the curl timeout issue"
-```
-
-`/session ID` loads another saved session (the current one is saved first); an ID with no file on
-disk simply starts a fresh session — same semantics as `--session`.
-
-`/session rm ID` deletes a session: the file `.cell/sessions/<id>.json` **and its usage record**
-in `usages.json` are both removed (per-model aggregates are kept). Deleting the current session
-switches to a fresh one. Orphaned usage records (session files deleted externally) are pruned
-automatically at startup and when `/usages` runs.
-
-#### 2.7 `/usages` — Usage Statistics
-
-Reads and summarizes `.cell/usages.json`, grouped by model and by session:
-
-`requests`, `messages` (messages added), `in_chars`/`out_chars` (characters sent/received),
-and `in_tok`/`out_tok` (tokens — present only if the API returns usage data).
-
-#### 2.8 `/compact` — Context Compaction
-
-Use this when a long conversation inflates the context. Strategy:
-
-- The **first system prompt message is kept as-is**;
-- **Every other message** (skills/system injections, user, assistant, tool results) is fed to the
-  current model and aggregated into a **single summary message** of the form
-  `{"role": "system", "content": "Here is a summary that ..."}`;
-- With 12 or fewer messages to aggregate it reports "already small" and does nothing;
-- If summarization fails, a placeholder truncation text is used as fallback;
-- Session and config are saved immediately afterwards.
-
-Compaction itself is one LLM call and counts toward usage statistics.
-
-#### 2.9 `/skills` and `/skill` — Skill System
-
-Skills are Markdown files under `.cell/skills/`, scanned **recursively** (so directory-style
-skills work too — e.g. `.cell/skills/my-suite/SKILL.md`). They are discovered only if they start
-with a YAML-style front matter block (otherwise ignored):
+**Skills (`/skills`, `/skill`).** A skill is a Markdown file under `.cell/skills/`, discovered only if
+it opens with a YAML-style front matter block; the scanner recurses (depth ≤ 6), so directory-style
+skills work too:
 
 ```markdown
 ---
 name: build-helper
 description: helpers for building cell
 ---
-Body instructions injected when the skill is loaded...
+Body instructions injected when the skill is loaded…
 ```
 
-- `name` falls back to the file name (without extension); for directory-style skills named
-  `SKILL.md`/`README.md` it falls back to the parent folder name; `description` falls back to the
-  first non-empty body line (truncated at ~120 characters); surrounding quotes in front-matter
-  values are stripped;
-- As long as valid skills exist, every **new session** gets an "available skills" list injected as a
-  system message, so the model can suggest loading a matching skill;
-- `/skill NAME` wraps the skill body into a system message appended to the current session and saves
-  immediately; it stays in effect for the rest of the session (loading repeatedly appends copies).
+`name` falls back to the file stem — or to the parent folder name for `SKILL.md`/`README.md` — and
+`description` to the first non-empty body line (truncated at ~120 chars); surrounding quotes are
+stripped. Whenever valid skills exist, every new session gets a metadata-only "available skills" list
+injected as a system message so the model can suggest loading one; `/skill NAME` appends the full body
+(front matter removed) as a system message for the rest of the session. Names and descriptions pass
+through `display_safe` (control/ANSI stripping) but are not fingerprint-redacted — the heavy scan is
+reserved for `exec` output.
 
-#### 2.10 `/clear`, `/save` and `/new`
+**Context compaction (`/compact`).** The first `system` message is kept verbatim; every other
+message (skills injection, user, assistant, tool results — each truncated to 400 chars) is sent to
+the current model with tools disabled and replaced by a single
+`{"role":"system","content":"Here is a summary that captures the previous conversation: …"}`
+message. With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if the
+summarization call fails, a truncation placeholder is used. The summary is re-run through the
+injection sanitizer before it is inserted, and the read-before-edit log is reset because the earlier
+`read` results are gone from context. Compaction is itself one LLM request and counts toward usage.
 
-- `/clear`: empties the current session's message history but **keeps the session id** — the
-  system prompt and skill list are re-injected and the file is saved immediately. Useful for
-  starting a long conversation over without losing the session's identity;
-- `/save`: writes the current session to `.cell/sessions/<id>.json` right away. The session is also
-  auto-saved after every conversation round, after `/compact` and after `/skill` — `/save` is mainly
-  a manual safety net;
-- `/new`: saves the current session, then starts a fresh session (ID = Unix timestamp in seconds)
-  with the system prompt and skill list re-injected. **Old session files are kept on disk** and can
-  be revisited with `/session ID`.
+## Tools
 
-#### 2.11 Appendix: Tool Approval Prompts
+Eight tools are registered, with schemas emitted for the active API style
+(`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic).
 
-During a conversation the model may call one of 8 tools:
-
-| Tool | Purpose | Approval |
-|---|---|---|
-| `ls` | List a directory (one level, paginated, max 500 entries/page) | read-only, runs automatically |
-| `read` | Read a file (max 1MB per call; optional line-range segmenting) | read-only, runs automatically |
-| `rg` | Recursive content search (skips hidden files and `.gitignore` paths, max 500 matches) | read-only, runs automatically |
-| `glob` | Find files by name pattern (e.g. `**/*.test.ts`) | read-only, runs automatically |
-| `find` | Filter files by metadata (name, size, modification time) | read-only, runs automatically |
-| `write` | Create a **new** file (refuses to overwrite; refuses if the parent directory is missing) | runs automatically (path sandbox-checked) |
-| `edit` | Modify an existing file in 5 modes: `replace` (unique SEARCH block → replacement; short snippet for precise tweaks, multi-line block for whole rewrites), `insert` (after a unique text or a line), `append` (end of file), `delete` (unique text or a line range), `query` (read-only locate with line numbers). Ambiguous searches abort with every match reported. **Requires a prior read**: edits may only touch files/lines returned by an earlier `read` call, otherwise refused | runs automatically (path sandbox-checked) |
-| `exec` | Run build/test/git commands (default 30s timeout; result ends with `exitcode=N`) | confirmation required |
-
-Read-only tools run without asking and may execute **concurrently** within one round; `write` and `edit` also run without asking but are executed sequentially (after the concurrent pass, in call order) so edits to the same file never race and same-message reads always complete first. Only `exec` shows an interactive prompt before every execution:
-
-```
-allow exec({"cmd":"g++ -std=c++26 -O2 -o cell.exe cell.cpp"})? [y/N]
-```
-
-Answer `y` or `Y` to allow; anything else (including plain Enter) rejects that call.
-High-risk commands (`rm -rf`, `chmod`, `chown`, `del /s`, ...) pass the sandbox but demand a
-**second** confirmation.
-
-##### Sandbox Access Modes
-
-`/sandbox [mode]` or `--sandbox MODE` picks how much of the machine the tools may reach.
-The choice is persisted in `config.json` under `sandbox_mode`.
-
-| Mode | `write` / `edit` | `exec` | Network egress (`curl`, `wget`, `git push`...) |
+| Tool | Policy | Arguments | Behaviour |
 |---|---|---|---|
-| `read-only` | refused (except `edit` in `query` mode, which never writes) | refused entirely | refused |
-| `workspace-write` (default) | allowed inside the current working directory only | allowed | refused |
-| `full-access` | allowed anywhere | allowed | allowed |
+| `ls` | Allow | `path`, `page`, `page_size` (≤500) | One level, non-recursive; directories first, then case-insensitive name order; header reports total and page window |
+| `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; records the returned line range for the read-before-edit rule |
+| `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
+| `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
+| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500) | Recursive content search; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; rejects patterns > 200 chars and nested/alternation quantifier groups (ReDoS); 8M-line scan budget |
+| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s) | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout **and** stderr are captured; the result always ends with `exitcode=N` |
+| `glob` | Allow | `pattern` (required), `path` | Recursive filename match (`**` crosses directories, `*`/`?` do not); 500 results max |
+| `find` | Allow | `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Metadata filter: `path  size bytes  mtime (UTC)` per hit |
 
-Two floors hold in **every** mode:
+**Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
+(`ls`/`read`/`rg`/`glob`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
+and `edit` are deliberately deferred to a second, **sequential** pass so that same-message reads
+always complete first (read-before-edit) and two edits of one file never race; `exec` runs
+sequentially after an interactive confirmation. Results are appended to the transcript in the
+original `tool_call` order.
 
-- **Dangerous paths** — `..` traversal, the `.cell` runtime directory (vault, keys, config,
-  sessions, logs) and well-known credential stores (`~/.ssh/id_*`, `~/.aws/credentials`,
-  `~/.netrc`, `~/.git-credentials`, `~/.docker/config.json`, ...) stay unreachable. Symlinks are
-  resolved first, so a link pointing at one of those is blocked too.
-- **Dangerous commands** — the deny-list (`format`, `mkfs`, `fdisk`, `diskpart`, `shutdown`,
-  `reboot`, `taskkill`, `reg delete`, `net user`, `icacls`, `takeown`, `dd if=`, fork bombs,
-  `eval`/`exec(`/`compile(`, base64 payloads, `powershell -enc`) plus shell pipelines, `>`
-  redirects, backtick substitution and `$(...)` command substitution are rejected outright.
+**Read-before-edit rule.** Paths are canonicalized (`weakly_canonical`, lowercased on Windows) and
+the line ranges returned by read tools are logged. `edit` refuses to touch any line not covered by a
+previously read range, and the log is cleared whenever the visible context changes (`/clear`, `/new`,
+`/session`, `/compact`).
 
-Reading credentials is also denied in every mode: dumping the environment (`env`, `printenv`,
-`cmd /c set`) or expanding a secret variable name (`$OPENAI_API_KEY`, `$CELL_MASTERKEY`, ...)
-never runs.
+**File cache.** `edit` reads through a `(size, mtime)`-validated cache keyed by canonical path, so
+consecutive edits of one file skip the disk while an external writer is always picked up.
 
-## Architecture
+## Security model
 
-The entire application lives in a single `cell.cpp` file, organized into clean namespaces:
+Six independent layers, from the path down to the bytes shown on your screen.
 
+### 1. Sandbox modes
+
+Set with `/sandbox [mode]`, `--sandbox MODE` or the `sandbox_mode` config key.
+
+| Mode | `exec` | Path-checked tools (`ls`/`read`/`rg`/`glob`/`find`/`write`/`edit`) |
+|---|---|---|
+| `read-only` | refused (`check_exec` returns false before anything else) | confined to the current working directory by `check_path` |
+| `workspace-write` | allowed, subject to gates 2–4 | any non-sensitive path (`check_path` adds no workspace rule in this mode) |
+| `full-access` | allowed | any non-sensitive path |
+| `outer-full` | allowed | any non-sensitive path |
+
+Network egress and credential access are denied in **all four** modes, and the sensitive-path list
+below applies in all four as well.
+
+The workspace confinement of `write`/`edit` is mode-independent in practice: those two tools are
+`Policy::Allow`, so they are gated by `check_path` (traversal + vault/credential list + the
+`read-only` "inside the workspace" rule) rather than by `check()`, whose "block all write/exec
+operations in `read-only`" and "workspace only in `workspace-write`" branches sit on the `Ask`/`exec`
+code path. In other words, `read-only` stops `exec` completely but still lets the model create or edit
+files inside the cwd, and `workspace-write` does not additionally restrict `write`/`edit` to the cwd.
+See [implementation notes](#implementation-notes).
+
+### 2. Path gate — `check_path` / `is_sensitive_path`
+
+- any `..` in the argument is rejected;
+- everything under the `.cell` runtime directory is off limits (vault, `.key`, `config.json`,
+  sessions, logs) — **except** `.cell/skills/`, which the skill system legitimately reads;
+- well-known credential stores are blocked anywhere on disk: `~/.ssh/id_{rsa,ed25519,ecdsa,dsa}`,
+  `~/.aws/{credentials,config}`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`,
+  `~/.git/config`, `~/.git/hooks`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`,
+  `~/.kube/config`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`;
+- paths are canonicalized with `weakly_canonical` first, so a symlink or junction pointing at a
+  credential file is blocked under its literal name too.
+
+Only the `path`/`dirpath` field is checked for `write`/`edit` — code content may legitimately
+contain `>`, `|` or `..`.
+
+### 3. Command gate — `check` / `check_exec`
+
+- **injection primitives rejected outright**: `|`, `>`, `>>`, backticks, `$(…)`;
+- **deny-token list** (token-aware, case-insensitive): disk destruction (`format`, `mkfs`, `fdisk`,
+  `diskpart`), system control (`shutdown`, `reboot`, `halt`, `taskkill`), registry/user management
+  (`reg delete`, `net user`, `net localgroup`, `net group`), permission manipulation (`cacls`,
+  `icacls`, `takeown`, `attrib`), `cmd /c del|format|rd`, `dd if=`, fork bombs, `curl|sh` /
+  `wget -o`, `eval `/`exec `, and inline-code / encoded-payload forms (`exec(`, `eval(`,
+  `compile(`, `iex(`, `import base64`, `b64decode`, `fromhex`, `unhexlify`, `atob(`);
+- **network egress**: matched by command name against a list of ~40 egress binaries (`curl`, `wget`,
+  `nc`, `ssh`, `scp`, `rsync`, `rclone`, `aws`, `gcloud`, `az`, `nmap`, `socat`, `git-remote-http`,
+  `yt-dlp`, …) in command position or after `&&`/`&`/`;`. Shell wrappers (`cmd /c`, `sh -c`,
+  `pwsh -Command`, …) are normalized so `cmd /c curl …` is still caught. Scripted clients are caught
+  by keyword (`urllib`, `requests.`, `httpx`, `socket.`, `fetch(`, `axios`, `websocket`,
+  `Invoke-RestMethod`, `/dev/tcp`, `boto3`, `paramiko`, …), and network-touching git subcommands
+  (`push`, `pull`, `fetch`, `clone`, `lfs`, `submodule`, bare `git remote`) are denied;
+- **credential leak**: whole-environment dumps (`env`, `printenv`, `cmd /c set`), secret variable
+  names (`$OPENAI_API_KEY`, `%ANTHROPIC_API_KEY%`, `$CELL_APIKEY`, `$CELL_MASTERKEY`,
+  `$GIT_ASKPASS`) and any reference to the vault's files are refused.
+
+### 4. Human confirmation
+
+`exec` is the only `Ask` tool: `allow exec({…})? [y/N]` — the argument is printed through
+`display_safe`, so injected JSON cannot erase the prompt or fake an approval. Commands that pass the
+sandbox but are still destructive demand a **second** confirmation: recursive/forced deletes
+(`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`chmod`, `chown`, `sudo`,
+`cacls`, `icacls`, `takeown`) and git operations that can trigger hooks or rewrite history
+(`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`, `stash`, `clean`,
+`reset`, `restore`). A rejected or blocked call ends the current agent run instead of letting the
+model retry it.
+
+### 5. Output hardening
+
+- **`sanitize_output`** (applied to `exec` results, and to `exec`-tagged results reloaded from disk):
+  truncates to a byte cap, then redacts line-by-line against ~50 command-override fingerprints plus
+  three regex families (verb + filler + `instructions|rules|system prompt|sandbox|safety`,
+  `you are now …`, `no longer bound …`). Matching runs on a flattened form of each line: UTF-8
+  decoded, fullwidth/Latin-1/Cyrillic/Greek homoglyphs folded to ASCII, zero-width and bidi marks
+  dropped, punctuation collapsed to spaces, and windows of up to 6 adjacent lines joined so split
+  fingerprints still match. The tool-output wrapper framing lines are never redacted (they carry the
+  `tool="exec"` marker used on reload).
+- **`wrap_tool_output`**: every result is wrapped in an explicit untrusted-data boundary tag that
+  carries the tool name and a path/command marker, with the attributes sanitized and any occurrence of
+  that closing tag inside the body escaped, so injected content cannot forge a nested "authorized" tool
+  block or break out of the wrapper.
+- **`truncate_output`**: non-exec results get a size cap without the injection scan.
+- **`display_safe`** (single-line, ANSI-stripped) for confirmation prompts and skill metadata;
+  **`console_safe`** (multi-line, ANSI-stripped) for the cyan console echo of tool output, which is
+  additionally capped at 16 KiB.
+
+### 6. Credential vault
+
+`.cell/.crypt` is a JSON envelope (`version: 2`) holding a random base64 salt and, per key, a
+`{nonce, ct}` pair. The AEAD key is derived with **Argon2id** (moderate ops/memory limits) from:
+
+- the `CELL_VAULT_PASSPHRASE` environment variable if set, otherwise
+- `.cell/.key` — 32 random bytes, auto-generated on first use (base64 on disk).
+
+Encryption uses **AES-256-GCM** when the CPU provides AES-NI, transparently falling back to
+**XChaCha20-Poly1305**. Secrets are held in `secure_string` (`sodium_malloc` buffers, zeroized on
+destruction, constant-time comparison); the derived key is wiped in the vault destructor. Plaintext
+never appears in the vault file — the self-test asserts this.
+
+## Sessions and the working-directory model
+
+- Each session id is `<cwd-key>-<unix-seconds>`; the cwd key is the first 16 hex characters of the
+  SHA-256 of the normalized absolute working directory (lowercased on Windows).
+- Files live at `.cell/sessions/<cwd-key>/<id>.json` and record `id`, `cwd` and the full message
+  array. `.cell/sessions/sessions.json` is the hash → path index that lets every group be resolved
+  back to a real directory; `/sessions` groups by it and marks the current cwd with `>`.
+- `/session ID` and startup resume logic **follow the session's cwd** (`current_path` + cache
+  invalidation), so tools keep operating on the project the conversation belongs to.
+- `/new` keeps the old file (revisitable), `/clear` keeps the id, `/session rm` deletes both the file
+  and its usage record; orphaned usage records are pruned at startup and on `/usages`.
+- Legacy flat `.cell/sessions/<id>.json` files are migrated once at startup into the current cwd
+  group with a rewritten id and `cwd` field.
+- Session, config and index writes go through `cell::async_io::file_writer` (coalesced per path, one
+  background thread). Commands that read those files back (`/save`, `/sessions`, `/session`,
+  `/compact`, exit) call `flush()` first as a durability barrier; the signal handler and the RAII
+  exit guard do the same.
+
+## Configuration file
+
+`.cell/config.json` (written with `dump(2)`, so it is hand-editable):
+
+```json
+{
+  "providers": [
+    { "name": "openai", "style": "openai", "base": "https://api.openai.com/v1",
+      "key": "provider:openai", "proxy": "http://user:pass@host:8080" },
+    { "name": "claude", "style": "anthropic", "base": "https://api.anthropic.com" }
+  ],
+  "current_provider": "openai",
+  "current_model": "gpt-4o",
+  "think": false,
+  "tools": true,
+  "sandbox_mode": "full-access",
+  "system": "You are a helpful assistant.…",
+  "session": "6333a2b6f7084f1a-1787819024",
+  "log_max_lines": 1000,
+  "thread_pool_size": 16,
+  "active_sessions": { "6333a2b6f7084f1a": "6333a2b6f7084f1a-1787819024" }
+}
 ```
-cell::box      ─ Sandboxed system operations (file I/O, exec, rg, glob, find, multi-mode edit)
-cell::net      ─ HTTP networking via libcurl (GET, POST, SSE streaming)
-cell::sys      ─ Console output, logger, exceptions
-cell::config   ─ Configuration persistence (.cell/config.json)
-cell::encrypt  ─ Encrypted credential vault (libsodium)
-cell::tools    ─ Tool abstraction & permission system
-cell::llm      ─ OpenAI & Anthropic API clients
-cell::chat     ─ Session management & message history
-```
 
-## How It Works
+| Field | Default | Meaning |
+|---|---|---|
+| `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
+| `current_provider` | first entry | Active provider when empty |
+| `current_model` | — | Active model name |
+| `think` / `tools` | `false` / `true` | CoT output, tool calling |
+| `sandbox_mode` | `workspace-write` when the key is absent from an existing file, `full-access` in the built-in defaults | See [sandbox modes](#1-sandbox-modes) |
+| `system` | short assistant prompt | System prompt |
+| `log_max_lines` | `1000` (min 10) | `logs/cell.log` is trimmed to its tail on every startup |
+| `thread_pool_size` | `16` (clamped 1–16) | Max concurrent read-only tool workers; the pool spawns lazily and idles with zero workers |
+| `active_sessions` | `{}` | cwd key → last active session id |
 
-```
-User Input ──▶ LLM API ──▶ Tool Call? ──▶ Execute in Sandbox ──▶ Feed Result ──▶ LLM API
-                 ▲                                                  │
-                 └──────────────────────────────────────────────────┘
-                                    (up to 8 rounds)
-```
+**Legacy migration.** A flat `{"provider","base","model","key","proxy"}` object, or a
+`{"models":[…],"current_model":<index>}` array, is rewritten into the provider list on load
+(duplicate endpoints are merged, names are de-duplicated as `style`, `style2`, …).
 
-1. You type a message
-2. It's sent to the LLM (OpenAI or Anthropic)
-3. If the LLM wants to use a tool, it returns a tool call
-4. The tool executes in a sandboxed environment
-5. The result is fed back to the LLM
-6. This loops until the LLM produces a final response or the round limit is reached
+## Runtime data layout
 
-## Runtime Data
-
-The tool creates a `.cell/` directory in your working directory:
+`.cell` is anchored to **the directory containing the cell executable** (`GetModuleFileNameW` /
+`/proc/self/exe`), not the current working directory — so `bin/cell.exe` uses `bin/.cell/` no matter
+where you launch it from.
 
 ```
 .cell/
-├── config.json       # Provider config: {"providers":[{name,style,base,key,proxy}...], "current_provider":NAME, "current_model":NAME, "think":false, "tools":true, "log_max_lines":1000}
-├── .crypt            # Encrypted API key vault
-├── .key              # Symmetric encryption key
-├── usages.json       # Per-model and per-session usage statistics
-├── skills/
-│   └── *.md          # Skills (front matter: name/description, body injected on /skill)
+├── config.json           # settings above
+├── .crypt                # encrypted vault (version 2: salt + per-key {nonce, ct})
+├── .key                  # 32-byte master secret (base64) — unless CELL_VAULT_PASSPHRASE is set
+├── usages.json           # {"sessions": {id: {...}}, "models": {"provider:model": {...}}}
+├── skills/               # *.md with YAML front matter, scanned recursively (depth <= 6)
+│   └── suite/core/SKILL.md
 ├── logs/
-│   └── cell.log      # Timestamped application logs, trimmed to the last log_max_lines lines at startup
+│   └── cell.log          # [UTC timestamp] LEVEL [cat  ] message, trimmed at startup
 └── sessions/
-    ├── <id>.json     # Persisted chat sessions
-    └── ...
+    ├── sessions.json     # cwd hash -> cwd path index
+    └── 6333a2b6f7084f1a/ # one directory per working directory
+        └── 6333a2b6f7084f1a-1787819024.json
 ```
 
-`log_max_lines` (default `1000`, minimum 10) controls how many lines `logs/cell.log` keeps — on
-every startup the file is trimmed to its tail before new entries are appended.
+Usage records accumulate `requests`, `messages`, `input_chars`, `output_chars`, `input_tokens`,
+`output_tokens`, `total_tokens`. The prompt **cache hit rate** shown in the `[llm]` log line is
+computed from `usage.prompt_tokens_details.cached_tokens / prompt_tokens` (OpenAI) or
+`cache_read_input_tokens / (cache_read_input_tokens + input_tokens)` (Anthropic).
 
-`thread_pool_size` (default `16`, range 1–16) caps how many worker threads cell may spawn for
-concurrent read-only tool calls (ls/read/rg/glob/find). The pool scales up dynamically under load,
-so small values keep the machine quiet while larger ones speed up batched exploration.
+## Architecture
+
+Everything is in `cell.cpp`, split into namespaces with a strict dependency direction: only
+`cell::plat` knows about OS APIs, only `cell::net` knows about curl, only `cell::encrypt` knows about
+libsodium.
+
+```
+cell::async_io   coalescing background file writer (submit / flush)
+cell::plat       OS shims: spawn_cmd (timeout + process-tree kill), is_tty, init_console,
+                 peek_key (Esc cancel), executable_dir, restore_console
+cell::text       zero-copy line generator, trim, BOM strip, display_safe / console_safe
+cell::box        the sandbox + every tool implementation: check_path / check / check_exec,
+                 network_exfil, credential_leak, is_high_risk, sanitize_output,
+                 wrap_tool_output, rg / glob / find / list_dir / read / write / edit,
+                 gitignore matcher, walk_entries (lazy DFS), read-before-edit log, file cache
+cell::net        curl transport: perform / CURL_post / CURL_stream_post / CURL_get,
+                 RAII header_list, OpenAI-style error body extraction
+cell::sys        print/println/eprintln/pprintln, structured logger + rotation, exception +
+                 source_location, scoped_exit, dynamically-scaling thread_pool, signal handlers
+cell::config     provider registry, settings, load/save + legacy migration
+cell::encrypt    base64, secure_string, Argon2id + AES-256-GCM vault
+cell::tools      Policy (Deny/Ask/Allow), tool base class, callable_tool (approval + gates)
+cell::llm        SSE parsers (generator + incremental feed), OpenAI and Anthropic clients
+cell::chat       session (per-cwd persistence) and history (in-memory session map)
+cell::skills     front-matter parser, recursive scanner, metadata prompt
+cell::stats      usage counters in .cell/usages.json
+```
+
+## The agent loop
+
+```
+user message ──▶ LLM (stream) ──▶ tool_calls? ──▶ pass 1: read-only tools, concurrent
+                    │                              pass 2: write/edit (sequential), exec (confirm)
+                    │                                   │
+                    │      results sanitized + wrapped ──▶ appended to transcript ──▶ next round
+                    └──▶ no tool calls ──▶ final answer ──▶ session persisted
+```
+
+There is no fixed round cap: the loop continues until the model answers without tool calls, a call is
+blocked/rejected, the user cancels, or an error occurs. Each round logs `round=`, context size, token
+counts, cache hit rate, total time and time-to-first-token. After every user turn the session and
+config are persisted.
+
+## Streaming UI and keyboard control
+
+- `> ` prompt, `reply> ` prefix for streamed answers; the reasoning stream is printed **dim**, the
+  answer **plain**, tool results and their echo **cyan**.
+- While waiting for the first token a `⏳ Ns` spinner is refreshed every 500 ms; afterwards a
+  `~N tok` counter is refreshed on line boundaries.
+- **Esc** during a stream cancels it: the partial reply is kept in the transcript and `[cancelled]`
+  is printed. (Implemented by `cell::plat::peek_key`, which temporarily puts stdin in raw mode.)
+- **Ctrl+C** (and `SIGABRT`/`SIGFPE`/`SIGILL`/`SIGSEGV`) runs the persistence hook — save session,
+  save config, flush async writes — restores the terminal and exits with the signal number.
+- Non-interactive mode (stdin is not a tty) reads all of stdin as one message, requires a configured
+  provider, runs the agent loop once and exits.
+
+## Logging, signals and exit codes
+
+Log lines are `[YYYY-MM-DD HH:MM:SS] LEVEL [cat  ] message` (UTC). Categories include `boot`, `core`,
+`llm`, `tool`, `sess`, `ctx`, `cmd`, `user`, `probe`, `provider`, `model`, `think`, `sandbox`,
+`skill`, `stats`, `vault`. Only `llm` and `tool` activity is mirrored to the console (`ERROR` always
+is; `DEBUG` only with `--verbose`), so the terminal stays readable while the file keeps everything.
+Writes are buffered in 16 KiB chunks and flushed immediately for `ERROR`.
+
+| Situation | Exit code |
+|---|---|
+| Normal exit, or `--selftest` passed | `0` |
+| Unknown option / missing option value | `1` |
+| Non-interactive run with no provider configured | `1` |
+| Fatal `cell::sys::exception` or unhandled `std::exception` (logged, then the RAII guard persists state) | `1` |
+| Terminated by a caught signal | the signal number |
+
+A `set_terminate` handler records the type of any escaping exception, and a `set_new_handler` records
+out-of-memory before aborting.
+
+## Self-test
+
+```bash
+cell --selftest
+```
+
+Runs against a throwaway `.cell-selftest/` root (removed afterwards) and covers: high-risk and
+sandbox decisions in all four modes, path/traversal/symlink/credential blocking, the injection
+sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-across-lines,
+punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
+read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
+`rg`/`glob`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
+the tool registry and its policies, 16-way concurrent read-only tool calls, incremental SSE parsing
+and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
+round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
+semantics, the cwd index, load-time re-sanitization of exec results, skill discovery (including
+directory-style) and usage statistics. Prints `selftest OK` / `selftest FAILED`.
+
+## Implementation notes
+
+A few places where the code and its own help text/comments differ, or where behaviour is
+intentionally stricter than it looks:
+
+- `print_usage` still advertises `--sandbox git | safe | open`; the values actually parsed are
+  `read-only` / `workspace-write` / `full-access` / `outer-full` (plus the `readonly` / `write` /
+  `full` / `outer` aliases).
+- Startup always opens a **fresh** session (`history::now()` under the `"current"` key);
+  `--session` / the `session` field are persisted but not used to resume automatically — resume with
+  `/session ID`.
+- The built-in default `sandbox_mode` in `settings` is currently `full-access`, so a missing
+  `config.json` starts wide open; an existing file without that key falls back to `workspace-write`,
+  and the `/sandbox` help text still calls `workspace-write` the default.
+- The comment above `cwd_id()` says "sha3-256"; the implementation uses `crypto_hash_sha256`
+  (SHA-256, truncated to 16 hex characters).
+- In `workspace-write` mode the `exec` gate calls `is_in_workspace()` on the **whole command string**,
+  which is resolved relative to the cwd — so it rejects commands that start with an absolute path
+  outside the workspace, rather than auditing each file argument.
+- `exec` is the only tool whose output is scanned for injection fingerprints; the other tools are
+  considered sandboxed at call time and get a size cap only.
+- The tool-output wrapper tag is written with an escaped forward slash in the source; the escape
+  collapses to a plain slash at runtime, so the marker that reaches the transcript is an opening tag
+  carrying the `tool` and `path` attributes, and the reload-time sanitizer keys off the `exec` value of
+  that attribute.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
