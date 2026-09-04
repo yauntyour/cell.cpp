@@ -4,9 +4,9 @@
 
 **A single-file AI coding agent in modern C++26**
 
-One translation unit, one executable: talk to OpenAI- or Anthropic-compatible endpoints, let the
-model read / write / edit / search / execute inside a strict sandbox, and keep every credential in an
-encrypted on-disk vault.
+One translation unit, one executable: talk to OpenAI- / Anthropic-compatible endpoints (OpenAI
+Chat Completions, OpenAI Responses, and Anthropic messages), let the model read / write / edit /
+search / execute inside a strict sandbox, and keep every credential in an encrypted on-disk vault.
 
 [![C++26](https://img.shields.io/badge/C%2B%2B-26-blue?logo=cplusplus)](https://isocpp.org/)
 [![Single file](https://img.shields.io/badge/layout-single%20translation%20unit-orange)](cell.cpp)
@@ -42,14 +42,14 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 
 | | Feature | Where it lives |
 |---|---|---|
-| 🤖 | **Two API styles** — OpenAI (`{base}/chat/completions`) and Anthropic (`{base}/v1/messages`), both streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
+| 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
 | 🔧 | **7 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` | `cell::box`, `cell::tools` |
-| 🛡️ | **Four sandbox modes** — `read-only`, `workspace-write`, `full-access`, `outer-full`; network egress and credential reads are denied in *every* mode | `cell::box::check_exec` |
+| 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; network egress is denied in *every* mode and credential/secret files are off limits everywhere | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
-| 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max) streams `reasoning_content` (OpenAI) or `thinking_delta` (Anthropic) in dim text; thinking content is persisted in sessions | `cell::llm` |
+| 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max); OpenAI streams `reasoning_content`, Anthropic streams `thinking_delta`, both rendered dim; reasoning content is persisted in sessions | `cell::llm` |
 | 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
 | 📊 | **Usage statistics** — per-model and per-session request/token/character counters with prompt-cache hit rate | `cell::stats` |
 | ⚡ | **Async I/O** — session/config/stats writes are coalesced and flushed by one background thread; a dynamic worker pool runs read-only tool calls concurrently | `cell::async_io`, `cell::sys::thread_pool` |
@@ -137,7 +137,7 @@ usage: cell [options]
   --key KEY                   api key (saved to the encrypted vault)
   --session ID                resume an existing session (switches to its working directory)
   --system TEXT               system prompt
-  --sandbox MODE              exec sandbox mode (see below)
+  --sandbox MODE              exec sandbox mode: read-only | workspace-write (default) | full-access | outer-full
   --no-color                  disable colored log output
   --verbose                   enable DEBUG-level log output on console
   --selftest                  run internal self tests
@@ -145,14 +145,14 @@ usage: cell [options]
 
 | Option | Value | Effect |
 |---|---|---|
-| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`). |
+| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`); for OpenAI-style providers with no explicit style, the API style defaults to `openai-chat`. |
 | `--base` | URL | Sets `base` on the current provider. There is **no built-in default base** — an empty base means the provider is unusable until you set one. |
 | `--model` | string | Active model name, stored as-is (it need not appear in `/models`; a mismatch only warns). |
 | `--proxy` | URL | HTTP(S) proxy for the current provider, credentials may be embedded. `localhost`, `127.0.0.1`, `::1` always bypass it (`CURLOPT_NOPROXY`); HTTPS targets are tunnelled with `CONNECT`. |
 | `--key` | secret | Encrypted into `.cell/.crypt` under the id `provider:<name>` and bound to the current provider; the plaintext copy is zeroed (`sodium_memzero`) immediately. |
 | `--session` | id | Stored as `cfg.session_id`. See [Implementation notes](#implementation-notes): startup always opens a fresh session, so resume with `/session ID`. |
 | `--system` | text | Replaces the system prompt entirely. |
-| `--sandbox` | `read-only`/`readonly`, `workspace-write`/`write`, `full-access`/`full`, `outer-full`/`outer` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `workspace-write`, but leaves the live mode at the built-in default (see [implementation notes](#implementation-notes)). |
+| `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. Note: `print_usage` also advertises `workspace-write` / `outer-full` aliases, but only the three modes above are implemented. |
 | `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
 | `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
 | `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
@@ -181,9 +181,9 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | Command | Description |
 |---|---|
 | `/help` | Print the command list |
-| `/provides` | List configured providers (style, base, proxy, key state, model) |
+| `/provides` | List configured providers (style, api_style, base, proxy, key state, model) |
 | `/provide NAME` | Select a provider (persisted immediately) |
-| `/provide add openai:URL [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style (a spaced `openai: URL` form is accepted). After adding, the model list is fetched once as a connectivity probe. |
+| `/provide add openai:URL [api_style:openai-chat\|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style and an optional `api_style:` overrides the derived style (a spaced `openai: URL` form is accepted). After adding, the model list is fetched once as a connectivity probe. |
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
@@ -245,7 +245,8 @@ injection sanitizer before it is inserted, and the read-before-edit log is reset
 ## Tools
 
 Seven tools are registered, with schemas emitted for the active API style
-(`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic).
+(`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic, and
+`{"type":"function","name":…,"parameters":…}` for the Responses API).
 
 | Tool | Policy | Arguments | Behaviour |
 |---|---|---|---|
@@ -253,9 +254,12 @@ Seven tools are registered, with schemas emitted for the active API style
 | `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; records the returned line range for the read-before-edit rule |
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
-| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget |
+| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget; nested/alternation-quantifier regexes and patterns over 200 chars are rejected |
 | `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata. When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Combine with metadata filters to narrow results. Returns `path  size bytes  mtime (UTC)` per match |
+
+The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
+`larger_than_bytes` metadata filters.
 
 **Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
 (`ls`/`read`/`rg`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
@@ -274,29 +278,22 @@ consecutive edits of one file skip the disk while an external writer is always p
 
 ## Security model
 
-Six independent layers, from the path down to the bytes shown on your screen.
+Five independent layers, from the path down to the bytes shown on your screen.
 
 ### 1. Sandbox modes
 
-Set with `/sandbox [mode]`, `--sandbox MODE` or the `sandbox_mode` config key.
+Set with `/sandbox [mode]`, `--sandbox MODE` or the `sandbox_mode` config key. Tools are admitted or
+refused by mode before any command runs:
 
-| Mode | `exec` | Path-checked tools (`ls`/`read`/`rg`/`glob`/`find`/`write`/`edit`) |
+| Mode | Allowed tools | `exec` |
 |---|---|---|
-| `read-only` | refused (`check_exec` returns false before anything else) | confined to the current working directory by `check_path` |
-| `workspace-write` | allowed, subject to gates 2–4 | any non-sensitive path (`check_path` adds no workspace rule in this mode) |
-| `full-access` | allowed | any non-sensitive path |
-| `outer-full` | allowed | any non-sensitive path |
+| `read-only` | `read`, `rg`, `find`, `ls` (and anything run read-only) | **blocked entirely** |
+| `edit-only` | `read`/`rg`/`find`/`ls` **plus** `write`/`edit` | allowed, subject to gates 2–3 |
+| `full-access` (default) | all tools | allowed, subject to gates 2–3 |
 
-Network egress and credential access are denied in **all four** modes, and the sensitive-path list
-below applies in all four as well.
-
-The workspace confinement of `write`/`edit` is mode-independent in practice: those two tools are
-`Policy::Allow`, so they are gated by `check_path` (traversal + vault/credential list + the
-`read-only` "inside the workspace" rule) rather than by `check()`, whose "block all write/exec
-operations in `read-only`" and "workspace only in `workspace-write`" branches sit on the `Ask`/`exec`
-code path. In other words, `read-only` stops `exec` completely but still lets the model create or edit
-files inside the cwd, and `workspace-write` does not additionally restrict `write`/`edit` to the cwd.
-See [implementation notes](#implementation-notes).
+Network egress is denied in **all three** modes, and the sensitive-path rules in layer 2 apply
+everywhere. `exec` is the only tool gated by a human confirmation prompt (layer 4); in `read-only`
+mode `exec` is refused before the prompt is ever shown.
 
 ### 2. Path gate — `check_path` / `is_sensitive_path`
 
@@ -307,60 +304,52 @@ See [implementation notes](#implementation-notes).
   `~/.aws/{credentials,config}`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`,
   `~/.git/config`, `~/.git/hooks`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`,
   `~/.kube/config`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`;
-- paths are canonicalized with `weakly_canonical` first, so a symlink or junction pointing at a
-  credential file is blocked under its literal name too.
+- paths are canonicalized with `weakly_canonical` first (symlinks/junctions resolved), so a link
+  pointing at a credential file is blocked under its literal name too.
 
 Only the `path`/`dirpath` field is checked for `write`/`edit` — code content may legitimately
 contain `>`, `|` or `..`.
 
 ### 3. Command gate — `check` / `check_exec`
 
-- **injection primitives rejected outright**: `|`, `>`, `>>`, backticks, `$(…)`;
-- **deny-token list** (token-aware, case-insensitive): disk destruction (`format`, `mkfs`, `fdisk`,
-  `diskpart`), system control (`shutdown`, `reboot`, `halt`, `taskkill`), registry/user management
-  (`reg delete`, `net user`, `net localgroup`, `net group`), permission manipulation (`cacls`,
-  `icacls`, `takeown`, `attrib`), `cmd /c del|format|rd`, `dd if=`, fork bombs, `curl|sh` /
-  `wget -o`, `eval `/`exec `, and inline-code / encoded-payload forms (`exec(`, `eval(`,
-  `compile(`, `iex(`, `import base64`, `b64decode`, `fromhex`, `unhexlify`, `atob(`);
-- **network egress**: matched by command name against a list of ~40 egress binaries (`curl`, `wget`,
-  `nc`, `ssh`, `scp`, `rsync`, `rclone`, `aws`, `gcloud`, `az`, `nmap`, `socat`, `git-remote-http`,
-  `yt-dlp`, …) in command position or after `&&`/`&`/`;`. Shell wrappers (`cmd /c`, `sh -c`,
-  `pwsh -Command`, …) are normalized so `cmd /c curl …` is still caught. Scripted clients are caught
-  by keyword (`urllib`, `requests.`, `httpx`, `socket.`, `fetch(`, `axios`, `websocket`,
-  `Invoke-RestMethod`, `/dev/tcp`, `boto3`, `paramiko`, …), and network-touching git subcommands
-  (`push`, `pull`, `fetch`, `clone`, `lfs`, `submodule`, bare `git remote`) are denied;
-- **credential leak**: whole-environment dumps (`env`, `printenv`, `cmd /c set`), secret variable
-  names (`$OPENAI_API_KEY`, `%ANTHROPIC_API_KEY%`, `$CELL_APIKEY`, `$CELL_MASTERKEY`,
-  `$GIT_ASKPASS`) and any reference to the vault's files are refused.
+The sandbox is **path-only**: the command string is checked for path traversal (`..`) and for
+sensitive paths (`/.crypt`, `/.key`, `/config.json`, `/sessions/`, `/logs/` and the same credential
+store names listed above). It does **not** attempt to block network egress by parsing command names,
+decode encoded payloads, or forbid shell operators — the threat model assumes an untrusted *agent*
+running inside a trusted host, where `exec` commands are confirmed by the user (or autoallowed in
+full-access). In `read-only` mode `exec` is refused outright. Note also that `exec` can still run
+interpreters such as `python3 -c "exec(base64…)"` or `cmd /c "echo …"`, because the gate only
+inspects paths, not inline code.
+
+High-risk commands that pass the sandbox still demand a **second** confirmation: recursive/forced
+deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`chmod`, `chown`,
+`sudo`, `cacls`, `icacls`, `takeown`) and git operations that can trigger hooks or rewrite history
+(`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`, `stash`, `clean`,
+`reset`, `restore`).
 
 ### 4. Human confirmation
 
 `exec` is the only `Ask` tool: `allow exec({…})? [y/N]` — the argument is printed through
 `display_safe`, so injected JSON cannot erase the prompt or fake an approval. When **autoallow mode**
 is enabled (`/autoallow on`, full-access sandbox only), the LLM alone decides whether exec commands
-run without user confirmation — sandbox checks (network egress, sensitive paths) still apply.
-Commands that pass the sandbox but are still destructive demand a **second** confirmation:
-recursive/forced deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes
-(`chmod`, `chown`, `sudo`, `cacls`, `icacls`, `takeown`) and git operations that can trigger hooks
-or rewrite history (`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`,
-`stash`, `clean`, `reset`, `restore`). A rejected or blocked call ends the current agent run instead
-of letting the model retry it.
+run without user confirmation — sandbox checks (sensitive paths) still apply. A rejected or blocked
+call ends the current agent run instead of letting the model retry it.
 
 ### 5. Output hardening
 
 - **`sanitize_output`** (applied to `exec` results, and to `exec`-tagged results reloaded from disk):
-  truncates to a byte cap, then redacts line-by-line against ~50 command-override fingerprints plus
-  three regex families (verb + filler + `instructions|rules|system prompt|sandbox|safety`,
-  `you are now …`, `no longer bound …`). Matching runs on a flattened form of each line: UTF-8
-  decoded, fullwidth/Latin-1/Cyrillic/Greek homoglyphs folded to ASCII, zero-width and bidi marks
-  dropped, punctuation collapsed to spaces, and windows of up to 6 adjacent lines joined so split
-  fingerprints still match. The tool-output wrapper framing lines are never redacted (they carry the
-  `tool="exec"` marker used on reload).
+  truncates to a byte cap (128 KiB), then redacts line-by-line against ~50 command-override
+  fingerprints plus three regex families (verb + filler + `instructions|rules|system prompt|sandbox|
+  safety`, `you are now …`, `no longer bound …`). Matching runs on a flattened form of each line:
+  UTF-8 decoded, fullwidth/Latin-1/Cyrillic/Greek homoglyphs folded to ASCII, zero-width and bidi
+  marks dropped, punctuation collapsed to spaces, and windows of up to 6 adjacent lines joined so
+  split fingerprints still match. The tool-output wrapper framing lines are never redacted (they
+  carry the `tool="exec"` marker used on reload).
 - **`wrap_tool_output`**: every result is wrapped in an explicit untrusted-data boundary tag that
-  carries the tool name and a path/command marker, with the attributes sanitized and any occurrence of
-  that closing tag inside the body escaped, so injected content cannot forge a nested "authorized" tool
-  block or break out of the wrapper.
-- **`truncate_output`**: non-exec results get a size cap without the injection scan.
+  carries the tool name and a path/command marker, with the attributes sanitized and any occurrence
+  of that closing tag inside the body escaped, so injected content cannot forge a nested "authorized"
+  tool block or break out of the wrapper.
+- **`truncate_output`**: non-exec results get a size cap (512 MiB) without the injection scan.
 - **`display_safe`** (single-line, ANSI-stripped) for confirmation prompts and skill metadata;
   **`console_safe`** (multi-line, ANSI-stripped) for the cyan console echo of tool output, which is
   additionally capped at 16 KiB.
@@ -403,15 +392,16 @@ never appears in the vault file — the self-test asserts this.
 ```json
 {
   "providers": [
-    { "name": "openai", "style": "openai", "base": "https://api.openai.com/v1",
+    { "name": "openai", "style": "openai", "api_style": "openai-chat", "base": "https://api.openai.com/v1",
       "key": "provider:openai", "proxy": "http://user:pass@host:8080" },
-    { "name": "claude", "style": "anthropic", "base": "https://api.anthropic.com" }
+    { "name": "claude", "style": "anthropic", "api_style": "anthropic", "base": "https://api.anthropic.com" }
   ],
   "current_provider": "openai",
   "current_model": "gpt-4o",
   "think_level": 0,
   "tools": true,
   "sandbox_mode": "full-access",
+  "autoallow": false,
   "system": "You are a helpful assistant.…",
   "session": "6333a2b6f7084f1a-1787819024",
   "log_max_lines": 1000,
@@ -422,12 +412,13 @@ never appears in the vault file — the self-test asserts this.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
+| `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `api_style` (`openai-chat` \| `openai-responses` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
 | `current_provider` | first entry | Active provider when empty |
 | `current_model` | — | Active model name |
 | `think_level` | `0` | Chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192). Legacy `think: true` maps to level 2. |
 | `tools` | `true` | Tool calling enabled |
-| `sandbox_mode` | `workspace-write` when the key is absent from an existing file, `full-access` in the built-in defaults | See [sandbox modes](#1-sandbox-modes) |
+| `sandbox_mode` | `full-access` | See [sandbox modes](#1-sandbox-modes) |
+| `autoallow` | `false` | LLM decides whether exec commands run (only effective in full-access) |
 | `system` | short assistant prompt | System prompt |
 | `log_max_lines` | `1000` (min 10) | `logs/cell.log` is trimmed to its tail on every startup |
 | `thread_pool_size` | `16` (clamped 1–16) | Max concurrent read-only tool workers; the pool spawns lazily and idles with zero workers |
@@ -476,8 +467,8 @@ cell::plat       OS shims: spawn_cmd (timeout + process-tree kill), is_tty, init
                  peek_key (Esc cancel), executable_dir, restore_console
 cell::text       zero-copy line generator, trim, BOM strip, display_safe / console_safe
 cell::box        the sandbox + every tool implementation: check_path / check / check_exec,
-                 network_exfil, credential_leak, is_high_risk, sanitize_output,
-                 wrap_tool_output, rg / glob / find / list_dir / read / write / edit,
+                 is_high_risk, sanitize_output, wrap_tool_output, truncate_output,
+                 rg / find / list_dir / read / write / edit,
                  gitignore matcher, walk_entries (lazy DFS), read-before-edit log, file cache
 cell::net        curl transport: perform / CURL_post / CURL_stream_post / CURL_get,
                  RAII header_list, OpenAI-style error body extraction
@@ -486,7 +477,7 @@ cell::sys        print/println/eprintln/pprintln, structured logger + rotation, 
 cell::config     provider registry, settings, load/save + legacy migration
 cell::encrypt    base64, secure_string, Argon2id + AES-256-GCM vault
 cell::tools      Policy (Deny/Ask/Allow), tool base class, callable_tool (approval + gates)
-cell::llm        SSE parsers (generator + incremental feed), OpenAI and Anthropic clients
+cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResponses / Anthropic clients
 cell::chat       session (per-cwd persistence) and history (in-memory session map)
 cell::skills     front-matter parser, recursive scanner, metadata prompt
 cell::stats      usage counters in .cell/usages.json
@@ -546,11 +537,11 @@ cell --selftest
 ```
 
 Runs against a throwaway `.cell-selftest/` root (removed afterwards) and covers: high-risk and
-sandbox decisions in all four modes, path/traversal/symlink/credential blocking, the injection
+sandbox decisions in all three modes, path/traversal/symlink/credential blocking, the injection
 sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-across-lines,
 punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
 read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
-`rg`/`glob`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
+`rg`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
 the tool registry and its policies, 16-way concurrent read-only tool calls, incremental SSE parsing
 and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
@@ -560,22 +551,24 @@ directory-style) and usage statistics. Prints `selftest OK` / `selftest FAILED`.
 ## Implementation notes
 
 A few places where the code and its own help text/comments differ, or where behaviour is
-intentionally stricter than it looks:
+intentionally simpler than it looks:
 
-- `print_usage` still advertises `--sandbox git | safe | open`; the values actually parsed are
-  `read-only` / `workspace-write` / `full-access` / `outer-full` (plus the `readonly` / `write` /
-  `full` / `outer` aliases).
+- `print_usage` and `print_help` still advertise `workspace-write` / `outer-full` sandbox aliases; the
+  values actually implemented are `read-only` / `edit-only` / `full-access` (plus the `readonly` /
+  `edit` / `full` aliases). An unknown value warns and rewrites the stored value to `full-access`.
+- The sandbox is **path-only**: `box::check_exec` / `box::check` do **not** parse command names,
+  decode encoded payloads, or block network egress by binary name — they only reject path traversal
+  and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
+  commands; `exec` is gated instead by the sandbox mode, a human confirmation (or autoallow), and the
+  high-risk second-confirmation list.
 - Startup always opens a **fresh** session (`history::now()` under the `"current"` key);
   `--session` / the `session` field are persisted but not used to resume automatically — resume with
   `/session ID`.
-- The built-in default `sandbox_mode` in `settings` is currently `full-access`, so a missing
-  `config.json` starts wide open; an existing file without that key falls back to `workspace-write`,
-  and the `/sandbox` help text still calls `workspace-write` the default.
+- The built-in default `sandbox_mode` in `settings` is `full-access`, so a missing `config.json` starts
+  wide open; the `/sandbox` and `--sandbox` help text still mention `workspace-write`/`outer-full`
+  defaults that are not implemented.
 - The comment above `cwd_id()` says "sha3-256"; the implementation uses `crypto_hash_sha256`
   (SHA-256, truncated to 16 hex characters).
-- In `workspace-write` mode the `exec` gate calls `is_in_workspace()` on the **whole command string**,
-  which is resolved relative to the cwd — so it rejects commands that start with an absolute path
-  outside the workspace, rather than auditing each file argument.
 - `exec` is the only tool whose output is scanned for injection fingerprints; the other tools are
   considered sandboxed at call time and get a size cap only.
 - The tool-output wrapper tag is written with an escaped forward slash in the source; the escape
