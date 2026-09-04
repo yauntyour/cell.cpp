@@ -49,7 +49,7 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
-| 🧠 | **Chain of thought** — `/think` streams `reasoning_content` (OpenAI) or `thinking_delta` (Anthropic) in dim text | `cell::llm` |
+| 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max) streams `reasoning_content` (OpenAI) or `thinking_delta` (Anthropic) in dim text; thinking content is persisted in sessions | `cell::llm` |
 | 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
 | 📊 | **Usage statistics** — per-model and per-session request/token/character counters with prompt-cache hit rate | `cell::stats` |
 | ⚡ | **Async I/O** — session/config/stats writes are coalesced and flushed by one background thread; a dynamic worker pool runs read-only tool calls concurrently | `cell::async_io`, `cell::sys::thread_pool` |
@@ -187,7 +187,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
-| `/think [on\|off]` | Toggle chain-of-thought output (persisted) |
+| `/think [off\|low\|med\|high\|max]` | Set chain-of-thought level (persisted); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
 | `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |
 | `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
@@ -195,6 +195,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/session rm ID` | Delete a session file and its usage record |
 | `/usages` | Print per-model and per-session usage statistics (orphaned records are pruned first) |
 | `/compact` | Aggregate the conversation into one summary message |
+| `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
 | `/skills` | List available skills |
 | `/skill NAME` | Inject a skill body into the current session as a system message |
 | `/save` | Persist the current session now (flushes the async writer) |
@@ -203,11 +204,13 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/exit`, `/quit` | Exit |
 
 **Chain of thought (`/think`).** For OpenAI-style providers nothing extra is sent — reasoning models
-already stream `delta.reasoning_content`, and `/think on` displays it dim ahead of the answer, so
+already stream `delta.reasoning_content`, and `/think` displays it dim ahead of the answer, so
 non-reasoning models are unaffected. For Anthropic-style providers the request body gains
-`thinking: {"type":"enabled","budget_tokens":2048}` (with `max_tokens` raised from 4096 to 8192) and
-the streamed `thinking_delta` / `signature_delta` blocks are rendered dim; the thinking blocks stay in
-the stored assistant message, which Anthropic requires when a tool call follows a thinking turn.
+`thinking: {"type":"enabled","budget_tokens":N}` (where N depends on the level: low=1024, med=2048,
+high=4096, max=8192; `max_tokens` is raised accordingly) and the streamed `thinking_delta` /
+`signature_delta` blocks are rendered dim; the thinking blocks stay in the stored assistant message,
+which Anthropic requires when a tool call follows a thinking turn. For OpenAI, reasoning_content is
+now stored in the session for persistence across restarts.
 
 **Skills (`/skills`, `/skill`).** A skill is a Markdown file under `.cell/skills/`, discovered only if
 it opens with a YAML-style front matter block; the scanner recurses (depth ≤ 6), so directory-style
@@ -250,7 +253,7 @@ Seven tools are registered, with schemas emitted for the active API style
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget |
-| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout **and** stderr are captured; use `wd` to set the working directory; the result always ends with `exitcode=N` |
+| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata. When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Combine with metadata filters to narrow results. Returns `path  size bytes  mtime (UTC)` per match |
 
 **Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
@@ -403,7 +406,7 @@ never appears in the vault file — the self-test asserts this.
   ],
   "current_provider": "openai",
   "current_model": "gpt-4o",
-  "think": false,
+  "think_level": 0,
   "tools": true,
   "sandbox_mode": "full-access",
   "system": "You are a helpful assistant.…",
@@ -419,7 +422,8 @@ never appears in the vault file — the self-test asserts this.
 | `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
 | `current_provider` | first entry | Active provider when empty |
 | `current_model` | — | Active model name |
-| `think` / `tools` | `false` / `true` | CoT output, tool calling |
+| `think_level` | `0` | Chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192). Legacy `think: true` maps to level 2. |
+| `tools` | `true` | Tool calling enabled |
 | `sandbox_mode` | `workspace-write` when the key is absent from an existing file, `full-access` in the built-in defaults | See [sandbox modes](#1-sandbox-modes) |
 | `system` | short assistant prompt | System prompt |
 | `log_max_lines` | `1000` (min 10) | `logs/cell.log` is trimmed to its tail on every startup |
