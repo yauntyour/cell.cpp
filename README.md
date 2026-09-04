@@ -44,7 +44,7 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 |---|---|---|
 | 🤖 | **Two API styles** — OpenAI (`{base}/chat/completions`) and Anthropic (`{base}/v1/messages`), both streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
-| 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `glob`, `find` | `cell::box`, `cell::tools` |
+| 🔧 | **7 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` | `cell::box`, `cell::tools` |
 | 🛡️ | **Four sandbox modes** — `read-only`, `workspace-write`, `full-access`, `outer-full`; network egress and credential reads are denied in *every* mode | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
@@ -240,7 +240,7 @@ injection sanitizer before it is inserted, and the read-before-edit log is reset
 
 ## Tools
 
-Eight tools are registered, with schemas emitted for the active API style
+Seven tools are registered, with schemas emitted for the active API style
 (`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic).
 
 | Tool | Policy | Arguments | Behaviour |
@@ -249,13 +249,12 @@ Eight tools are registered, with schemas emitted for the active API style
 | `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; records the returned line range for the read-before-edit rule |
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
-| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500) | Recursive content search; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; rejects patterns > 200 chars and nested/alternation quantifier groups (ReDoS); 8M-line scan budget |
-| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s) | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout **and** stderr are captured; the result always ends with `exitcode=N` |
-| `glob` | Allow | `pattern` (required), `path` | Recursive filename match (`**` crosses directories, `*`/`?` do not); 500 results max |
-| `find` | Allow | `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Metadata filter: `path  size bytes  mtime (UTC)` per hit |
+| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget |
+| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout **and** stderr are captured; use `wd` to set the working directory; the result always ends with `exitcode=N` |
+| `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata. When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Combine with metadata filters to narrow results. Returns `path  size bytes  mtime (UTC)` per match |
 
 **Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
-(`ls`/`read`/`rg`/`glob`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
+(`ls`/`read`/`rg`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
 and `edit` are deliberately deferred to a second, **sequential** pass so that same-message reads
 always complete first (read-before-edit) and two edits of one file never race; `exec` runs
 sequentially after an interactive confirmation. Results are appended to the transcript in the

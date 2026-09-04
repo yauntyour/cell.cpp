@@ -1861,8 +1861,12 @@ namespace cell
             }
         }
         // recursive content search: skips hidden entries and .gitignore'd paths,
-        // caps at max_results, groups matches per file as "line: content"
-        bool rg(std::string_view pattern, std::string_view root_path, size_t max_results, std::string &output)
+        // caps at max_results, groups matches per file as "line: content".
+        // supports: case-insensitive (-i), context lines (-C N), file type filter
+        // (-t ext), count mode (-c), and an optimized literal fast path.
+        bool rg(std::string_view pattern, std::string_view root_path, size_t max_results,
+                std::string &output, bool ignore_case = false, size_t context = 0,
+                std::string_view file_type = "", bool count_only = false)
         {
             // pattern guards: pathological regexes (nested or alternation
             // quantifier groups) can take exponential time on attacker-controlled
@@ -1882,17 +1886,35 @@ namespace cell
             }
             try
             {
-                std::regex re{std::string(pattern)};
+                // compile the regex with optional case-insensitive flag
+                auto flags = ignore_case ? (std::regex::icase | std::regex::optimize) : std::regex::optimize;
+                std::regex re{std::string(pattern), flags};
                 // literal fast path: a pattern without regex metacharacters is a
                 // plain substring search — std::string::find is an order of
-                // magnitude faster than per-line std::regex_search
+                // magnitude faster than per-line std::regex_search. for
+                // case-insensitive literal search, we use a lowercased copy.
                 bool literal = pattern.find_first_of(R"(.*+?[](){}|^$\\)") == std::string_view::npos;
+                std::string pattern_lower;
+                if (literal && ignore_case)
+                {
+                    pattern_lower = std::string(pattern);
+                    lower_ascii(pattern_lower);
+                }
                 std::filesystem::path root(root_path);
                 std::error_code ec;
                 if (!std::filesystem::is_directory(root, ec))
                 {
                     output = std::format("rg: not a directory: {}", std::string(root_path));
                     return false;
+                }
+                // optional file type extension filter (e.g. "cpp", "h")
+                std::string ext_filter;
+                if (!file_type.empty())
+                {
+                    ext_filter = std::string(file_type);
+                    lower_ascii(ext_filter);
+                    if (ext_filter.front() != '.')
+                        ext_filter = "." + ext_filter;
                 }
                 // gitignore levels, root first (prefix ""); levels track walker depth
                 std::vector<ignore_level> stack;
@@ -1904,9 +1926,12 @@ namespace cell
                     stack.push_back(std::move(lv));
                 }
                 size_t count = 0;
+                size_t files_scanned = 0;
                 size_t scanned = 0; // scan budget: cap total lines read
                 bool truncated = false;
                 std::string line; // reused across files: getline keeps the capacity
+                // for context mode: ring buffer of recent lines per file
+                std::vector<std::pair<size_t, std::string>> ctx_buf; // (1-based line number, content)
                 for (auto &&[p, rel, is_dir] : walk_entries(root))
                 {
                     if (count >= max_results || scanned >= 8'000'000)
@@ -1927,14 +1952,23 @@ namespace cell
                         stack.push_back(std::move(lv));
                         continue;
                     }
+                    // optional extension filter: skip non-matching files
+                    if (!ext_filter.empty())
+                    {
+                        std::string ext = to_lower(p.extension().generic_string());
+                        if (ext != ext_filter)
+                            continue;
+                    }
                     if (std::filesystem::file_size(p, ec) > 1024 * 1024 * 128)
                         continue; // skip large/binary candidates
                     std::ifstream f(p);
                     if (!f.is_open())
                         continue;
                     size_t ln = 0;
+                    size_t file_matches = 0;
                     bool wrote_header = false;
                     std::string header = std::format("\n=== {} ===", rel);
+                    ctx_buf.clear();
                     while (std::getline(f, line))
                     {
                         ln++;
@@ -1948,16 +1982,43 @@ namespace cell
                             line.pop_back();
                         if (line.find('\0') != std::string::npos)
                             break; // binary file, stop scanning
-                        bool hit = literal ? (line.find(pattern) != std::string::npos)
-                                           : std::regex_search(line, re);
+                        bool hit = false;
+                        if (literal)
+                        {
+                            if (ignore_case)
+                            {
+                                std::string line_lower(line);
+                                lower_ascii(line_lower);
+                                hit = line_lower.find(pattern_lower) != std::string::npos;
+                            }
+                            else
+                                hit = line.find(pattern) != std::string::npos;
+                        }
+                        else
+                            hit = std::regex_search(line, re);
                         if (hit)
                         {
-                            if (!wrote_header)
+                            if (count_only)
                             {
-                                output += header + "\n";
-                                wrote_header = true;
+                                file_matches++;
                             }
-                            output += std::format("{}: {}\n", ln, line);
+                            else
+                            {
+                                if (!wrote_header)
+                                {
+                                    output += header + "\n";
+                                    wrote_header = true;
+                                }
+                                // emit context lines before the match
+                                if (context > 0 && !ctx_buf.empty())
+                                {
+                                    size_t start = ctx_buf.size() > context ? ctx_buf.size() - context : 0;
+                                    for (size_t k = start; k < ctx_buf.size(); k++)
+                                        output += std::format("{}-{}\n", ctx_buf[k].first, ctx_buf[k].second);
+                                }
+                                output += std::format("{}: {}\n", ln, line);
+                                file_matches++;
+                            }
                             count++;
                             if (count >= max_results)
                             {
@@ -1965,55 +2026,47 @@ namespace cell
                                 break;
                             }
                         }
+                        // for context mode, keep a ring buffer of recent lines
+                        if (context > 0)
+                        {
+                            ctx_buf.emplace_back(ln, line);
+                            if (ctx_buf.size() > context + 1)
+                                ctx_buf.erase(ctx_buf.begin());
+                        }
                     }
+                    if (count_only && file_matches > 0)
+                        output += std::format("{}: {}\n", rel, file_matches);
+                    files_scanned++;
                 }
-                output += std::format("\n{} match(es){}", count, truncated ? " (truncated)" : "");
+                output += std::format("\n{} match(es) in {} file(s){}", count, files_scanned, truncated ? " (truncated)" : "");
                 return true;
             }
-            catch (const std::exception &)
+            catch (const std::regex_error &e)
             {
+                output = std::format("rg: invalid regex: {}", e.what());
+                return false;
+            }
+            catch (const std::exception &e)
+            {
+                output = std::format("rg: error: {}", e.what());
                 return false;
             }
         }
-        // recursive filename glob (e.g. "**/*.test.ts"), skips hidden entries
+        // forward declaration for glob() which calls find()
+        bool find(std::string_view root_path, std::string_view pattern,
+                  std::string_view name, double newer_hours,
+                  long long larger_bytes, size_t max_results, std::string &output);
+        // recursive filename glob is now handled by find() with the 'pattern' parameter
+        // this wrapper is kept for backward compatibility in tests
         bool glob(std::string_view pattern, std::string_view root_path, std::string &output)
         {
-            try
-            {
-                std::filesystem::path root(root_path);
-                std::error_code ec;
-                if (!std::filesystem::is_directory(root, ec))
-                {
-                    output = std::format("glob: not a directory: {}", std::string(root_path));
-                    return false;
-                }
-                std::regex rx("^" + glob_regex(pattern) + "$");
-                const size_t cap = 500;
-                size_t count = 0;
-                bool truncated = false;
-                for (auto &&[p, rel, is_dir] : walk_entries(root))
-                {
-                    if (count >= cap)
-                    {
-                        truncated = true;
-                        break;
-                    }
-                    if (!is_dir && std::regex_match(rel, rx))
-                    {
-                        output += rel + "\n";
-                        count++;
-                    }
-                }
-                output += std::format("\n{} match(es){}", count, truncated ? " (truncated)" : "");
-                return true;
-            }
-            catch (const std::exception &)
-            {
-                return false;
-            }
+            return find(root_path, pattern, "", 0.0, 0, 500, output);
         }
-        // metadata filter: name glob, modification time (hours), minimum size
-        bool find(std::string_view root_path, std::string_view name, double newer_hours,
+        // unified file finder: glob pattern matching + metadata filter (name glob,
+        // modification time, size). When only 'pattern' is given, behaves like a
+        // recursive glob. When metadata filters are given, they narrow the results.
+        bool find(std::string_view root_path, std::string_view pattern,
+                  std::string_view name, double newer_hours,
                   long long larger_bytes, size_t max_results, std::string &output)
         {
             try
@@ -2025,6 +2078,11 @@ namespace cell
                     output = std::format("find: not a directory: {}", std::string(root_path));
                     return false;
                 }
+                // pattern is the primary glob filter (e.g. "**/*.test.ts")
+                std::optional<std::regex> pattern_rx;
+                if (!pattern.empty())
+                    pattern_rx.emplace("^" + glob_regex(pattern) + "$");
+                // name is an optional secondary filename filter (plain glob)
                 std::optional<std::regex> name_rx;
                 if (!name.empty())
                     name_rx.emplace("^" + glob_regex(name) + "$");
@@ -2040,6 +2098,10 @@ namespace cell
                     }
                     if (is_dir)
                         continue;
+                    // pattern filter: match the full relative path
+                    if (pattern_rx && !std::regex_match(rel, *pattern_rx))
+                        continue;
+                    // name filter: match just the filename
                     if (name_rx && !std::regex_match(p.filename().string(), *name_rx))
                         continue;
                     std::error_code ec2;
@@ -2067,8 +2129,14 @@ namespace cell
                 output += std::format("\n{} match(es){}", count, truncated ? " (truncated at max_results)" : "");
                 return true;
             }
-            catch (const std::exception &)
+            catch (const std::regex_error &e)
             {
+                output = std::format("find: invalid regex/glob pattern: {}", e.what());
+                return false;
+            }
+            catch (const std::exception &e)
+            {
+                output = std::format("find: error: {}", e.what());
                 return false;
             }
         }
@@ -2134,12 +2202,34 @@ namespace cell
             }
             return true;
         }
-        bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code)
+        bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code, std::string_view wd = "")
         {
             if (!check(cmd))
                 return false;
             exit_code = 1;
-            return plat::spawn_cmd(std::string(cmd), timeout_s, output, exit_code);
+            // change to the working directory if specified
+            std::string actual_cmd(cmd);
+            if (!wd.empty())
+            {
+                std::error_code ec;
+                auto abs_wd = std::filesystem::absolute(std::filesystem::path(wd), ec);
+                if (!ec)
+                {
+                    auto canon_wd = std::filesystem::weakly_canonical(abs_wd, ec);
+#ifdef _WIN32
+                    std::string wd_s = canon_wd.lexically_normal().generic_string();
+                    actual_cmd = std::format("cd /d \"{}\" && {}", wd_s, cmd);
+#else
+                    std::string wd_s = canon_wd.lexically_normal().generic_string();
+                    actual_cmd = std::format("cd \"{}\" && {}", wd_s, cmd);
+#endif
+                }
+            }
+            bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code);
+            // ensure trailing newline before exitcode line
+            if (!output.empty() && output.back() != '\n')
+                output += '\n';
+            return ok;
         }
         // -------- read-before-edit rule --------
         // the edit tool may only modify lines the model actually saw: every read
@@ -4111,6 +4201,7 @@ namespace cell
                 if (policy() == Policy::Deny)
                 {
                     blocked_.store(true, std::memory_order_relaxed);
+                    output = std::format("[{}] tool is disabled by policy", name());
                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=policy_deny", name()));
                     return false;
                 }
@@ -4122,6 +4213,7 @@ namespace cell
                     if (answer != "y" && answer != "Y")
                     {
                         blocked_.store(true, std::memory_order_relaxed);
+                        output = std::format("[{}] rejected by user", name());
                         cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=rejected_by_user", name()));
                         return false;
                     }
@@ -4132,8 +4224,27 @@ namespace cell
                         {
                             blocked_.store(true, std::memory_order_relaxed);
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), input));
-                            cell::sys::println("[{}] exec blocked by sandbox (mode={}) - network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode()));
+                            output = std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode()));
                             return false;
+                        }
+                        // also sandbox-check the working directory if provided
+                        try
+                        {
+                            auto j = nlohmann::json::parse(input, nullptr, false);
+                            if (j.is_object() && j.contains("wd") && j["wd"].is_string())
+                            {
+                                std::string wd_val = j["wd"].get<std::string>();
+                                if (!wd_val.empty() && !box::check_path(wd_val))
+                                {
+                                    blocked_.store(true, std::memory_order_relaxed);
+                                    output = std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val);
+                                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=wd_sandbox wd={} args={}", name(), wd_val, input));
+                                    return false;
+                                }
+                            }
+                        }
+                        catch (const std::exception &)
+                        {
                         }
                         if (box::is_high_risk(input))
                         {
@@ -4142,6 +4253,7 @@ namespace cell
                             if (answer != "y" && answer != "Y")
                             {
                                 blocked_.store(true, std::memory_order_relaxed);
+                                output = std::format("[{}] high-risk command rejected by user", name());
                                 cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
                                 return false;
                             }
@@ -4168,6 +4280,7 @@ namespace cell
                         if (blocked)
                         {
                             blocked_.store(true, std::memory_order_relaxed);
+                            output = std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name());
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox args={}", name(), input));
                             return false;
                         }
@@ -4203,6 +4316,7 @@ namespace cell
                     if (blocked)
                     {
                         blocked_.store(true, std::memory_order_relaxed);
+                        output = std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name());
                         cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=path_traversal args={}", name(), input));
                         return false;
                     }
@@ -5112,17 +5226,21 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                    std::move_only_function<bool(const nlohmann::json &, std::string &)> fn)
     {
         list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy,
-                                                                  [fn = std::move(fn)](const std::string &in, std::string &out) mutable -> bool
+                                                                  [name, fn = std::move(fn)](const std::string &in, std::string &out) mutable -> bool
                                                                   {
                                                                       nlohmann::json j;
                                                                       if (!json_args(in, j))
+                                                                      {
+                                                                          out = std::format("[{}] invalid JSON arguments: {}", name, in.size() > 200 ? in.substr(0, 200) + "..." : in);
                                                                           return false;
+                                                                      }
                                                                       try
                                                                       {
                                                                           return fn(j, out);
                                                                       }
-                                                                      catch (const std::exception &)
+                                                                      catch (const std::exception &e)
                                                                       {
+                                                                          out = std::format("[{}] internal error: {}", name, e.what());
                                                                           return false;
                                                                       }
                                                                   });
@@ -5179,19 +5297,26 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    j.value("search", ""), j.value("content", ""),
                                    num_arg(j, "from", 0), num_arg(j, "to", 0), out);
         });
-    add("rg", "Search file contents recursively. Skips hidden files/directories (names starting with '.') and paths matched by .gitignore. Returns up to max_results matches grouped by file as 'line: content'. Prefer this when searching by content.",
-        {{"pattern", str_prop("regex pattern")},
+    add("rg", "Search file contents recursively with regex support. Skips hidden files/directories and .gitignore'd paths. Returns up to max_results matches grouped by file as 'line: content'. Supports case-insensitive search, context lines, file extension filtering, and count-only mode. Prefer this when searching by content.",
+        {{"pattern", str_prop("regex pattern (supports full ECMAScript regex syntax)")},
          {"path", str_prop("directory to search (default .)")},
-         {"max_results", str_prop("max matches, capped at 500 (default 500)")}},
+         {"max_results", str_prop("max matches, capped at 500 (default 500)")},
+         {"ignore_case", str_prop("case-insensitive search (default false)")},
+         {"context", str_prop("number of context lines to show around each match (default 0)")},
+         {"file_type", str_prop("file extension filter, e.g. 'cpp', 'h', 'py' (optional)")},
+         {"count_only", str_prop("only count matches per file, don't show lines (default false)")}},
         {"pattern"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
             return cell::box::rg(j.value("pattern", ""), j.value("path", "."),
-                                 std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
+                                 std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out,
+                                 j.value("ignore_case", false), num_arg(j, "context", 0),
+                                 j.value("file_type", ""), j.value("count_only", false));
         });
-    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. The command is sandboxed: by default only local git subcommands are allowed; network-egress commands (curl, wget, git push/fetch/clone, python urllib, node fetch, ...) are denied in every mode, and non-whitelisted commands need a broader sandbox mode. High-risk commands (rm -rf, chmod, ...) require a second confirmation.",
+    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command is sandboxed: network-egress commands (curl, wget, git push/fetch/clone, ...) are denied in every mode. High-risk commands (rm -rf, chmod, ...) require a second confirmation.",
         {{"cmd", str_prop("shell command to execute")},
-         {"timeout", str_prop("timeout in seconds, default 30, max 300")}},
+         {"timeout", str_prop("timeout in seconds, default 30, max 300")},
+         {"wd", str_prop("working directory for the command (optional, defaults to cwd)")}},
         {"cmd"}, Policy::Ask,
         [](const nlohmann::json &j, std::string &out)
         {
@@ -5199,28 +5324,22 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             if (!(timeout > 0) || timeout > 300)
                 timeout = 30.0;
             int exit_code = 1;
-            bool ok = cell::box::exec(j.value("cmd", ""), timeout, out, exit_code);
-            out += std::format("\nexitcode={}", exit_code);
+            bool ok = cell::box::exec(j.value("cmd", ""), timeout, out, exit_code, j.value("wd", ""));
+            out += std::format("exitcode={}", exit_code);
             return ok;
         });
-    add("glob", "Find files by filename pattern (e.g. '**/*.test.ts'). Use this to narrow down candidates when ls returns too many entries. Skips hidden files.",
-        {{"pattern", str_prop("glob pattern (** matches across directories)")},
-         {"path", str_prop("root directory (default .)")}},
-        {"pattern"}, Policy::Allow,
-        [](const nlohmann::json &j, std::string &out)
-        {
-            return cell::box::glob(j.value("pattern", ""), j.value("path", "."), out);
-        });
-    add("find", "Filter files by metadata (name pattern, modification time, size) — complementary to rg which searches by content.",
-        {{"path", str_prop("root directory (default .)")},
-         {"name", str_prop("optional filename glob pattern")},
+    add("find", "Find files recursively by glob pattern and/or metadata (name, modification time, size). When only 'pattern' is given, behaves like a recursive glob (e.g. '**/*.test.ts'). Combine with metadata filters to narrow results. Returns 'path  size bytes  mtime (UTC)' per match. Skips hidden files and .gitignore'd paths.",
+        {{"pattern", str_prop("glob pattern to match relative paths (** matches across directories, optional)")},
+         {"path", str_prop("root directory (default .)")},
+         {"name", str_prop("optional filename glob pattern (matches just the filename)")},
          {"newer_than_hours", str_prop("only files modified within the last N hours (0 = any)")},
          {"larger_than_bytes", str_prop("only files larger than N bytes (0 = any)")},
          {"max_results", str_prop("max results, capped at 500 (default 500)")}},
         {}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            return cell::box::find(j.value("path", "."), j.value("name", ""),
+            return cell::box::find(j.value("path", "."), j.value("pattern", ""),
+                                   j.value("name", ""),
                                    dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
                                    std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
@@ -5430,7 +5549,7 @@ static int run_selftest()
     expect(cell::box::remove("box_test.txt") && !cell::box::exist("box_test.txt"), "box::remove file");
     expect(cell::box::remove("box_dir/sub") && cell::box::remove("box_dir"), "box::remove dir");
 
-    // rg / glob / find
+    // rg / find (glob is merged into find)
     expect(cell::box::mkdir("rg_dir"), "rg dir");
     expect(cell::box::write("rg_dir/a.txt", "hello\nTODO fix\n"), "rg fixture a");
     expect(cell::box::write("rg_dir/b.txt", "world\n"), "rg fixture b");
@@ -5439,17 +5558,40 @@ static int run_selftest()
     expect(cell::box::write("rg_dir/ignored.txt", "IGNORED\n"), "rg ignored fixture");
     std::string rg_out;
     expect(cell::box::rg("TODO", "rg_dir", 500, rg_out) && rg_out.find("a.txt") != std::string::npos && rg_out.find("2:") != std::string::npos, "box::rg match with line numbers");
+    rg_out.clear();
     expect(cell::box::rg("HIDDEN", "rg_dir", 500, rg_out) && rg_out.find("HIDDEN") == std::string::npos, "box::rg skips hidden files");
+    rg_out.clear();
     expect(cell::box::rg("IGNORED", "rg_dir", 500, rg_out) && rg_out.find("IGNORED") == std::string::npos, "box::rg honors gitignore");
+    rg_out.clear();
     expect(cell::box::rg("hello", "rg_dir", 1, rg_out) && rg_out.find("(truncated") != std::string::npos, "box::rg max_results cap");
     std::string rg_bad;
     expect(!cell::box::rg(std::string(300, 'a'), "rg_dir", 500, rg_bad), "box::rg rejects oversized pattern");
     expect(!cell::box::rg("(a+)+b", "rg_dir", 500, rg_bad), "box::rg rejects nested quantifier pattern");
     expect(!cell::box::rg("(foo|bar)+", "rg_dir", 500, rg_bad), "box::rg rejects alternation quantifier pattern");
     expect(cell::box::rg("(ab)+c", "rg_dir", 500, rg_bad), "box::rg allows safe group pattern");
-    std::string gl_out;
-    expect(cell::box::glob("*.txt", "rg_dir", gl_out) && gl_out.find("a.txt") != std::string::npos && gl_out.find(".hidden.txt") == std::string::npos, "box::glob pattern");
-    expect(cell::box::glob("**/*.txt", ".", gl_out) && gl_out.find("rg_dir/a.txt") != std::string::npos, "box::glob double-star");
+    // rg: case-insensitive search
+    rg_out.clear();
+    expect(cell::box::rg("todo", "rg_dir", 500, rg_out, true) && rg_out.find("a.txt") != std::string::npos, "box::rg case-insensitive");
+    // rg: count-only mode
+    rg_out.clear();
+    expect(cell::box::rg("TODO", "rg_dir", 500, rg_out, false, 0, "", true) && rg_out.find("a.txt: 1") != std::string::npos, "box::rg count-only");
+    // rg: file type filter
+    rg_out.clear();
+    expect(cell::box::rg("TODO", "rg_dir", 500, rg_out, false, 0, "txt") && rg_out.find("a.txt") != std::string::npos, "box::rg file_type filter");
+    rg_out.clear();
+    expect(cell::box::rg("TODO", "rg_dir", 500, rg_out, false, 0, "cpp") && rg_out.find("a.txt") == std::string::npos, "box::rg file_type excludes non-matching");
+    // find with glob pattern (merged glob functionality)
+    std::string fd_out;
+    expect(cell::box::find("rg_dir", "*.txt", "", 0, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find glob pattern");
+    fd_out.clear();
+    expect(cell::box::find(".", "rg_dir/*.txt", "", 0, 0, 500, fd_out) && fd_out.find("rg_dir/a.txt") != std::string::npos, "box::find glob double-star");
+    // find with metadata filters
+    fd_out.clear();
+    expect(cell::box::find("rg_dir", "", "a*", 0, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by name");
+    fd_out.clear();
+    expect(cell::box::find("rg_dir", "", "", 0, 10, 500, fd_out) && fd_out.find("a.txt") != std::string::npos && fd_out.find("b.txt") == std::string::npos, "box::find larger_than");
+    fd_out.clear();
+    expect(cell::box::find("rg_dir", "", "a*", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by mtime");
     // ls: dirs first, then case-insensitive by name, paginated
     expect(cell::box::mkdir("ls_dir") && cell::box::write("ls_dir/b.txt", "x\n") &&
                cell::box::write("ls_dir/a.txt", "y\n") && cell::box::write("ls_dir/C.txt", "z\n") &&
@@ -5466,10 +5608,6 @@ static int run_selftest()
     expect(cell::box::remove("ls_dir/zdir") && cell::box::remove("ls_dir/b.txt") && cell::box::remove("ls_dir/a.txt") &&
                cell::box::remove("ls_dir/C.txt") && cell::box::remove("ls_dir"),
            "ls fixtures cleanup");
-    std::string fd_out;
-    expect(cell::box::find("rg_dir", "a*", 0, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by name");
-    expect(cell::box::find("rg_dir", "", 0, 10, 500, fd_out) && fd_out.find("a.txt") != std::string::npos && fd_out.find("b.txt") == std::string::npos, "box::find larger_than");
-    expect(cell::box::find("rg_dir", "a*", 24 * 365 * 100, 0, 500, fd_out) && fd_out.find("a.txt") != std::string::npos, "box::find by mtime");
     expect(cell::box::remove("rg_dir/a.txt") && cell::box::remove("rg_dir/b.txt") && cell::box::remove("rg_dir/.hidden.txt") &&
                cell::box::remove("rg_dir/ignored.txt") && cell::box::remove("rg_dir/.gitignore") && cell::box::remove("rg_dir"),
            "rg cleanup");
@@ -5540,16 +5678,15 @@ static int run_selftest()
     }
 
     {
-        // tool registry: exactly the 8 redesigned tools with correct policies
+        // tool registry: exactly the 6 redesigned tools with correct policies
         auto [tool_list, tool_defs] = build_tools(false);
-        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "glob", "find"};
-        bool all_present = tool_list.size() == 8 && tool_defs.size() == 8;
+        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "find"};
+        bool all_present = tool_list.size() == 7 && tool_defs.size() == 7;
         for (auto n : expected)
             all_present = all_present && tool_list.find(n) != tool_list.end();
-        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/glob/find");
+        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find");
         expect(tool_list["read"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["rg"]->policy() == cell::tools::Policy::Allow &&
-                   tool_list["glob"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["find"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["ls"]->policy() == cell::tools::Policy::Allow,
                "read-only tool policies are Allow");
@@ -5607,7 +5744,7 @@ static int run_selftest()
         mixed.push_back(std::async(std::launch::async, [&conc_tools]
                                    {
                                        std::string o;
-                                       return conc_tools["glob"]->execute(R"({"pattern":"f0*.txt","path":"conc_dir"})", o) &&
+                                       return conc_tools["find"]->execute(R"({"pattern":"f0*.txt","path":"conc_dir"})", o) &&
                                               o.find("f00.txt") != std::string::npos && o.find("f09.txt") != std::string::npos; }));
         mixed.push_back(std::async(std::launch::async, [&conc_tools]
                                    {
@@ -5622,7 +5759,7 @@ static int run_selftest()
         bool mixed_ok = true;
         for (auto &f : mixed)
             mixed_ok = mixed_ok && f.get();
-        expect(mixed_ok, "concurrent mixed read-only tool calls (rg/glob/find/ls)");
+        expect(mixed_ok, "concurrent mixed read-only tool calls (rg/find/ls)");
         for (int i = 0; i < 16; i++)
             cell::box::remove(std::format("conc_dir/f{:02d}.txt", i));
         expect(cell::box::remove("conc_dir"), "conc cleanup");
@@ -7454,7 +7591,7 @@ int main(int argc, char const *argv[])
                     };
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
-                    // pass 1: read-only tools (Policy::Allow: ls/read/rg/glob/find) run concurrently
+                    // pass 1: read-only tools (Policy::Allow: ls/read/rg/find) run concurrently
                     // on the shared worker pool (dynamically scaled up to max_threads)
                     size_t allow_count = 0;
                     for (size_t i = 0; i < tool_calls.size(); i++)
@@ -7499,6 +7636,10 @@ int main(int argc, char const *argv[])
                                     res[i].blocked = true;
                                     res[i].status = "blocked";
                                 }
+                                else if (!o.empty())
+                                {
+                                    res[i].output = std::move(o);
+                                }
                                 res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
                         }
                         else
@@ -7526,6 +7667,10 @@ int main(int argc, char const *argv[])
                         {
                             res[i].blocked = true;
                             res[i].status = "blocked";
+                        }
+                        else if (!o.empty())
+                        {
+                            res[i].output = std::move(o);
                         }
                         res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0;
                     }
