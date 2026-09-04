@@ -5190,7 +5190,7 @@ static void print_help()
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("  /models                     fetch the model list from the current provider");
     cell::sys::println("  /model NAME                 switch to a model of the current provider");
-    cell::sys::println("  /think [off|low|med|high|max]  set chain-of-thought level (default off)");
+    cell::sys::println("  /think [off|low|med|high|max]  cycle or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
     cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands (full-access only)");
@@ -7165,7 +7165,7 @@ int main(int argc, char const *argv[])
                         cfg.think_level = level;
                     }
                     else
-                        cfg.think_level = cfg.think_level > 0 ? 0 : 2; // toggle: off <-> med
+                        cfg.think_level = (cfg.think_level + 1) % 5; // cycle: off -> low -> med -> high -> max -> off
                     cell::config::save(cfg);
                     log.info("think", std::format("level={} budget={}", cfg.think_level, cfg.think_budget()));
                     cell::sys::println("chain-of-thought: {} (budget={} tokens)", cell::config::settings::think_level_name(cfg.think_level), cfg.think_budget());

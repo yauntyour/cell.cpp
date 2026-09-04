@@ -187,7 +187,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
-| `/think [off\|low\|med\|high\|max]` | Set chain-of-thought level (persisted); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
+| `/think [off\|low\|med\|high\|max]` | Cycle or set chain-of-thought level (persisted); bare `/think` cycles: off → low → med → high → max → off; levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
 | `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |
 | `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation |
