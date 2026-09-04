@@ -909,6 +909,13 @@ namespace cell
             static SandboxMode m = SandboxMode::FullAccess;
             return m;
         }
+        // autoallow mode: when enabled, LLM alone decides whether an exec command is allowed to run
+        // (only available in FullAccess sandbox mode)
+        static bool &autoallow_enabled()
+        {
+            static bool enabled = false;
+            return enabled;
+        }
         static std::string mode_name(SandboxMode m)
         {
             switch (m)
@@ -3084,7 +3091,11 @@ namespace cell
                     }
                 }
                 if (console)
+                {
+                    // leading newline to avoid log appearing right after unfinished streaming content
+                    std::fputc('\n', stderr);
                     eprintln(c, "{}", line);
+                }
             }
 
         public:
@@ -3437,6 +3448,7 @@ namespace cell
             int think_level = 0;                   // chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192)
             bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
             std::string sandbox_mode = "full-access";  // exec sandbox: "read-only" | "edit-only" | "full-access" (default)
+            bool autoallow = false;                 // autoallow mode: LLM decides whether exec commands run (only in full-access)
             std::string system_prompt =
                 "You are a helpful assistant."
                 "When you finish a task, reply with a short summary of what was done.";
@@ -3625,6 +3637,7 @@ namespace cell
                     s.think_level = 0;
                 s.tools = j.value("tools", true);
                 s.sandbox_mode = j.value("sandbox_mode", "workspace-write");
+                s.autoallow = j.value("autoallow", false);
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
@@ -3650,6 +3663,7 @@ namespace cell
             j["think_level"] = s.think_level;
             j["tools"] = s.tools;
             j["sandbox_mode"] = s.sandbox_mode;
+            j["autoallow"] = s.autoallow;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
             j["log_max_lines"] = s.log_max_lines;
@@ -4148,17 +4162,27 @@ namespace cell
                 }
                 if (policy() == Policy::Ask)
                 {
-                    std::cout << "allow " << name() << "(" << cell::text::display_safe(input) << ")? [y/N] " << std::flush;
-                    std::string answer;
-                    std::getline(std::cin, answer);
-                    if (answer != "y" && answer != "Y")
+                    // autoallow mode: skip user confirmation for exec when enabled in FullAccess mode
+                    bool autoallow = (name() == "exec" && box::autoallow_enabled() && box::sandbox_mode() == box::SandboxMode::FullAccess);
+                    if (!autoallow)
                     {
-                        blocked_.store(true, std::memory_order_relaxed);
-                        output = std::format("[{}] rejected by user", name());
-                        cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=rejected_by_user", name()));
-                        return false;
+                        std::cout << "allow " << name() << "(" << cell::text::display_safe(input) << ")? [y/N] " << std::flush;
+                        std::string answer;
+                        std::getline(std::cin, answer);
+                        if (answer != "y" && answer != "Y")
+                        {
+                            blocked_.store(true, std::memory_order_relaxed);
+                            output = std::format("[{}] rejected by user", name());
+                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=rejected_by_user", name()));
+                            return false;
+                        }
+                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user", name()));
                     }
-                    cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user", name()));
+                    else
+                    {
+                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={}", name(), cell::text::display_safe(input)));
+                        cell::sys::println("[autoallow] {}({})", name(), cell::text::display_safe(input));
+                    }
                     if (name() == "exec")
                     {
                         // Extract the actual command string from JSON before sandbox checks
@@ -4204,16 +4228,25 @@ namespace cell
                         }
                         if (box::is_high_risk(exec_cmd))
                         {
-                            std::cout << "high-risk command, confirm again: " << cell::text::display_safe(input) << "? [y/N] " << std::flush;
-                            std::getline(std::cin, answer);
-                            if (answer != "y" && answer != "Y")
+                            if (!autoallow)
                             {
-                                blocked_.store(true, std::memory_order_relaxed);
-                                output = std::format("[{}] high-risk command rejected by user", name());
-                                cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
-                                return false;
+                                std::cout << "high-risk command, confirm again: " << cell::text::display_safe(input) << "? [y/N] " << std::flush;
+                                std::string answer2;
+                                std::getline(std::cin, answer2);
+                                if (answer2 != "y" && answer2 != "Y")
+                                {
+                                    blocked_.store(true, std::memory_order_relaxed);
+                                    output = std::format("[{}] high-risk command rejected by user", name());
+                                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
+                                    return false;
+                                }
+                                cell::sys::logger::instance().debug("tool", std::format("approved name={} high_risk=yes by=user", name()));
                             }
-                            cell::sys::logger::instance().debug("tool", std::format("approved name={} high_risk=yes by=user", name()));
+                            else
+                            {
+                                cell::sys::logger::instance().debug("tool", std::format("approved name={} high_risk=yes by=autoallow args={}", name(), cell::text::display_safe(input)));
+                                cell::sys::println("[autoallow] {}(high-risk: {})", name(), cell::text::display_safe(input));
+                            }
                         }
                     }
                     else
@@ -5160,6 +5193,7 @@ static void print_help()
     cell::sys::println("  /think [off|low|med|high|max]  set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
+    cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands (full-access only)");
     cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
     cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
@@ -6200,6 +6234,8 @@ int main(int argc, char const *argv[])
             cell::sys::warn("unknown sandbox mode '{}' - using full-access", m);
             cfg.sandbox_mode = "full-access";
         }
+        // apply autoallow mode from config (only effective in full-access mode)
+        cell::box::autoallow_enabled() = cfg.autoallow && cell::box::sandbox_mode() == cell::box::SandboxMode::FullAccess;
     }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -7178,6 +7214,33 @@ int main(int argc, char const *argv[])
                     cell::sys::println("exec sandbox: {} (network-egress commands are blocked in every mode)", cell::box::mode_name(cell::box::sandbox_mode()));
                     continue;
                 }
+                if (cmd == "/autoallow")
+                {
+                    if (cell::box::sandbox_mode() != cell::box::SandboxMode::FullAccess)
+                    {
+                        cell::sys::error("/autoallow can only be used in full-access sandbox mode. Current mode: {}", cell::box::mode_name(cell::box::sandbox_mode()));
+                        continue;
+                    }
+                    if (toks.size() >= 2)
+                    {
+                        if (toks[1] == "on")
+                            cell::box::autoallow_enabled() = true;
+                        else if (toks[1] == "off")
+                            cell::box::autoallow_enabled() = false;
+                        else
+                        {
+                            cell::sys::error("usage: /autoallow [on|off]");
+                            continue;
+                        }
+                    }
+                    else
+                        cell::box::autoallow_enabled() = !cell::box::autoallow_enabled();
+                    cfg.autoallow = cell::box::autoallow_enabled();
+                    cell::config::save(cfg);
+                    log.info("autoallow", std::format("enabled={}", cell::box::autoallow_enabled() ? "on" : "off"));
+                    cell::sys::println("autoallow: {} (LLM decides whether exec commands run)", cell::box::autoallow_enabled() ? "ON" : "off");
+                    continue;
+                }
                 if (cmd == "/sessions")
                 {
                     cell::async_io::flush(); // listings must reflect queued session writes
@@ -7454,137 +7517,168 @@ llm_start:
                     }
                     return u->cancelled ? 1 : 0;
                 };
-                cell::net::StreamCallback tok_cb = [&](std::span<const char> data)
+                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries
+                constexpr int kMaxRetries = 5;
+                constexpr double kRetryDelaySec = 5.0;
+                bool ok = false;
+                std::string err;
+                for (int attempt = 0; attempt < kMaxRetries; attempt++)
                 {
-                    if (data.empty())
-                        return;
-                    if (!ui.got)
+                    if (attempt > 0)
                     {
-                        ui.got = true;
-                        ui.tok0 = cell::sys::detail::clock::now();
+                        log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, kRetryDelaySec, cfg.model_label(), rounds));
+                        cell::sys::println("\n[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries);
+                        std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
+                        // reset UI state for retry
+                        ui = StreamUI{};
+                        ui.t0 = cell::sys::detail::clock::now();
+                        reply = nlohmann::json{};
+                        tool_calls = nlohmann::json{};
+                        usage = nlohmann::json{};
+                        err.clear();
                     }
-                    ui.toks++;
-                    bool vt = cell::sys::detail::color_enabled;
-                    std::string out;
-                    // end an open reasoning line before the answer text starts
-                    if (ui.reason_active)
+                    cell::net::StreamCallback tok_cb = [&](std::span<const char> data)
                     {
-                        out += "\n";
-                        ui.reason_active = false;
+                        if (data.empty())
+                            return;
+                        if (!ui.got)
+                        {
+                            ui.got = true;
+                            ui.tok0 = cell::sys::detail::clock::now();
+                        }
+                        ui.toks++;
+                        bool vt = cell::sys::detail::color_enabled;
+                        std::string out;
+                        // end an open reasoning line before the answer text starts
+                        if (ui.reason_active)
+                        {
+                            out += "\n";
+                            ui.reason_active = false;
+                        }
+                        if (vt)
+                        {
+                            if (ui.timer_line)
+                            {
+                                out += "\r\x1b[2K";
+                                ui.timer_line = false;
+                            }
+                            if (ui.tok_line)
+                            {
+                                out += "\r\x1b[2K";
+                                ui.tok_line = false;
+                            }
+                        }
+                        out.append(data.data(), data.size());
+                        if (vt && data.back() == '\n')
+                        {
+                            long long ms = cell::sys::elapsed_ms(ui.tok0);
+                            if (ms - ui.last_cnt_ms >= 100)
+                            {
+                                ui.last_cnt_ms = ms;
+                                out += std::format("\x1b[2m~{} tok\x1b[0m", ui.toks);
+                                ui.tok_line = true;
+                            }
+                        }
+                        std::fwrite(out.data(), 1, out.size(), stdout);
+                        std::fflush(stdout);
+                    };
+                    // chain-of-thought output: streamed dim/gray ahead of the answer
+                    cell::net::StreamCallback reason_cb = [&](std::span<const char> data)
+                    {
+                        if (data.empty())
+                            return;
+                        if (!ui.got)
+                        {
+                            ui.got = true;
+                            ui.tok0 = cell::sys::detail::clock::now();
+                        }
+                        bool vt = cell::sys::detail::color_enabled;
+                        std::string out;
+                        if (vt)
+                        {
+                            if (ui.timer_line)
+                            {
+                                out += "\r\x1b[2K";
+                                ui.timer_line = false;
+                            }
+                            if (ui.tok_line)
+                            {
+                                out += "\r\x1b[2K";
+                                ui.tok_line = false;
+                            }
+                            out += "\x1b[2m";
+                            for (char c : data)
+                            {
+                                if (c == '\n')
+                                    out += "\x1b[0m\n\x1b[2m";
+                                else
+                                    out += c;
+                            }
+                            out += "\x1b[0m";
+                        }
+                        else
+                            out.append(data.data(), data.size());
+                        ui.reason_active = data.back() != '\n';
+                        std::fwrite(out.data(), 1, out.size(), stdout);
+                        std::fflush(stdout);
+                    };
+                    total_llm_requests++;
+                    ok = do_chat(*p, key, cfg.current_model, s->msg(), true, std::move(tok_cb), std::move(reason_cb), reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui);
+                    if (ui.timer_line || ui.tok_line)
+                    {
+                        if (cell::sys::detail::color_enabled)
+                        {
+                            std::string s = "\r\x1b[2K";
+                            std::fwrite(s.data(), 1, s.size(), stdout);
+                            std::fflush(stdout);
+                        }
+                        ui.timer_line = false;
+                        ui.tok_line = false;
                     }
-                    if (vt)
+                    if (ui.cancelled)
                     {
-                        if (ui.timer_line)
-                        {
-                            out += "\r\x1b[2K";
-                            ui.timer_line = false;
-                        }
-                        if (ui.tok_line)
-                        {
-                            out += "\r\x1b[2K";
-                            ui.tok_line = false;
-                        }
+                        log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
+                        cell::sys::println();
+                        cell::sys::error("[cancelled]");
+                        if (reply_text_len(reply) > 0 || !tool_calls.empty())
+                            s->msg().push_back(reply);
+                        done = true;
+                        break;
                     }
-                    out.append(data.data(), data.size());
-                    if (vt && data.back() == '\n')
+                    if (ok)
                     {
-                        long long ms = cell::sys::elapsed_ms(ui.tok0);
-                        if (ms - ui.last_cnt_ms >= 100)
-                        {
-                            ui.last_cnt_ms = ms;
-                            out += std::format("\x1b[2m~{} tok\x1b[0m", ui.toks);
-                            ui.tok_line = true;
-                        }
+                        // success: log and break out of retry loop
+                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                        double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
+                        log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={} attempts={}",
+                                                    rounds, cfg.model_label(), (long long)s->msg().size(),
+                                                    usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
+                                                    usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a",
+                                                    usage_cache_hit(usage).has_value() ? std::format("{:.1f}%", *usage_cache_hit(usage) * 100.0) : "n/a",
+                                                    final_sec, final_ttf < 0 ? "n/a" : std::format("{:.2f}s", final_ttf),
+                                                    tool_calls.size(), attempt + 1));
+                        break;
                     }
-                    std::fwrite(out.data(), 1, out.size(), stdout);
-                    std::fflush(stdout);
-                };
-                // chain-of-thought output: streamed dim/gray ahead of the answer
-                cell::net::StreamCallback reason_cb = [&](std::span<const char> data)
-                {
-                    if (data.empty())
-                        return;
-                    if (!ui.got)
+                    // request failed
+                    if (attempt < kMaxRetries - 1)
                     {
-                        ui.got = true;
-                        ui.tok0 = cell::sys::detail::clock::now();
-                    }
-                    bool vt = cell::sys::detail::color_enabled;
-                    std::string out;
-                    if (vt)
-                    {
-                        if (ui.timer_line)
-                        {
-                            out += "\r\x1b[2K";
-                            ui.timer_line = false;
-                        }
-                        if (ui.tok_line)
-                        {
-                            out += "\r\x1b[2K";
-                            ui.tok_line = false;
-                        }
-                        out += "\x1b[2m";
-                        for (char c : data)
-                        {
-                            if (c == '\n')
-                                out += "\x1b[0m\n\x1b[2m";
-                            else
-                                out += c;
-                        }
-                        out += "\x1b[0m";
+                        log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
                     }
                     else
-                        out.append(data.data(), data.size());
-                    ui.reason_active = data.back() != '\n';
-                    std::fwrite(out.data(), 1, out.size(), stdout);
-                    std::fflush(stdout);
-                };
-                total_llm_requests++;
-                std::string err;
-                bool ok = do_chat(*p, key, cfg.current_model, s->msg(), true, std::move(tok_cb), std::move(reason_cb), reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui);
-                double total_sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                double ttf_sec = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
-                if (ui.timer_line || ui.tok_line)
-                {
-                    if (cell::sys::detail::color_enabled)
                     {
-                        std::string s = "\r\x1b[2K";
-                        std::fwrite(s.data(), 1, s.size(), stdout);
-                        std::fflush(stdout);
+                        // final attempt failed
+                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                        log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)s->msg().size(), final_sec, err.empty() ? "n/a" : err, kMaxRetries));
+                        cell::sys::println();
+                        cell::sys::error("[llm error after {} attempts] {}", kMaxRetries, err.empty() ? "request failed" : err);
+                        done = true;
+                        break;
                     }
-                    ui.timer_line = false;
-                    ui.tok_line = false;
                 }
-                if (ui.cancelled)
-                {
-                    log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
-                    cell::sys::println();
-                    cell::sys::error("[cancelled]");
-                    if (reply_text_len(reply) > 0 || !tool_calls.empty())
-                        s->msg().push_back(reply);
-                    done = true;
+                if (done || ui.cancelled)
                     break;
-                }
-                if (!ok)
-                {
-                    log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={}", cfg.model_label(), rounds, (long long)s->msg().size(), total_sec, err.empty() ? "n/a" : err));
-                    cell::sys::println();
-                    cell::sys::error("[llm error] {}", err.empty() ? "request failed" : err);
-                    done = true;
-                    break;
-                }
                 cell::sys::println();
                 long long out_chars = reply_text_len(reply);
-                auto in_tok = usage_in(usage);
-                auto out_tok = usage_out(usage);
-                auto cache_hit = usage_cache_hit(usage);
-                log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={}",
-                                            rounds, cfg.model_label(), (long long)s->msg().size(),
-                                            in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
-                                            out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
-                                            cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a",
-                                            total_sec, ttf_sec < 0 ? "n/a" : std::format("{:.2f}s", ttf_sec),
-                                            tool_calls.size()));
                 s->msg().push_back(reply);
                 if (!tool_calls.empty())
                 {

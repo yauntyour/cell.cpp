@@ -190,6 +190,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/think [off\|low\|med\|high\|max]` | Set chain-of-thought level (persisted); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
 | `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |
+| `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation |
 | `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
 | `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
 | `/session rm ID` | Delete a session file and its usage record |
@@ -335,13 +336,15 @@ contain `>`, `|` or `..`.
 ### 4. Human confirmation
 
 `exec` is the only `Ask` tool: `allow exec({…})? [y/N]` — the argument is printed through
-`display_safe`, so injected JSON cannot erase the prompt or fake an approval. Commands that pass the
-sandbox but are still destructive demand a **second** confirmation: recursive/forced deletes
-(`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`chmod`, `chown`, `sudo`,
-`cacls`, `icacls`, `takeown`) and git operations that can trigger hooks or rewrite history
-(`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`, `stash`, `clean`,
-`reset`, `restore`). A rejected or blocked call ends the current agent run instead of letting the
-model retry it.
+`display_safe`, so injected JSON cannot erase the prompt or fake an approval. When **autoallow mode**
+is enabled (`/autoallow on`, full-access sandbox only), the LLM alone decides whether exec commands
+run without user confirmation — sandbox checks (network egress, sensitive paths) still apply.
+Commands that pass the sandbox but are still destructive demand a **second** confirmation:
+recursive/forced deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes
+(`chmod`, `chown`, `sudo`, `cacls`, `icacls`, `takeown`) and git operations that can trigger hooks
+or rewrite history (`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`,
+`stash`, `clean`, `reset`, `restore`). A rejected or blocked call ends the current agent run instead
+of letting the model retry it.
 
 ### 5. Output hardening
 
