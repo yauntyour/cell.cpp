@@ -896,6 +896,8 @@ namespace cell
             return true;
         }
 
+        static std::vector<std::string> tokens(std::string_view s);
+
         // check command/write tools (exec, write, remove, mkdir, edit): full sandbox
         bool check(std::string_view call)
         {
@@ -913,9 +915,10 @@ namespace cell
             if (call.find("$(") != std::string_view::npos)
                 return false; // $(...) command substitution
             std::string lower = to_lower(call);
+            auto toks = tokens(lower);
             // token-aware deny list: match whole tokens to avoid false positives
-            // e.g. "rm -r -f" matches "rm" + "-r" + "-f" rather than substring "rm -rf"
-            static constexpr std::string_view deny_tokens[] = {
+            // e.g. "--format=" should NOT match "format" deny token
+            static constexpr std::string_view deny_single_tokens[] = {
                 // disk destruction
                 "format",
                 "mkfs",
@@ -925,31 +928,57 @@ namespace cell
                 "shutdown",
                 "reboot",
                 "halt",
-                // registry / user management
-                "reg delete",
-                "net user",
-                "net localgroup",
-                "net group",
                 // process kill
                 "taskkill",
-                // powershell encoded commands
-                "powershell -enc",
-                "powershell -e ",
-                "pwsh -enc",
-                "pwsh -e ",
-                // cmd dangerous
-                "cmd /c del",
-                "cmd /c format",
-                "cmd /c rd",
-                // raw disk
-                "dd if=",
-                // fork bomb
-                ":(){",
                 // permission manipulation
                 "cacls",
                 "icacls",
                 "takeown",
                 "attrib",
+            };
+            // Check single-token denies (must be exact token match)
+            for (auto &t : toks)
+            {
+                for (auto &dt : deny_single_tokens)
+                {
+                    if (t == dt)
+                        return false;
+                }
+            }
+            // Multi-token deny patterns (check consecutive tokens)
+            static constexpr std::string_view deny_multi_patterns[][2] = {
+                {"reg", "delete"},
+                {"net", "user"},
+                {"net", "localgroup"},
+                {"net", "group"},
+                {"powershell", "-enc"},
+                {"powershell", "-e"},
+                {"pwsh", "-enc"},
+                {"pwsh", "-e"},
+                {"cmd", "/c"},
+                {"dd", "if="},
+            };
+            for (size_t i = 0; i + 1 < toks.size(); i++)
+            {
+                for (auto &pattern : deny_multi_patterns)
+                {
+                    if (toks[i] == pattern[0] && toks[i + 1] == pattern[1])
+                    {
+                        // Special case: "cmd /c" only denied if followed by dangerous commands
+                        if (toks[i] == "cmd" && toks[i + 1] == "/c" && i + 2 < toks.size())
+                        {
+                            std::string after_cmd = toks[i + 2];
+                            if (after_cmd != "del" && after_cmd != "format" && after_cmd != "rd")
+                                continue;
+                        }
+                        return false;
+                    }
+                }
+            }
+            // Substring-based deny patterns (safe for these specific patterns)
+            static constexpr std::string_view deny_substrings[] = {
+                // fork bomb
+                ":(){",
                 // curl/wget piped to shell
                 "curl|",
                 "curl |",
@@ -974,7 +1003,7 @@ namespace cell
                 "unhexlify",
                 "atob(",
             };
-            for (auto &p : deny_tokens)
+            for (auto &p : deny_substrings)
             {
                 if (lower.find(p) != std::string::npos)
                     return false;
@@ -2017,6 +2046,35 @@ namespace cell
                                         output += std::format("{}-{}\n", ctx_buf[k].first, ctx_buf[k].second);
                                 }
                                 output += std::format("{}: {}\n", ln, line);
+                                // emit post-match context lines
+                                if (context > 0)
+                                {
+                                    size_t post_ctx = 0;
+                                    // Save current position and read ahead for post-match context
+                                    auto saved_pos = f.tellg();
+                                    std::string post_line;
+                                    while (post_ctx < context && std::getline(f, post_line))
+                                    {
+                                        ln++;
+                                        scanned++;
+                                        if (!post_line.empty() && post_line.back() == '\r')
+                                            post_line.pop_back();
+                                        if (post_line.find('\0') != std::string::npos)
+                                            break; // binary file, stop
+                                        output += std::format("{}-{}\n", ln, post_line);
+                                        post_ctx++;
+                                        // Update ctx_buf for potential future matches
+                                        if (context > 0)
+                                        {
+                                            ctx_buf.emplace_back(ln, post_line);
+                                            if (ctx_buf.size() > context + 1)
+                                                ctx_buf.erase(ctx_buf.begin());
+                                        }
+                                    }
+                                    // If we hit EOF or binary during post-context, we're done with this file
+                                    if (post_line.find('\0') != std::string::npos)
+                                        break;
+                                }
                                 file_matches++;
                             }
                             count++;
@@ -2383,6 +2441,9 @@ namespace cell
                     output.append(buf, n);
                 }
                 if (!file.eof())
+                    return false;
+                // Binary file detection: reject files containing NUL bytes
+                if (output.find('\0') != std::string::npos)
                     return false;
                 if (track)
                     record_read(path, 1, (size_t)-1);
@@ -3537,7 +3598,7 @@ namespace cell
             std::string current_model;             // active model name (fetched from the provider)
             bool think = false;                    // chain-of-thought (CoT) enabled
             bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
-            std::string sandbox_mode = "full-access";  // exec sandbox: "read-only" | "workspace-write" | "full-access" (default) | "outer-full"
+            std::string sandbox_mode = "workspace-write";  // exec sandbox: "read-only" | "workspace-write" (default) | "full-access" | "outer-full"
             std::string system_prompt =
                 "You are a helpful assistant."
                 "When you finish a task, reply with a short summary of what was done.";
@@ -4220,10 +4281,25 @@ namespace cell
                     cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user", name()));
                     if (name() == "exec")
                     {
-                        if (!box::check_exec(input))
+                        // Extract the actual command string from JSON before sandbox checks
+                        std::string exec_cmd;
+                        try
+                        {
+                            auto j = nlohmann::json::parse(input, nullptr, false);
+                            if (j.is_object() && j.contains("cmd") && j["cmd"].is_string())
+                                exec_cmd = j["cmd"].get<std::string>();
+                            else
+                                exec_cmd = input; // fallback to raw input if not JSON
+                        }
+                        catch (const std::exception &)
+                        {
+                            exec_cmd = input; // fallback to raw input if parse fails
+                        }
+
+                        if (!box::check_exec(exec_cmd))
                         {
                             blocked_.store(true, std::memory_order_relaxed);
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), input));
+                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), exec_cmd));
                             output = std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode()));
                             return false;
                         }
@@ -4246,7 +4322,7 @@ namespace cell
                         catch (const std::exception &)
                         {
                         }
-                        if (box::is_high_risk(input))
+                        if (box::is_high_risk(exec_cmd))
                         {
                             std::cout << "high-risk command, confirm again: " << cell::text::display_safe(input) << "? [y/N] " << std::flush;
                             std::getline(std::cin, answer);
@@ -5167,7 +5243,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session (switches to its working directory)");
     cell::sys::println("  --system TEXT                system prompt");
-    cell::sys::println("  --sandbox MODE               exec sandbox mode: git (default) | safe | open");
+    cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
     cell::sys::println("  --selftest                   run internal self tests");
@@ -5221,6 +5297,10 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     size_t id = 0;
     auto str_prop = [](const std::string &desc)
     { return nlohmann::json{{"type", "string"}, {"description", desc}}; };
+    auto num_prop = [](const std::string &desc)
+    { return nlohmann::json{{"type", "number"}, {"description", desc}}; };
+    auto bool_prop = [](const std::string &desc)
+    { return nlohmann::json{{"type", "boolean"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy,
                    std::move_only_function<bool(const nlohmann::json &, std::string &)> fn)
@@ -5253,8 +5333,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
 
     add("ls", "List the entries of a directory (one level, non-recursive). Directories are listed first, then files, alphabetically. Paginated: at most page_size entries per page.",
         {{"path", str_prop("directory to list (default .)")},
-         {"page", str_prop("1-based page number (default 1)")},
-         {"page_size", str_prop("entries per page, capped at 500 (default 500)")}},
+         {"page", num_prop("1-based page number (default 1)")},
+         {"page_size", num_prop("entries per page, capped at 500 (default 500)")}},
         {}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
@@ -5263,8 +5343,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         });
     add("read", "Read a text file (capped at 128M characters per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
         {{"path", str_prop("file path")},
-         {"offset", str_prop("number of lines to skip from the start (0-based, optional)")},
-         {"limit", str_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
+         {"offset", num_prop("number of lines to skip from the start (0-based, optional)")},
+         {"limit", num_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
@@ -5288,8 +5368,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
          {"mode", str_prop("replace | insert | append | delete | query (default replace)")},
          {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")},
          {"content", str_prop("replacement text (replace) or text to insert/append")},
-         {"from", str_prop("1-based line: insert-after line, or delete range start")},
-         {"to", str_prop("1-based inclusive end line for delete range")}},
+         {"from", num_prop("1-based line: insert-after line, or delete range start")},
+         {"to", num_prop("1-based inclusive end line for delete range")}},
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
@@ -5300,11 +5380,11 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     add("rg", "Search file contents recursively with regex support. Skips hidden files/directories and .gitignore'd paths. Returns up to max_results matches grouped by file as 'line: content'. Supports case-insensitive search, context lines, file extension filtering, and count-only mode. Prefer this when searching by content.",
         {{"pattern", str_prop("regex pattern (supports full ECMAScript regex syntax)")},
          {"path", str_prop("directory to search (default .)")},
-         {"max_results", str_prop("max matches, capped at 500 (default 500)")},
-         {"ignore_case", str_prop("case-insensitive search (default false)")},
-         {"context", str_prop("number of context lines to show around each match (default 0)")},
+         {"max_results", num_prop("max matches, capped at 500 (default 500)")},
+         {"ignore_case", bool_prop("case-insensitive search (default false)")},
+         {"context", num_prop("number of context lines to show around each match (default 0)")},
          {"file_type", str_prop("file extension filter, e.g. 'cpp', 'h', 'py' (optional)")},
-         {"count_only", str_prop("only count matches per file, don't show lines (default false)")}},
+         {"count_only", bool_prop("only count matches per file, don't show lines (default false)")}},
         {"pattern"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
@@ -5315,7 +5395,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         });
     add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command is sandboxed: network-egress commands (curl, wget, git push/fetch/clone, ...) are denied in every mode. High-risk commands (rm -rf, chmod, ...) require a second confirmation.",
         {{"cmd", str_prop("shell command to execute")},
-         {"timeout", str_prop("timeout in seconds, default 30, max 300")},
+         {"timeout", num_prop("timeout in seconds, default 30, max 300")},
          {"wd", str_prop("working directory for the command (optional, defaults to cwd)")}},
         {"cmd"}, Policy::Ask,
         [](const nlohmann::json &j, std::string &out)
@@ -5332,9 +5412,9 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {{"pattern", str_prop("glob pattern to match relative paths (** matches across directories, optional)")},
          {"path", str_prop("root directory (default .)")},
          {"name", str_prop("optional filename glob pattern (matches just the filename)")},
-         {"newer_than_hours", str_prop("only files modified within the last N hours (0 = any)")},
-         {"larger_than_bytes", str_prop("only files larger than N bytes (0 = any)")},
-         {"max_results", str_prop("max results, capped at 500 (default 500)")}},
+         {"newer_than_hours", num_prop("only files modified within the last N hours (0 = any)")},
+         {"larger_than_bytes", num_prop("only files larger than N bytes (0 = any)")},
+         {"max_results", num_prop("max results, capped at 500 (default 500)")}},
         {}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
