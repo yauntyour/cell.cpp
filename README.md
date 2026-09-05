@@ -142,7 +142,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
   --key KEY                   api key (saved to the encrypted vault)
   --session ID                resume an existing session (switches to its working directory)
   --system TEXT               system prompt
-  --sandbox MODE              exec sandbox mode: read-only | workspace-write (default) | full-access | outer-full
+  --sandbox MODE              exec sandbox mode: read-only | workspace-write | full-access (default) | outer-full
   --no-color                  disable colored log output
   --verbose                   enable DEBUG-level log output on console
   --selftest                  run internal self tests
@@ -150,7 +150,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 
 | Option | Value | Effect |
 |---|---|---|
-| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`); for OpenAI-style providers with no explicit style, the API style defaults to `openai-chat`. |
+| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`); for OpenAI-style providers with no explicit style, the API style defaults to `openai-chat`. Switching to a **different** provider clears `current_model` — the stored model name belonged to the previous provider — while re-selecting the already-active provider (including the empty `current_provider` case, which means "first provider is active") keeps it; an explicit `--model` on the same command line is applied afterwards. |
 | `--base` | URL | Sets `base` on the current provider. There is **no built-in default base** — an empty base means the provider is unusable until you set one. |
 | `--model` | string | Active model name, stored as-is (it need not appear in `/models`; a mismatch only warns). |
 | `--proxy` | URL | HTTP(S) proxy for the current provider, credentials may be embedded. `localhost`, `127.0.0.1`, `::1` always bypass it (`CURLOPT_NOPROXY`); HTTPS targets are tunnelled with `CONNECT`. |
@@ -187,8 +187,8 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 |---|---|
 | `/help` | Print the command list |
 | `/provides` | List configured providers (style, api_style, base, proxy, key state, model) |
-| `/provide NAME` | Select a provider (persisted immediately) |
-| `/provide add openai:URL [api_style:openai-chat\|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style and an optional `api_style:` overrides the derived style (a spaced `openai: URL` form is accepted). After adding, the model list is fetched once as a connectivity probe. |
+| `/provide NAME` | Select a provider (persisted immediately). Switching to a **different** provider resets the model to unset — the stored model belonged to the previous provider — so pick a new one with `/models` + `/model NAME`; re-selecting the active provider keeps its model. After a switch the REPL prints either the kept model or a "no model set" hint. |
+| `/provide add openai:URL [api_style:openai-chat\|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style and an optional `api_style:` overrides the derived style (a spaced `openai: URL` form is accepted). Selecting the new provider clears any previous model name. After adding, the model list is fetched once as a connectivity probe. |
 | `/provide update NAME [base:URL] [style:openai\|anthropic\|openai-responses] [api_style:openai-chat\|openai-responses\|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]` | Update an existing provider in place. Only supplied fields change; renaming the provider carries its encrypted vault key to the new vault id, and a requested name that already exists is made unique as `NEW_NAME-N`. |
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
@@ -428,7 +428,7 @@ never appears in the vault file — the self-test asserts this.
 |---|---|---|
 | `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `api_style` (`openai-chat` \| `openai-responses` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
 | `current_provider` | first entry | Active provider when empty |
-| `current_model` | — | Active model name |
+| `current_model` | — | Active model name; cleared automatically whenever the active provider actually changes (see [`/provide`](#slash-commands)) |
 | `think_level` | `0` | Chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192). Legacy `think: true` maps to level 2. |
 | `tools` | `true` | Tool calling enabled |
 | `sandbox_mode` | `full-access` | See [sandbox modes](#1-sandbox-modes) |
@@ -582,6 +582,11 @@ intentionally simpler than it looks:
   and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
   commands; `exec` is gated instead by the sandbox mode, a human confirmation (or autoallow), and the
   high-risk second-confirmation list.
+- Switching providers resets the model name: `--provider NAME` (existing provider), `/provide NAME`
+  and `/provide add` all route through `config::select_provider`, which clears `current_model` when
+  the selection actually changes. Re-selecting the already-active provider keeps its model, and an
+  empty `current_provider` counts as "first provider is active" for that purpose. A requested model
+  on the same command line (`--model`) is applied after the switch.
 - Startup resumes the **last session used in the current cwd**, recorded in `active_sessions`; if
   no record exists yet, the most recently written session file for the cwd is selected. The last
   five user/assistant text messages are printed again, excluding thinking and tool-call content.
