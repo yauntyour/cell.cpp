@@ -45,11 +45,12 @@ cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
 | 🔧 | **7 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` | `cell::box`, `cell::tools` |
-| 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; network egress is denied in *every* mode and credential/secret files are off limits everywhere | `cell::box::check_exec` |
+| 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
 | 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max); OpenAI streams `reasoning_content`, Anthropic streams `thinking_delta`, both rendered dim; reasoning content is persisted in sessions | `cell::llm` |
+| 🔎 | **Numbered reads** — `read` returns every line prefixed with a right-aligned line number, and `rg` groups hits as `=== file ===` + `line: content`, so the model can cite exact lines to `edit` | `cell::box` |
 | 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
 | 📊 | **Usage statistics** — per-model and per-session request/token/character counters with prompt-cache hit rate | `cell::stats` |
 | ⚡ | **Async I/O** — session/config/stats writes are coalesced and flushed by one background thread; a dynamic worker pool runs read-only tool calls concurrently | `cell::async_io`, `cell::sys::thread_pool` |
@@ -105,7 +106,7 @@ Inside the REPL, providers are managed without restarting:
 /provide add openai:https://api.openai.com/v1 key:YOUR_API_KEY
 /models
 /model gpt-4o
-/think on
+/think low
 ```
 
 ### Session example
@@ -126,10 +127,14 @@ context compacted: aggregated 31 message(s) into 1 summary, 2 message(s) remain
 > /quit
 ```
 
+> [!NOTE]
+> The example transcript above predates the current build; the `read` tool output now carries
+> numbered lines and `ls` reports file sizes — cosmetic differences only.
+
 ## Command-line options
 
 ```
-usage: cell [options]
+usage: cell [options]        # verbatim from print_usage — the --sandbox line overstates the modes
   --provider NAME             select an existing provider, or create one (style = NAME)
   --base URL                  api base url for the current provider
   --model MODEL               default model name
@@ -152,7 +157,7 @@ usage: cell [options]
 | `--key` | secret | Encrypted into `.cell/.crypt` under the id `provider:<name>` and bound to the current provider; the plaintext copy is zeroed (`sodium_memzero`) immediately. |
 | `--session` | id | Stored as `cfg.session_id`. See [Implementation notes](#implementation-notes): startup always opens a fresh session, so resume with `/session ID`. |
 | `--system` | text | Replaces the system prompt entirely. |
-| `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. Note: `print_usage` also advertises `workspace-write` / `outer-full` aliases, but only the three modes above are implemented. |
+| `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. Note: `print_usage` also advertises `workspace-write` / `outer-full` aliases, but only the three modes above are implemented (see [Implementation notes](#implementation-notes)). |
 | `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
 | `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
 | `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
@@ -188,14 +193,14 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
 | `/model NAME [api_style:STYLE]` | Optionally switch the current provider's API wire style on the fly (`openai-chat` \| `openai-responses` \| `anthropic`; `openai` is accepted as an alias of `openai-chat`); the new style is persisted in `config.json` and shown by `/model` and `/provides` |
-| `/think [off\|low\|med\|high\|max]` | Cycle or set chain-of-thought level (persisted); bare `/think` cycles: off → low → med → high → max → off; levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
+| `/think [off\|low\|med\|high\|max]` | Set the chain-of-thought level (persisted; an unknown level prints the usage and keeps the previous one); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192); bare `/think` shows the current level and budget |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
-| `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |
+| `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); valid values are `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` — anything else is refused with a usage error |
 | `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation |
 | `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
 | `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
 | `/session rm ID` | Delete a session file and its usage record |
-| `/usages` | Print per-model and per-session usage statistics (orphaned records are pruned first) |
+| `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
 | `/compact` | Aggregate the conversation into one summary message |
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
 | `/skills` | List available skills |
@@ -251,8 +256,8 @@ Seven tools are registered, with schemas emitted for the active API style
 
 | Tool | Policy | Arguments | Behaviour |
 |---|---|---|---|
-| `ls` | Allow | `path`, `page`, `page_size` (≤500) | One level, non-recursive; directories first, then case-insensitive name order; header reports total and page window |
-| `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; records the returned line range for the read-before-edit rule |
+| `ls` | Allow | `path`, `page`, `page_size` (≤500) | One level, non-recursive; directories first, then case-insensitive name order; each entry is printed as `[dir ] NAME` or `[file] NAME  N bytes`, and the header reports `total`, the page window and the path |
+| `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; every returned line is prefixed with a right-aligned 6-column line number (`{:>6}: content`); records the returned line range for the read-before-edit rule |
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget; nested/alternation-quantifier regexes and patterns over 200 chars are rejected |
@@ -279,7 +284,7 @@ consecutive edits of one file skip the disk while an external writer is always p
 
 ## Security model
 
-Five independent layers, from the path down to the bytes shown on your screen.
+Six independent layers, from the path down to the bytes shown on your screen.
 
 ### 1. Sandbox modes
 
@@ -288,13 +293,15 @@ refused by mode before any command runs:
 
 | Mode | Allowed tools | `exec` |
 |---|---|---|
-| `read-only` | `read`, `rg`, `find`, `ls` (and anything run read-only) | **blocked entirely** |
+| `read-only` | `read`, `rg`, `find`, `ls` (and anything run read-only) | **blocked entirely** — refused before the confirmation prompt is ever shown |
 | `edit-only` | `read`/`rg`/`find`/`ls` **plus** `write`/`edit` | allowed, subject to gates 2–3 |
 | `full-access` (default) | all tools | allowed, subject to gates 2–3 |
 
-Network egress is denied in **all three** modes, and the sensitive-path rules in layer 2 apply
-everywhere. `exec` is the only tool gated by a human confirmation prompt (layer 4); in `read-only`
-mode `exec` is refused before the prompt is ever shown.
+Network egress is **not** filtered in any mode — the command gate is path-only (see
+[layer 3](#3-command-gate--check--check_exec) and [Implementation notes](#implementation-notes)).
+The sensitive-path rules in layer 2 apply everywhere. `exec` is the only tool gated by a human
+confirmation prompt (layer 4); in `read-only` mode `exec` is refused before the prompt is ever
+shown.
 
 ### 2. Path gate — `check_path` / `is_sensitive_path`
 
@@ -314,13 +321,14 @@ contain `>`, `|` or `..`.
 ### 3. Command gate — `check` / `check_exec`
 
 The sandbox is **path-only**: the command string is checked for path traversal (`..`) and for
-sensitive paths (`/.crypt`, `/.key`, `/config.json`, `/sessions/`, `/logs/` and the same credential
-store names listed above). It does **not** attempt to block network egress by parsing command names,
+sensitive paths (`/.crypt`, `/.key`, `/config.json`, `/sessions/`, `/logs/`, both separators, case
+folded). It does **not** attempt to block network egress by parsing command names,
 decode encoded payloads, or forbid shell operators — the threat model assumes an untrusted *agent*
 running inside a trusted host, where `exec` commands are confirmed by the user (or autoallowed in
 full-access). In `read-only` mode `exec` is refused outright. Note also that `exec` can still run
 interpreters such as `python3 -c "exec(base64…)"` or `cmd /c "echo …"`, because the gate only
-inspects paths, not inline code.
+inspects paths, not inline code. (The wider credential-store list of layer 2 is enforced by
+`check_path` on tool path arguments, not by `check_exec`.)
 
 High-risk commands that pass the sandbox still demand a **second** confirmation: recursive/forced
 deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`chmod`, `chown`,
@@ -376,7 +384,8 @@ never appears in the vault file — the self-test asserts this.
   array. `.cell/sessions/sessions.json` is the hash → path index that lets every group be resolved
   back to a real directory; `/sessions` groups by it and marks the current cwd with `>`.
 - `/session ID` and startup resume logic **follow the session's cwd** (`current_path` + cache
-  invalidation), so tools keep operating on the project the conversation belongs to.
+  invalidation), so tools keep operating on the project the conversation belongs to; `/session`
+  and `/session rm ID` reset the read-before-edit log because recorded reads no longer apply.
 - `/new` keeps the old file (revisitable), `/clear` keeps the id, `/session rm` deletes both the file
   and its usage record; orphaned usage records are pruned at startup and on `/usages`.
 - Legacy flat `.cell/sessions/<id>.json` files are migrated once at startup into the current cwd
@@ -557,6 +566,13 @@ intentionally simpler than it looks:
 - `print_usage` and `print_help` still advertise `workspace-write` / `outer-full` sandbox aliases; the
   values actually implemented are `read-only` / `edit-only` / `full-access` (plus the `readonly` /
   `edit` / `full` aliases). An unknown value warns and rewrites the stored value to `full-access`.
+  A stale `sandbox_mode` value left by an older build (`"workspace-write"`) also falls back to
+  `full-access` on load with a warning, because `config::load` defaults the field to
+  `"workspace-write"` before parsing.
+- Tool descriptions sent to the model overstate the gate: the `exec` description claims
+  network-egress commands are denied in every mode, and `print_usage` / the `/sandbox` banner repeat
+  that claim, but `check_exec` implements path-only checks — only `..` and sensitive-path substrings
+  are rejected.
 - The sandbox is **path-only**: `box::check_exec` / `box::check` do **not** parse command names,
   decode encoded payloads, or block network egress by binary name — they only reject path traversal
   and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
@@ -565,13 +581,12 @@ intentionally simpler than it looks:
 - Startup always opens a **fresh** session (`history::now()` under the `"current"` key);
   `--session` / the `session` field are persisted but not used to resume automatically — resume with
   `/session ID`.
-- The built-in default `sandbox_mode` in `settings` is `full-access`, so a missing `config.json` starts
-  wide open; the `/sandbox` and `--sandbox` help text still mention `workspace-write`/`outer-full`
-  defaults that are not implemented.
 - The comment above `cwd_id()` says "sha3-256"; the implementation uses `crypto_hash_sha256`
   (SHA-256, truncated to 16 hex characters).
 - `exec` is the only tool whose output is scanned for injection fingerprints; the other tools are
-  considered sandboxed at call time and get a size cap only.
+  considered sandboxed at call time and get a size cap only. The tool descriptions themselves can
+  also drift from the implementation (e.g. `exec`'s denies-network claim, `read`'s numbered lines),
+  which is normal for strings embedded next to the code.
 - The tool-output wrapper tag is written with an escaped forward slash in the source; the escape
   collapses to a plain slash at runtime, so the marker that reaches the transcript is an opening tag
   carrying the `tool` and `path` attributes, and the reload-time sanitizer keys off the `exec` value of
