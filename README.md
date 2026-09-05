@@ -75,7 +75,7 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 ---
 
 想开始的话，可以直接告诉我你的需求，或者让我先 `ls` 看看当前目录里有什么。你今天想做点什么？
-[2026-09-05 16:03:46] INFO  [llm  ] round=1 model=bai:glm-5.3-flash stream=true ctx_msgs=2 tok_in=1640 tok_out=603 cache=0.0% time=20.08s ttf=5.17s tools=0 attempts=1
+[2026-09-05 16:03:46] INFO  [llm  ] round=1 model=Z.AI:glm-5.3-flash stream=true ctx_msgs=2 tok_in=1640 tok_out=603 cache=0.0% time=20.08s ttf=5.17s tools=0 attempts=1
 
 > 
 ```
