@@ -3492,7 +3492,7 @@ namespace cell
             bool autoallow = false;                   // autoallow mode: LLM decides whether exec commands run (only in full-access)
             std::string system_prompt =
                 "You are a helpful assistant. \n"
-#ifdef _WIN32
+#if _WIN32
                 "Operating system environment: Win32 or likely.\n"
 #else
                 "Operating system environment: Unix or likely.\n"
@@ -5816,7 +5816,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session (switches to its working directory)");
     cell::sys::println("  --system TEXT                system prompt");
-    cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
+    cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | workspace-write | full-access (default) | outer-full");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
     cell::sys::println("  --selftest                   run internal self tests");
@@ -5836,7 +5836,7 @@ static void print_help()
     cell::sys::println("  /model NAME [api_style:STYLE]  switch model; optionally pick the API style (openai-chat|openai-responses|anthropic)");
     cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
-    cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
+    cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write | full-access (default) | outer-full");
     cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands (full-access only)");
     cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
     cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
