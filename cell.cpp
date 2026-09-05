@@ -4418,11 +4418,39 @@ namespace cell
                 auth.append(api_key.data(), api_key.size());
                 return {"Content-Type: application/json", std::move(auth)};
             }
+            // Chat Completions only accepts a fixed set of content-part types
+            // (text / image_url / input_audio / file). Reasoning models persist
+            // assistant turns as content arrays that include {"type":"reasoning",...},
+            // which is not valid Chat-Completions input and makes providers such as
+            // GLM reject the request (messages[N].content[0].type 类型错误). Drop those
+            // reasoning parts before sending, mirroring OpenAIResponses::convert_input.
+            static nlohmann::json sanitize_messages(const nlohmann::json &messages)
+            {
+                nlohmann::json out = nlohmann::json::array();
+                for (auto &m : messages)
+                {
+                    nlohmann::json item = m;
+                    if (m.contains("content") && m["content"].is_array())
+                    {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (auto &b : m["content"])
+                        {
+                            std::string bt = b.value("type", "");
+                            if (bt == "reasoning")
+                                continue; // not a valid Chat-Completions content part
+                            arr.push_back(b);
+                        }
+                        item["content"] = arr.empty() ? nlohmann::json(nullptr) : std::move(arr);
+                    }
+                    out.push_back(std::move(item));
+                }
+                return out;
+            }
             static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
             {
                 nlohmann::json b;
                 b["model"] = model;
-                b["messages"] = messages;
+                b["messages"] = sanitize_messages(messages);
                 if (tools.is_array() && !tools.empty())
                     b["tools"] = tools;
                 b["stream"] = stream;
