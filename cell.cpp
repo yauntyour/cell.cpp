@@ -4405,6 +4405,43 @@ namespace cell
             }
         }
 
+        // Flatten request-local content formats into the text forms accepted by
+        // OpenAI-compatible APIs. Sessions can contain reasoning arrays and legacy
+        // Anthropic tool_result blocks, neither of which should reach the wire.
+        static void append_content_text(const nlohmann::json &content, std::string &out)
+        {
+            if (content.is_string())
+            {
+                out += content.get_ref<const std::string &>();
+                return;
+            }
+            if (!content.is_array())
+                return;
+            for (auto &part : content)
+            {
+                if (part.is_string())
+                    out += part.get_ref<const std::string &>();
+                else if (part.is_object())
+                {
+                    std::string type = part.value("type", "");
+                    if ((type == "text" || type == "input_text" || type == "output_text") &&
+                        part.contains("text") && part["text"].is_string())
+                        out += part["text"].get_ref<const std::string &>();
+                }
+            }
+        }
+        static std::string string_content(const nlohmann::json &content)
+        {
+            std::string text;
+            append_content_text(content, text);
+            if (text.empty() && !content.is_null())
+            {
+                // Preserve JSON payloads rather than silently dropping them.
+                text = content.dump();
+            }
+            return text;
+        }
+
         class OpenAI
         {
         private:
@@ -4418,34 +4455,68 @@ namespace cell
                 auth.append(api_key.data(), api_key.size());
                 return {"Content-Type: application/json", std::move(auth)};
             }
-            // Chat Completions only accepts a fixed set of content-part types
-            // (text / image_url / input_audio / file). Reasoning models persist
-            // assistant turns as content arrays that include {"type":"reasoning",...},
-            // which is not valid Chat-Completions input and makes providers such as
-            // GLM reject the request (messages[N].content[0].type 类型错误). Drop those
-            // reasoning parts before sending, mirroring OpenAIResponses::convert_input.
+            // Flatten our internal transcript into the subset that all
+            // OpenAI-compatible Chat Completions providers accept. In particular,
+            // assistant reasoning arrays and Anthropic-style tool_result parts are
+            // request-local persistence formats, not valid Chat-Completions input.
             static nlohmann::json sanitize_messages(const nlohmann::json &messages)
             {
                 nlohmann::json out = nlohmann::json::array();
                 for (auto &m : messages)
                 {
-                    nlohmann::json item = m;
-                    if (m.contains("content") && m["content"].is_array())
+                    std::string role = m.value("role", "");
+
+                    // Legacy Anthropic-format results can occur after a session is
+                    // reused with an OpenAI-style provider. Convert them to the
+                    // tool result shape before they reach the wire.
+                    if (role == "user" && m.contains("content") && m["content"].is_array())
                     {
-                        nlohmann::json arr = nlohmann::json::array();
+                        nlohmann::json text_parts = nlohmann::json::array();
                         for (auto &b : m["content"])
                         {
-                            std::string bt = b.value("type", "");
-                            if (bt == "reasoning")
-                                continue; // not a valid Chat-Completions content part
-                            arr.push_back(b);
+                            if (b.is_object() && b.value("type", "") == "tool_result")
+                            {
+                                nlohmann::json tool = {
+                                    {"role", "tool"},
+                                    {"tool_call_id", b.value("tool_use_id", "")},
+                                    {"content", string_content(b.contains("content") ? b["content"] : nlohmann::json())},
+                                };
+                                out.push_back(std::move(tool));
+                            }
+                            else
+                                text_parts.push_back(b);
                         }
-                        item["content"] = arr.empty() ? nlohmann::json(nullptr) : std::move(arr);
+                        if (!text_parts.empty())
+                            out.push_back({{"role", "user"}, {"content", string_content(text_parts)}});
+                        continue;
                     }
+
+                    nlohmann::json item = m;
+                    bool has_tool_calls = item.contains("tool_calls") && item["tool_calls"].is_array() &&
+                                          !item["tool_calls"].empty();
+                    if (item.contains("content") && item["content"].is_array())
+                    {
+                        std::string text;
+                        append_content_text(item["content"], text);
+                        item["content"] = text.empty() ? nlohmann::json(nullptr) : nlohmann::json(std::move(text));
+                    }
+                    if (role == "tool")
+                    {
+                        if (!item.contains("tool_call_id") || !item["tool_call_id"].is_string())
+                            item["tool_call_id"] = "";
+                        if (!item.contains("content") || item["content"].is_null())
+                            item["content"] = "";
+                        else if (!item["content"].is_string())
+                            item["content"] = string_content(item["content"]);
+                    }
+                    else if (role == "assistant" && item["content"].is_null() && !has_tool_calls)
+                        item["content"] = "";
                     out.push_back(std::move(item));
                 }
                 return out;
             }
+
+        public:
             static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
             {
                 nlohmann::json b;
@@ -4624,84 +4695,95 @@ namespace cell
                         }
                         continue;
                     }
+                    if (role == "user" && m.contains("content") && m["content"].is_array())
+                    {
+                        nlohmann::json item;
+                        nlohmann::json content = nlohmann::json::array();
+                        for (auto &b : m["content"])
+                        {
+                            std::string bt = b.value("type", "");
+                            if (bt == "text")
+                                content.push_back({{"type", "input_text"}, {"text", b.value("text", "")}});
+                            else if (bt == "input_text")
+                                content.push_back(b);
+                            else if (bt == "tool_result")
+                            {
+                                nlohmann::json output;
+                                output["type"] = "function_call_output";
+                                output["call_id"] = b.value("tool_use_id", "");
+                                output["output"] = string_content(b.contains("content") ? b["content"] : nlohmann::json());
+                                input.push_back(std::move(output));
+                            }
+                        }
+                        if (!content.empty())
+                        {
+                            item["role"] = "user";
+                            item["content"] = std::move(content);
+                            input.push_back(std::move(item));
+                        }
+                        continue;
+                    }
                     if (role == "user")
                     {
                         nlohmann::json item;
                         item["role"] = "user";
-                        if (m.contains("content") && m["content"].is_string())
-                            item["content"] = {{{"type", "input_text"}, {"text", m["content"]}}};
-                        else if (m.contains("content") && m["content"].is_array())
-                        {
-                            nlohmann::json arr = nlohmann::json::array();
-                            for (auto &b : m["content"])
-                            {
-                                if (b.is_object() && b.value("type", "") == "text")
-                                    arr.push_back({{"type", "input_text"}, {"text", b.value("text", "")}});
-                                else
-                                    arr.push_back(b); // pass through other content types
-                            }
-                            item["content"] = std::move(arr);
-                        }
+                        item["content"] = {{{"type", "input_text"}, {"text", m.value("content", "")}}};
                         input.push_back(std::move(item));
                     }
                     else if (role == "assistant")
                     {
-                        nlohmann::json item;
-                        item["role"] = "assistant";
+                        nlohmann::json content = nlohmann::json::array();
                         if (m.contains("content") && m["content"].is_string())
-                            item["content"] = {{{"type", "output_text"}, {"text", m["content"]}}};
+                            content.push_back({{"type", "output_text"}, {"text", m["content"].get_ref<const std::string &>()}});
                         else if (m.contains("content") && m["content"].is_array())
                         {
-                            // reasoning model format: array of {type:"reasoning",...} and {type:"text",...}
-                            nlohmann::json arr = nlohmann::json::array();
                             for (auto &b : m["content"])
                             {
                                 std::string bt = b.value("type", "");
                                 if (bt == "text" && b.contains("text"))
-                                    arr.push_back({{"type", "output_text"}, {"text", b["text"]}});
+                                    content.push_back({{"type", "output_text"}, {"text", b["text"]}});
+                                else if (bt == "output_text")
+                                    content.push_back(b);
                                 else if (bt == "reasoning")
-                                    continue; // reasoning items are not passed back in input
-                                else
-                                    arr.push_back(b);
+                                    continue;
                             }
-                            item["content"] = std::move(arr);
+                        }
+                        if (!content.empty())
+                        {
+                            nlohmann::json item;
+                            item["role"] = "assistant";
+                            item["content"] = std::move(content);
+                            input.push_back(std::move(item));
                         }
                         if (m.contains("tool_calls") && m["tool_calls"].is_array())
                         {
-                            // tool_calls become function_call items in the input
-                            nlohmann::json content = item.contains("content") ? item["content"] : nlohmann::json::array();
+                            // Tool calls and their outputs are top-level Responses
+                            // items. They must never be nested inside message content.
                             for (auto &tc : m["tool_calls"])
                             {
                                 nlohmann::json fc;
                                 fc["type"] = "function_call";
+                                fc["call_id"] = tc.value("id", "");
                                 fc["name"] = tc.value("function", nlohmann::json()).value("name", "");
                                 fc["arguments"] = tc.value("function", nlohmann::json()).value("arguments", "");
-                                fc["call_id"] = tc.value("id", "");
-                                content.push_back(std::move(fc));
+                                input.push_back(std::move(fc));
                             }
-                            item["content"] = std::move(content);
                         }
-                        input.push_back(std::move(item));
                     }
                     else if (role == "tool")
                     {
-                        // tool result -> function_call_output
-                        nlohmann::json item;
-                        item["role"] = "user";
-                        nlohmann::json content = nlohmann::json::array();
                         nlohmann::json output;
                         output["type"] = "function_call_output";
                         output["call_id"] = m.value("tool_call_id", "");
-                        output["output"] = m.contains("content") && m["content"].is_string() ? m["content"] : "";
-                        content.push_back(std::move(output));
-                        item["content"] = std::move(content);
-                        input.push_back(std::move(item));
+                        output["output"] = string_content(m.contains("content") ? m["content"] : nlohmann::json());
+                        input.push_back(std::move(output));
                     }
                 }
                 return {std::move(input), instructions};
             }
 
             // build request body for Responses API
+        public:
             static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
             {
                 auto [input, instructions] = convert_input(messages);
@@ -6278,6 +6360,54 @@ static int run_selftest()
     {
     }
     expect(no_throw, "sys::throw_if");
+
+    // OpenAI-style requests must convert the internal transcript into the shape
+    // each wire API accepts, including sessions persisted with reasoning arrays
+    // or legacy Anthropic tool_result blocks.
+    {
+        nlohmann::json messages = nlohmann::json::array({
+            {{"role", "system"}, {"content", "instructions"}},
+            {{"role", "user"}, {"content", "list files"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hidden"}},
+                                                {{"type", "text"}, {"text", "running ls"}}})},
+             {"tool_calls",
+              nlohmann::json::array({{{"id", "call_1"},
+                                      {"type", "function"},
+                                      {"function", {{"name", "ls"}, {"arguments", "{\"path\":\".\"}"}}}}})}},
+            {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "file.txt"}},
+            {{"role", "assistant"}, {"content", "done"}},
+            {{"role", "user"},
+             {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "legacy_call"}, {"content", "legacy output"}}})}},
+        });
+
+        auto chat = cell::llm::OpenAI::body("m", messages, nlohmann::json::array(), false);
+        auto &chat_msgs = chat["messages"];
+        expect(chat_msgs[1]["content"] == "list files", "openai chat user content is a string");
+        expect(chat_msgs[2]["content"] == "running ls", "openai chat drops assistant reasoning");
+        expect(chat_msgs[3]["content"] == "file.txt" && chat_msgs[3]["tool_call_id"] == "call_1",
+               "openai chat preserves tool results");
+        bool legacy_tool_result = false;
+        for (auto &m : chat_msgs)
+            legacy_tool_result |= m.value("role", "") == "tool" &&
+                                  m.value("tool_call_id", "") == "legacy_call" &&
+                                  m.value("content", "") == "legacy output";
+        expect(legacy_tool_result, "openai chat converts Anthropic tool_result blocks");
+
+        auto responses = cell::llm::OpenAIResponses::body("m", messages, nlohmann::json::array(), false);
+        auto &responses_input = responses["input"];
+        expect(responses["instructions"] == "instructions", "responses collects instructions");
+        expect(responses_input[2]["type"] == "function_call" && responses_input[2]["call_id"] == "call_1",
+               "responses emits top-level function_call");
+        expect(responses_input[3]["type"] == "function_call_output" && responses_input[3]["call_id"] == "call_1",
+               "responses emits top-level function_call_output");
+        bool legacy_responses_output = false;
+        for (auto &item : responses_input)
+            legacy_responses_output |= item.value("type", "") == "function_call_output" &&
+                                       item.value("call_id", "") == "legacy_call" &&
+                                       item.value("output", "") == "legacy output";
+        expect(legacy_responses_output, "responses converts Anthropic tool_result blocks");
+    }
 
     // log rotation: trim_log keeps only the tail of an over-cap log file
     {
