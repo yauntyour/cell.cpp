@@ -12,8 +12,70 @@ search / execute inside a strict sandbox, and keep every credential in an encryp
 [![Single file](https://img.shields.io/badge/layout-single%20translation%20unit-orange)](cell.cpp)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-```
-cell --provider openai --base https://api.openai.com/v1 --model gpt-4o --key sk-***
+```bash
+shell> cell
+cell: cwd=path/to/ session=82db5d5997826cfd-1788623888 model=Z.AI:glm-5.3-flash sandbox=full-access
+context: loaded 1 message(s) from disk
+> 介绍一下自己，以及你能干什么   
+The user is asking me to introduce myself and what I can do, in Chinese. Let me respond in Chinese since they asked in Chinese.
+
+I'm an AI assistant operating in a sandboxed environment with various file and shell tools. Let me give a helpful introduction covering:
+1. Who I am
+2. What tools/capabilities I have
+3. What I can help with
+
+I should be accurate about my tools:
+- ls: list directory entries
+- read: read text files
+- write: create new files
+- edit: modify existing files (replace/insert/append/delete/query)
+- rg: search file contents with regex
+- exec: run shell commands (sandboxed, no network egress, high-risk commands need confirmation)
+- find: find files by glob pattern/metadata
+
+I can also just chat and answer questions generally. Let me write a nice introduction in Chinese. I shouldn't make it too long, but should be informative. Maybe use some formatting like a list.
+你好！很高兴见到你 👋
+
+## 我是谁
+
+我是一个 AI 编程助手（基于 GLM 大模型），运行在一个**沙盒化的工作环境**中。与普通聊天机器人不同的是，我可以直接操作你所在的这个文件系统，真正地"动手"干活，而不只是纸上谈兵。
+
+## 我能做什么
+
+### 📁 文件操作
+- **浏览**：列出目录内容、按名称/大小/修改时间递归查找文件
+- **读写**：读取文本文件、创建新文件
+- **编辑**：精确修改已有文件（替换、插入、删除、追加），支持大文件的分段读取和局部修改
+
+### 🔍 代码搜索与分析
+- 用正则表达式递归搜索整个代码库的内容
+- 快速定位函数定义、引用、配置项等
+
+### 💻 执行命令
+- 运行 shell 命令（如编译、测试、运行脚本、安装依赖）
+- 沙盒安全限制：网络请求类命令（curl、git push 等）会被拦截，高风险命令需要二次确认
+
+### 🧠 通用智力
+- 写代码、改 bug、重构、写测试、代码审查
+- 解释技术概念、设计方案、撰写文档
+- 当然，也可以纯聊天答疑 😄
+
+## 典型使用场景
+
+| 场景 | 示例 |
+|------|------|
+| 熟悉陌生代码库 | "帮我看看这个项目的结构" |
+| 修 bug | "测试失败了，帮我找原因并修复" |
+| 开发功能 | "给这个项目加一个 XX 功能" |
+| 项目脚手架 | "从零搭建一个 XX 项目" |
+| 自动化 | "写个脚本批量处理这些文件" |
+
+---
+
+想开始的话，可以直接告诉我你的需求，或者让我先 `ls` 看看当前目录里有什么。你今天想做点什么？
+[2026-09-05 16:03:46] INFO  [llm  ] round=1 model=bai:glm-5.3-flash stream=true ctx_msgs=2 tok_in=1640 tok_out=603 cache=0.0% time=20.08s ttf=5.17s tools=0 attempts=1
+
+> 
 ```
 
 </div>
@@ -108,28 +170,6 @@ Inside the REPL, providers are managed without restarting:
 /model gpt-4o
 /think low
 ```
-
-### Session example
-
-```
-cell: cwd=D:\work\demo session=6333a2b6f7084f1a-1787819024 model=openai:Qwen3.8-27B sandbox=full-access
-context: injected system_prompt=1740chars
-> 还记得前面聊了什么吗
-记得呀，咱们前面聊了这些内容：
-1. **你让我介绍自己** …
-2. **你让我查看当前目录下的项目** —— 我列出了目录内容 …
-[2026-08-27 08:31:55] INFO  [llm  ] round=1 model=openai:Qwen3.8-27B stream=true ctx_msgs=8 tok_in=3424 tok_out=393 cache=92.6% time=19.95s ttf=11.06s tools=0
-> /sessions
-  > cwd: D:\work\demo
-    6333a2b6f7084f1a-1787819024 *  messages=7  "你好，请介绍一下你自己"
-> /compact
-context compacted: aggregated 31 message(s) into 1 summary, 2 message(s) remain
-> /quit
-```
-
-> [!NOTE]
-> The example transcript above predates the current build; the `read` tool output now carries
-> numbered lines and `ls` reports file sizes — cosmetic differences only.
 
 ## Command-line options
 
