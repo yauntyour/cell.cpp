@@ -189,6 +189,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/provides` | List configured providers (style, api_style, base, proxy, key state, model) |
 | `/provide NAME` | Select a provider (persisted immediately) |
 | `/provide add openai:URL [api_style:openai-chat\|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]` | Add **and select** a provider; the `openai:` / `anthropic:` prefix picks the API style and an optional `api_style:` overrides the derived style (a spaced `openai: URL` form is accepted). After adding, the model list is fetched once as a connectivity probe. |
+| `/provide update NAME [base:URL] [style:openai\|anthropic\|openai-responses] [api_style:openai-chat\|openai-responses\|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]` | Update an existing provider in place. Only supplied fields change; renaming the provider carries its encrypted vault key to the new vault id, and a requested name that already exists is made unique as `NEW_NAME-N`. |
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
@@ -386,6 +387,8 @@ never appears in the vault file — the self-test asserts this.
 - `/session ID` and startup resume logic **follow the session's cwd** (`current_path` + cache
   invalidation), so tools keep operating on the project the conversation belongs to; `/session`
   and `/session rm ID` reset the read-before-edit log because recorded reads no longer apply.
+  Switching to an existing session prints its last five user/assistant text messages again, omitting
+  thinking and tool-call content.
 - `/new` keeps the old file (revisitable), `/clear` keeps the id, `/session rm` deletes both the file
   and its usage record; orphaned usage records are pruned at startup and on `/usages`.
 - Legacy flat `.cell/sessions/<id>.json` files are migrated once at startup into the current cwd
@@ -578,9 +581,11 @@ intentionally simpler than it looks:
   and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
   commands; `exec` is gated instead by the sandbox mode, a human confirmation (or autoallow), and the
   high-risk second-confirmation list.
-- Startup always opens a **fresh** session (`history::now()` under the `"current"` key);
-  `--session` / the `session` field are persisted but not used to resume automatically — resume with
-  `/session ID`.
+- Startup resumes the **last session used in the current cwd**, recorded in `active_sessions`; if
+  no record exists yet, the most recently written session file for the cwd is selected. The last
+  five user/assistant text messages are printed again, excluding thinking and tool-call content.
+  `--session` / the `session` field are still persisted for compatibility, but startup uses the
+  active-session record instead.
 - The comment above `cwd_id()` says "sha3-256"; the implementation uses `crypto_hash_sha256`
   (SHA-256, truncated to 16 hex characters).
 - `exec` is the only tool whose output is scanned for injection fingerprints; the other tools are

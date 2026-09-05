@@ -936,11 +936,11 @@ namespace cell
             {
             case SandboxMode::ReadOnly:
                 // Only read-only tools allowed
-                return tool_name == "read" || tool_name == "rg" || 
+                return tool_name == "read" || tool_name == "rg" ||
                        tool_name == "find" || tool_name == "ls";
             case SandboxMode::EditOnly:
                 // Read-only tools plus write and edit allowed
-                return tool_name == "read" || tool_name == "rg" || 
+                return tool_name == "read" || tool_name == "rg" ||
                        tool_name == "find" || tool_name == "ls" ||
                        tool_name == "write" || tool_name == "edit";
             case SandboxMode::FullAccess:
@@ -2322,7 +2322,7 @@ namespace cell
                     carry.append(buf, seg, n - seg);
             }
             if (!stop && !file.eof())
-                return false; // I/O error mid-read
+                return false;   // I/O error mid-read
             if (!carry.empty()) // trailing line without '\n'
             {
                 nline++;
@@ -3410,12 +3410,12 @@ namespace cell
         // (GET {base}/models or {base}/v1/models) and only the active model name is kept.
         struct provider_entry
         {
-            std::string name;                      // unique id, e.g. "openai", "claude", "deepseek"
-            std::string style = "openai";          // "openai" | "anthropic" (legacy, kept for backward compat)
-            std::string api_style;                 // "openai-chat" | "openai-responses" | "anthropic" (derived from style if empty)
-            std::string base;                      // api base url
-            std::string key_id;                    // vault map key for the api key (optional)
-            std::string proxy;                     // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+            std::string name;             // unique id, e.g. "openai", "claude", "deepseek"
+            std::string style = "openai"; // "openai" | "anthropic" (legacy, kept for backward compat)
+            std::string api_style;        // "openai-chat" | "openai-responses" | "anthropic" (derived from style if empty)
+            std::string base;             // api base url
+            std::string key_id;           // vault map key for the api key (optional)
+            std::string proxy;            // http(s) proxy url, e.g. http://user:pass@host:port (optional)
 
             // derive api_style from legacy style field; called after construction when api_style is not set
             void normalize_api_style()
@@ -3483,16 +3483,21 @@ namespace cell
         };
         struct settings
         {
-            std::vector<provider_entry> providers; // empty until the user adds one
-            std::string current_provider;          // provider name (empty => first provider)
-            std::string current_model;             // active model name (fetched from the provider)
-            int think_level = 0;                   // chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192)
-            bool tools = true;                     // tool calls enabled (configurable via /tool on|off)
-            std::string sandbox_mode = "full-access";  // exec sandbox: "read-only" | "edit-only" | "full-access" (default)
-            bool autoallow = false;                 // autoallow mode: LLM decides whether exec commands run (only in full-access)
+            std::vector<provider_entry> providers;    // empty until the user adds one
+            std::string current_provider;             // provider name (empty => first provider)
+            std::string current_model;                // active model name (fetched from the provider)
+            int think_level = 0;                      // chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192)
+            bool tools = true;                        // tool calls enabled (configurable via /tool on|off)
+            std::string sandbox_mode = "full-access"; // exec sandbox: "read-only" | "edit-only" | "full-access" (default)
+            bool autoallow = false;                   // autoallow mode: LLM decides whether exec commands run (only in full-access)
             std::string system_prompt =
-                "You are a helpful assistant."
-                "When you finish a task, reply with a short summary of what was done.";
+                "You are a helpful assistant. \n"
+#ifdef _WIN32
+                "Operating system environment: Win32 or likely.\n"
+#else
+                "Operating system environment: Unix or likely.\n"
+#endif
+                ;
             std::string session_id;
             size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
             size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
@@ -3533,12 +3538,18 @@ namespace cell
             {
                 switch (level)
                 {
-                case 0: return "off";
-                case 1: return "low";
-                case 2: return "med";
-                case 3: return "high";
-                case 4: return "max";
-                default: return level > 4 ? "max" : "off";
+                case 0:
+                    return "off";
+                case 1:
+                    return "low";
+                case 2:
+                    return "med";
+                case 3:
+                    return "high";
+                case 4:
+                    return "max";
+                default:
+                    return level > 4 ? "max" : "off";
                 }
             }
             // convert name to level number, -1 on error
@@ -3546,11 +3557,16 @@ namespace cell
             {
                 std::string s = name;
                 lower_ascii(s);
-                if (s == "off" || s == "0") return 0;
-                if (s == "on" || s == "low" || s == "1") return 1;
-                if (s == "med" || s == "medium" || s == "2") return 2;
-                if (s == "high" || s == "3") return 3;
-                if (s == "max" || s == "maximum" || s == "4") return 4;
+                if (s == "off" || s == "0")
+                    return 0;
+                if (s == "on" || s == "low" || s == "1")
+                    return 1;
+                if (s == "med" || s == "medium" || s == "2")
+                    return 2;
+                if (s == "high" || s == "3")
+                    return 3;
+                if (s == "max" || s == "maximum" || s == "4")
+                    return 4;
                 return -1;
             }
         };
@@ -3569,9 +3585,9 @@ namespace cell
         {
             if (find(s, wanted) < 0)
                 return wanted;
-            for (int i = 2;; i++)
+            for (int i = 1;; i++)
             {
-                std::string n = wanted + std::to_string(i);
+                std::string n = wanted + "-" + std::to_string(i);
                 if (find(s, n) < 0)
                     return n;
             }
@@ -5322,6 +5338,94 @@ namespace cell
                 messages.push_back({{"role", role}, {"content", content}});
             }
         };
+
+        // select the latest regular session file in the current cwd group; used
+        // when active_sessions does not yet contain an entry for this directory
+        static std::string latest_session_id_for_cwd()
+        {
+            std::error_code ec;
+            std::filesystem::path dir = root / "sessions" / cwd_id();
+            if (!std::filesystem::is_directory(dir, ec))
+                return "";
+
+            std::string latest;
+            auto latest_time = std::filesystem::file_time_type::min();
+            for (auto &entry : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (ec)
+                    break;
+                if (!entry.is_regular_file(ec) || entry.path().extension() != ".json")
+                    continue;
+                auto time = entry.last_write_time(ec);
+                if (ec)
+                    continue;
+                if (latest.empty() || time > latest_time)
+                {
+                    latest = entry.path().stem().string();
+                    latest_time = time;
+                }
+            }
+            return latest;
+        }
+
+        // console rendering for resumed sessions: thinking blocks and tool calls
+        // are context, but they are not useful startup previews
+        static std::string message_display_text(const nlohmann::json &message)
+        {
+            std::string role = message.value("role", "");
+            if (role != "user" && role != "assistant")
+                return "";
+            if (message.contains("tool_calls"))
+            {
+                auto &calls = message["tool_calls"];
+                if (calls.is_array() && !calls.empty())
+                    return "";
+            }
+
+            auto content = message.find("content");
+            if (content == message.end() || content->is_null())
+                return "";
+            if (content->is_string())
+                return content->get<std::string>();
+            if (!content->is_array())
+                return "";
+
+            std::string text;
+            for (auto &block : *content)
+            {
+                if (!block.is_object() || block.value("type", "") != "text" ||
+                    !block.contains("text") || !block["text"].is_string())
+                    continue;
+                if (!text.empty())
+                    text += "\n";
+                text += block["text"].get<std::string>();
+            }
+            return text;
+        }
+
+        static void print_recent_messages(const nlohmann::json &messages, size_t limit = 5)
+        {
+            if (limit == 0)
+                return;
+
+            std::vector<std::pair<std::string, std::string>> recent;
+            for (auto it = messages.rbegin(); it != messages.rend() && recent.size() < limit; ++it)
+            {
+                if (!it->is_object())
+                    continue;
+                std::string text = message_display_text(*it);
+                if (text.empty())
+                    continue;
+                recent.emplace_back(it->value("role", ""), std::move(text));
+            }
+            if (recent.empty())
+                return;
+
+            cell::sys::println("recent messages:");
+            for (auto &[role, text] : recent)
+                cell::sys::println("  [{}] {}", role, cell::text::display_safe(text));
+        }
+
         class history
         {
         private:
@@ -5677,6 +5781,7 @@ static void print_help()
     cell::sys::println("  /provides                   list configured providers");
     cell::sys::println("  /provide NAME               select a provider (persistent across sessions)");
     cell::sys::println("  /provide add openai:URL [api_style:openai-chat|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]   add a provider");
+    cell::sys::println("  /provide update NAME [base:URL] [api_style:openai-chat|openai-responses|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]   update a provider");
     cell::sys::println("  /provide rm NAME            delete a provider (removes its stored key too)");
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 api_style:openai-responses key:sk-xxx");
@@ -5805,12 +5910,12 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return cell::box::write_new(j.value("path", ""), j.value("content", ""), out);
         });
     add("edit", "Modify an existing file. The 'mode' parameter selects the operation (default 'replace'):\n"
-                 "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
-                 "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
-                 "  append  — append 'content' at the end of the file.\n"
-                 "  delete  — delete the unique 'search' text; if 'search' is empty, delete the 1-based inclusive line range 'from'..'to'.\n"
-                 "  query   — locate 'search' and report every match with line numbers and surrounding context; read-only, never modifies.\n"
-                 "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.",
+                "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
+                "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
+                "  append  — append 'content' at the end of the file.\n"
+                "  delete  — delete the unique 'search' text; if 'search' is empty, delete the 1-based inclusive line range 'from'..'to'.\n"
+                "  query   — locate 'search' and report every match with line numbers and surrounding context; read-only, never modifies.\n"
+                "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.",
         {{"path", str_prop("file path")},
          {"mode", str_prop("replace | insert | append | delete | query (default replace)")},
          {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")},
@@ -6384,6 +6489,37 @@ static int run_selftest()
     {
     }
     expect(no_throw, "sys::throw_if");
+
+    // provider names collide safely, and resumed-session previews omit context
+    {
+        cell::config::settings s;
+        cell::config::provider_entry alpha;
+        alpha.name = "alpha";
+        s.providers.push_back(alpha);
+        expect(cell::config::unique_name(s, "alpha") == "alpha-1", "provider duplicate names append -N");
+        alpha.name = "alpha-1";
+        s.providers.push_back(alpha);
+        expect(cell::config::unique_name(s, "alpha") == "alpha-2", "provider sequence skips occupied names");
+
+        nlohmann::json preview = nlohmann::json::array({
+            {{"role", "system"}, {"content", "do not preview"}},
+            {{"role", "user"}, {"content", "visible user"}},
+            {{"role", "assistant"}, {"reasoning_content", "hidden"}, {"content", "visible assistant"}},
+            {{"role", "assistant"}, {"content", nullptr},
+             {"tool_calls", nlohmann::json::array({{{"id", "call"}, {"type", "function"}, {"function", {{"name", "noop"}, {"arguments", "{}"}}}}})}},
+            {{"role", "tool"}, {"content", "hidden tool"}},
+            {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"content", "hidden result"}}})}},
+            {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "hidden"}},
+                                                                        {{"type", "text"}, {"text", "visible block"}}})}},
+        });
+        expect(cell::chat::message_display_text(preview[0]).empty(), "session preview omits system messages");
+        expect(cell::chat::message_display_text(preview[1]) == "visible user", "session preview keeps user text");
+        expect(cell::chat::message_display_text(preview[2]) == "visible assistant", "session preview omits reasoning field");
+        expect(cell::chat::message_display_text(preview[3]).empty(), "session preview omits tool calls");
+        expect(cell::chat::message_display_text(preview[4]).empty(), "session preview omits tool results");
+        expect(cell::chat::message_display_text(preview[5]).empty(), "session preview omits Anthropic tool results");
+        expect(cell::chat::message_display_text(preview[6]) == "visible block", "session preview keeps text blocks only");
+    }
 
     // OpenAI-style requests must convert the internal transcript into the shape
     // each wire API accepts, including sessions persisted with reasoning arrays
@@ -7130,8 +7266,16 @@ int main(int argc, char const *argv[])
             }
         }
     }
-    // always start a fresh session (ignore previous active_sessions / session_id)
+    // resume the last session used in the current cwd; fall back to filesystem
+    // mtime when an active-session record has not been written yet
     cell::chat::history h;
+    std::string boot_session_id;
+    if (auto it = cfg.active_sessions.find(cell::cwd_id()); it != cfg.active_sessions.end())
+        boot_session_id = it->second;
+    if (boot_session_id.empty())
+        boot_session_id = cell::chat::latest_session_id_for_cwd();
+    if (!boot_session_id.empty())
+        h.use(boot_session_id);
     cell::chat::session *s = &h.now();
     // a resumed session may belong to another cwd: follow it so tools operate there
     if (const std::string &sc = s->cwd_path(); !sc.empty() && !cell::same_path(sc, cell::workdir().string()))
@@ -7273,6 +7417,7 @@ int main(int argc, char const *argv[])
     long long loaded_msgs = (long long)s->msg().size();
     if (loaded_msgs > 0)
         cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
+    cell::chat::print_recent_messages(s->msg());
     ensure_prompt(s);
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
         probe_async(*p); // background: startup never waits on the network
@@ -7617,11 +7762,8 @@ int main(int argc, char const *argv[])
                             continue;
                         }
                         std::string name = name_arg.empty() ? style : name_arg;
-                        if (cell::config::find(cfg, name) >= 0)
-                        {
-                            cell::sys::error("provider already exists: {} (use /provide rm {} first)", name, name);
-                            continue;
-                        }
+                        std::string requested_name = name;
+                        name = cell::config::unique_name(cfg, name);
                         cell::config::provider_entry ne;
                         ne.name = name;
                         ne.style = style;
@@ -7664,6 +7806,173 @@ int main(int argc, char const *argv[])
                         else
                             cell::sys::warn("[provider unreachable] {}: {}", reg.name, ferr.empty() ? "request failed" : ferr);
                         cell::sys::println("       pick a model with /models then /model NAME");
+                        continue;
+                    }
+                    if (toks[1] == "update")
+                    {
+                        if (toks.size() < 3)
+                        {
+                            cell::sys::error("usage: /provide update NAME [base:URL] [style:openai|anthropic|openai-responses] [api_style:openai-chat|openai-responses|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]");
+                            continue;
+                        }
+
+                        std::string target = toks[2];
+                        int idx = cell::config::find(cfg, target);
+                        if (idx < 0)
+                        {
+                            cell::sys::error("provider not found: {}", target);
+                            continue;
+                        }
+
+                        std::string new_base, new_key, new_proxy, new_name, new_style, new_api_style;
+                        bool has_base = false, has_key = false, has_proxy = false;
+                        bool has_name = false, has_style = false, has_api_style = false;
+                        auto read_value = [&](size_t &ti, size_t prefix_len) -> std::string
+                        {
+                            std::string v = toks[ti].substr(prefix_len);
+                            if (v.empty() && ti + 1 < toks.size())
+                                v = toks[++ti];
+                            return cell::text::trim(std::move(v));
+                        };
+                        for (size_t ti = 3; ti < toks.size(); ti++)
+                        {
+                            auto &tt = toks[ti];
+                            if (tt.rfind("base:", 0) == 0)
+                            {
+                                new_base = read_value(ti, 5);
+                                has_base = true;
+                            }
+                            else if (tt.rfind("key:", 0) == 0)
+                            {
+                                new_key = read_value(ti, 4);
+                                has_key = true;
+                            }
+                            else if (tt.rfind("proxy:", 0) == 0)
+                            {
+                                new_proxy = read_value(ti, 6);
+                                has_proxy = true;
+                            }
+                            else if (tt.rfind("name:", 0) == 0)
+                            {
+                                new_name = read_value(ti, 5);
+                                has_name = true;
+                            }
+                            else if (tt.rfind("style:", 0) == 0)
+                            {
+                                new_style = read_value(ti, 6);
+                                has_style = true;
+                            }
+                            else if (tt.rfind("api_style:", 0) == 0)
+                            {
+                                new_api_style = read_value(ti, 10);
+                                has_api_style = true;
+                            }
+                            else
+                                cell::sys::warn("ignoring token: {}", tt);
+                        }
+
+                        std::string final_name = has_name ? new_name : target;
+                        if (has_name && !final_name.empty() && final_name != target)
+                            final_name = cell::config::unique_name(cfg, final_name);
+                        if (has_api_style)
+                        {
+                            std::string canonical = cell::config::provider_entry::parse_api_style(new_api_style);
+                            if (canonical.empty())
+                            {
+                                cell::sys::error("invalid api_style: {} (use openai-chat, openai-responses, or anthropic)", new_api_style);
+                                continue;
+                            }
+                            new_api_style = canonical;
+                        }
+                        if (has_style)
+                        {
+                            cell::lower_ascii(new_style);
+                            if (new_style != "openai" && new_style != "anthropic" && new_style != "openai-responses")
+                            {
+                                cell::sys::error("invalid style: {} (use openai, anthropic, or openai-responses)", new_style);
+                                continue;
+                            }
+                        }
+                        if (!has_base && !has_key && !has_proxy && !has_name && !has_style && !has_api_style)
+                        {
+                            cell::sys::error("no provider changes requested: /provide update {} base:URL key:KEY", target);
+                            continue;
+                        }
+
+                        auto &p = cfg.providers[idx];
+                        std::string old_name = p.name;
+                        std::string old_key_id = p.key_id;
+                        if (has_base)
+                            p.base = new_base;
+                        if (has_style)
+                        {
+                            p.style = new_style;
+                            if (!has_api_style)
+                            {
+                                if (new_style == "anthropic")
+                                    p.api_style = "anthropic";
+                                else if (new_style == "openai-responses")
+                                    p.api_style = "openai-responses";
+                                else
+                                    p.api_style = "openai-chat";
+                            }
+                        }
+                        if (has_api_style)
+                            p.set_api_style(new_api_style);
+                        p.name = final_name;
+
+                        std::string key_id = "provider:" + p.name;
+                        if (has_key)
+                        {
+                            if (!new_key.empty())
+                            {
+                                vault.set(key_id, new_key);
+                                sodium_memzero(new_key.data(), new_key.size());
+                                p.key_id = key_id;
+                            }
+                            else
+                            {
+                                if (!old_key_id.empty() && vault.remove(old_key_id) > 0)
+                                    log.info("vault", std::format("removed old key id={}", old_key_id));
+                                p.key_id.clear();
+                            }
+                        }
+                        else if (p.name != old_name && !old_key_id.empty())
+                        {
+                            auto existing_key = vault.get(old_key_id);
+                            if (!existing_key.empty())
+                            {
+                                vault.set(key_id, existing_key);
+                                p.key_id = key_id;
+                            }
+                            if (old_key_id != key_id)
+                                vault.remove(old_key_id);
+                        }
+                        if (!p.key_id.empty() && p.key_id != key_id)
+                        {
+                            // older entries may point at a vault id that does not
+                            // match the final provider name; keep the vault mapping coherent
+                            p.key_id = key_id;
+                        }
+                        if (has_proxy)
+                            p.proxy = new_proxy;
+                        if ((cfg.current_provider == old_name) ||
+                            (cfg.current_provider.empty() && idx == 0))
+                            cfg.current_provider = p.name;
+
+                        cell::config::save(cfg);
+                        log.info("provider", std::format("updated name={} style={} api_style={} base={} proxy={} key={}",
+                                                         p.name, p.style, p.api_style, p.base,
+                                                         p.proxy.empty() ? "(none)" : p.proxy,
+                                                         p.key_id.empty() ? "none" : "stored"));
+                        cell::sys::println("provider updated: {}", p.name);
+                        if (p.name != old_name)
+                            cell::sys::println("       renamed:  {} -> {}", old_name, p.name);
+                        cell::sys::println("       style:     {}", p.style);
+                        cell::sys::println("       api_style: {}", p.api_style);
+                        cell::sys::println("       base:      {}", p.base);
+                        cell::sys::println("       proxy: {}", p.proxy.empty() ? "(system default)" : p.proxy);
+                        cell::sys::println("       key:   {}", p.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
                         continue;
                     }
                     // select a provider by name (persistent)
@@ -8016,6 +8325,7 @@ int main(int argc, char const *argv[])
                     ensure_prompt(s);
                     log.info("sess", std::format("switched to={} msgs={} previous={}", target, s->msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
                     cell::sys::println("switched to session {} cwd={} ({} message(s))", s->id(), cell::workdir().string(), s->msg().size());
+                    cell::chat::print_recent_messages(s->msg());
                     continue;
                 }
                 if (cmd == "/usages")
@@ -8081,7 +8391,7 @@ int main(int argc, char const *argv[])
                 continue;
             }
 
-llm_start:
+        llm_start:
             s->msg().push_back({{"role", "user"}, {"content", input}});
             log.info("user", std::format("chars={} text={}", input.size(), input));
             cell::sys::print("reply> ");
