@@ -342,8 +342,9 @@ deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`
 `exec` is the only `Ask` tool: `allow exec({…})? [y/N]` — the argument is printed through
 `display_safe`, so injected JSON cannot erase the prompt or fake an approval. When **autoallow mode**
 is enabled (`/autoallow on`, full-access sandbox only), the LLM alone decides whether exec commands
-run without user confirmation — sandbox checks (sensitive paths) still apply. A rejected or blocked
-call ends the current agent run instead of letting the model retry it.
+run without user confirmation — sandbox checks (sensitive paths) still apply. Approval refusals
+(from the user or autoallow) end the current agent run; sandbox security refusals are returned to
+the model as normal feedback.
 
 ### 5. Output hardening
 

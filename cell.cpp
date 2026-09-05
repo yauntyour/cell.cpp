@@ -4163,6 +4163,21 @@ namespace cell
             Ask = 0,
             Allow = 1,
         };
+        // distinguish policy/security refusals (the model may try another route)
+        // from approval refusals (the run should stop immediately)
+        enum class rejection_reason : unsigned char
+        {
+            none = 0,
+            sandbox,
+            user,
+            autoallow,
+        };
+        // set during normal startup; while unset, autoallow is fail-closed
+        static std::function<bool(const std::string &)> &autoallow_validator()
+        {
+            static std::function<bool(const std::string &)> v;
+            return v;
+        }
         class tool
         {
         private:
@@ -4183,6 +4198,7 @@ namespace cell
             const std::string &name() const { return key; }
             Policy policy() const { return permission; }
             virtual bool blocked() const { return false; }
+            virtual rejection_reason rejected_for() const { return rejection_reason::none; }
         };
         template <typename F>
         concept tool_handler = requires(F f, const std::string &input, std::string &output) {
@@ -4195,19 +4211,23 @@ namespace cell
             using handler_t = std::move_only_function<bool(const std::string &input, std::string &output)>;
             handler_t handler_;
             std::atomic<bool> blocked_{false};
+            std::atomic<rejection_reason> rejected_for_{rejection_reason::none};
 
         public:
             template <tool_handler F>
             callable_tool(size_t id, const std::string &key, Policy permission, F &&fn)
                 : tool(id, key, permission), handler_(std::forward<F>(fn)) {}
             bool blocked() const override { return blocked_.load(std::memory_order_relaxed); }
+            rejection_reason rejected_for() const override { return rejected_for_.load(std::memory_order_relaxed); }
             bool execute(const std::string &input, std::string &output) override
             {
                 blocked_.store(false, std::memory_order_relaxed);
+                rejected_for_.store(rejection_reason::none, std::memory_order_relaxed);
                 // Check if this tool is allowed in the current sandbox mode
                 if (!box::is_tool_allowed(name()))
                 {
                     blocked_.store(true, std::memory_order_relaxed);
+                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                     output = std::format("[{}] tool is blocked by sandbox mode (mode={})", name(), box::mode_name(box::sandbox_mode()));
                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox_mode={}", name(), box::mode_name(box::sandbox_mode())));
                     return false;
@@ -4215,13 +4235,15 @@ namespace cell
                 if (policy() == Policy::Deny)
                 {
                     blocked_.store(true, std::memory_order_relaxed);
+                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                     output = std::format("[{}] tool is disabled by policy", name());
                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=policy_deny", name()));
                     return false;
                 }
                 if (policy() == Policy::Ask)
                 {
-                    // autoallow mode: skip user confirmation for exec when enabled in FullAccess mode
+                    // autoallow mode: ask a context-free LLM safety check before
+                    // running exec without user confirmation (FullAccess only)
                     bool autoallow = (name() == "exec" && box::autoallow_enabled() && box::sandbox_mode() == box::SandboxMode::FullAccess);
                     if (!autoallow)
                     {
@@ -4231,6 +4253,7 @@ namespace cell
                         if (answer != "y" && answer != "Y")
                         {
                             blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::user, std::memory_order_relaxed);
                             output = std::format("[{}] rejected by user", name());
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=rejected_by_user", name()));
                             return false;
@@ -4239,6 +4262,25 @@ namespace cell
                     }
                     else
                     {
+                        std::string action_json;
+                        try
+                        {
+                            auto aj = nlohmann::json::parse(input, nullptr, true);
+                            action_json = aj.dump();
+                        }
+                        catch (const std::exception &)
+                        {
+                            action_json = input;
+                        }
+                        auto validator = cell::tools::autoallow_validator();
+                        if (!validator || !validator(action_json))
+                        {
+                            blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::autoallow, std::memory_order_relaxed);
+                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=autoallow_rejected args={}", name(), input));
+                            output = std::format("[{}] rejected by autoallow safety check", name());
+                            return false;
+                        }
                         cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={}", name(), cell::text::display_safe(input)));
                         cell::sys::println("[autoallow] {}({})", name(), cell::text::display_safe(input));
                     }
@@ -4262,6 +4304,7 @@ namespace cell
                         if (!box::check_exec(exec_cmd))
                         {
                             blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), exec_cmd));
                             output = std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode()));
                             return false;
@@ -4276,6 +4319,7 @@ namespace cell
                                 if (!wd_val.empty() && !box::check_path(wd_val))
                                 {
                                     blocked_.store(true, std::memory_order_relaxed);
+                                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                                     output = std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val);
                                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=wd_sandbox wd={} args={}", name(), wd_val, input));
                                     return false;
@@ -4295,6 +4339,7 @@ namespace cell
                                 if (answer2 != "y" && answer2 != "Y")
                                 {
                                     blocked_.store(true, std::memory_order_relaxed);
+                                    rejected_for_.store(rejection_reason::user, std::memory_order_relaxed);
                                     output = std::format("[{}] high-risk command rejected by user", name());
                                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
                                     return false;
@@ -4328,6 +4373,7 @@ namespace cell
                         if (blocked)
                         {
                             blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                             output = std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name());
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox args={}", name(), input));
                             return false;
@@ -4364,6 +4410,7 @@ namespace cell
                     if (blocked)
                     {
                         blocked_.store(true, std::memory_order_relaxed);
+                        rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
                         output = std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name());
                         cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=path_traversal args={}", name(), input));
                         return false;
@@ -7159,6 +7206,35 @@ int main(int argc, char const *argv[])
                     n += (long long)b["text"].get_ref<const std::string &>().size();
         return n;
     };
+
+    // autoallow asks the model to evaluate only this action, not the session,
+    // prior tool output, or the user's system prompt. The check is fail-closed.
+    auto autoallow_check = [&do_chat, &cfg, &resolve_key, &total_llm_requests, &reply_text](const std::string &action) -> bool
+    {
+        const cell::config::provider_entry *p = cfg.current_provider_entry();
+        if (!p || cfg.current_model.empty())
+            return false;
+        cell::encrypt::secure_string key = resolve_key(*p);
+        if (key.empty())
+            return false;
+        const nlohmann::json messages = nlohmann::json::array({
+            {{"role", "system"}, {"content", "You are an action safety gate. Determine only whether this tool action is safe and legal to execute. Answer with exactly ALLOW or DENY. No explanation."}},
+            {{"role", "user"}, {"content", std::format("Tool action JSON:\n{}\n\nIs this action safe and legal to execute? Answer with exactly ALLOW or DENY.", action)}},
+        });
+        nlohmann::json reply, tc, usage;
+        std::string err;
+        ++total_llm_requests;
+        if (!do_chat(*p, key, cfg.current_model, messages, false, nullptr, nullptr,
+                     reply, tc, usage, err, false, cfg.think_level))
+        {
+            cell::sys::logger::instance().warn("autoallow", std::format("request_failed err={}", err.empty() ? "n/a" : err));
+            return false;
+        }
+        std::string answer = cell::text::trim(reply_text(reply));
+        cell::lower_ascii(answer);
+        return answer == "allow";
+    };
+    cell::tools::autoallow_validator() = autoallow_check;
     auto usage_in = [](const nlohmann::json &u) -> std::optional<long long>
     {
         if (u.is_object())
@@ -8623,6 +8699,7 @@ int main(int argc, char const *argv[])
                         std::string name, args, policy, status, output;
                         double sec = 0;
                         bool blocked = false;
+                        cell::tools::rejection_reason rejected_for = cell::tools::rejection_reason::none;
                     };
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
@@ -8669,6 +8746,7 @@ int main(int argc, char const *argv[])
                                 else if (it->second->blocked())
                                 {
                                     res[i].blocked = true;
+                                    res[i].rejected_for = it->second->rejected_for();
                                     res[i].status = "blocked";
                                 }
                                 else if (!o.empty())
@@ -8701,6 +8779,7 @@ int main(int argc, char const *argv[])
                         else if (it != tool_list.end() && it->second->blocked())
                         {
                             res[i].blocked = true;
+                            res[i].rejected_for = it->second->rejected_for();
                             res[i].status = "blocked";
                         }
                         else if (!o.empty())
@@ -8777,18 +8856,19 @@ int main(int argc, char const *argv[])
                         else
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
                     }
-                    // a rejected/blocked tool call ends this agent loop: no point
-                    // asking the model to retry a call the sandbox/user refused
-                    bool any_blocked = false;
+                    // sandbox security refusals are normal feedback; only approval
+                    // refusals end the run (user decline or autoallow safety deny)
+                    bool approval_refused = false;
                     for (size_t i = 0; i < tool_calls.size(); i++)
-                        if (res[i].blocked)
+                        if (res[i].blocked && (res[i].rejected_for == cell::tools::rejection_reason::user ||
+                                               res[i].rejected_for == cell::tools::rejection_reason::autoallow))
                         {
-                            any_blocked = true;
+                            approval_refused = true;
                             cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
                             break;
                         }
                     cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
-                    if (any_blocked)
+                    if (approval_refused)
                         done = true;
                     continue;
                 }
