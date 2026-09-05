@@ -3592,6 +3592,23 @@ namespace cell
                     return n;
             }
         }
+        // switch the active provider by name (no-op for unknown names). the stored
+        // model name belongs to the previously active provider, so an actual switch
+        // resets the model to unset; pick a model for the new provider afterwards
+        // (/models + /model NAME). selecting the provider that is already active
+        // (including when current_provider is empty, meaning "first provider")
+        // keeps its model.
+        static void select_provider(settings &s, const std::string &name)
+        {
+            int idx = find(s, name);
+            if (idx < 0)
+                return;
+            bool was_current = (s.providers[(size_t)idx].name == s.current_provider) ||
+                               (s.current_provider.empty() && idx == 0);
+            s.current_provider = s.providers[(size_t)idx].name;
+            if (!was_current)
+                s.current_model.clear();
+        }
 
         using config_result = std::expected<settings, std::string>;
         config_result load()
@@ -6548,6 +6565,35 @@ static int run_selftest()
         s.providers.push_back(alpha);
         expect(cell::config::unique_name(s, "alpha") == "alpha-2", "provider sequence skips occupied names");
 
+        // switching providers resets the stored model to unset (it belonged to the
+        // previous provider); re-selecting the active provider keeps its model
+        cell::config::provider_entry beta;
+        beta.name = "beta";
+        beta.api_style = "openai-chat";
+        s.providers.push_back(beta);
+        s.current_provider = "alpha";
+        s.current_model = "m-alpha";
+        cell::config::select_provider(s, "alpha");
+        expect(s.current_provider == "alpha" && s.current_model == "m-alpha", "select_provider re-selection keeps the model");
+        cell::config::select_provider(s, "beta");
+        expect(s.current_provider == "beta" && s.current_model.empty(), "select_provider switch resets the model to unset");
+        cell::config::select_provider(s, "nope");
+        expect(s.current_provider == "beta" && s.current_model.empty(), "select_provider ignores unknown names");
+
+        // current_provider empty means "first provider is active": re-selecting it
+        // must not drop the model, switching away from it must
+        cell::config::settings s2;
+        cell::config::provider_entry p1;
+        p1.name = "one";
+        cell::config::provider_entry p2;
+        p2.name = "two";
+        s2.providers = {p1, p2};
+        s2.current_model = "m-one";
+        cell::config::select_provider(s2, "one");
+        expect(s2.current_provider == "one" && s2.current_model == "m-one", "select_provider empty-current keeps the model");
+        cell::config::select_provider(s2, "two");
+        expect(s2.current_provider == "two" && s2.current_model.empty(), "select_provider empty-current switch resets the model");
+
         nlohmann::json preview = nlohmann::json::array({
             {{"role", "system"}, {"content", "do not preview"}},
             {{"role", "user"}, {"content", "visible user"}},
@@ -6987,7 +7033,7 @@ int main(int argc, char const *argv[])
     {
         int idx = cell::config::find(cfg, provider_arg);
         if (idx >= 0)
-            cfg.current_provider = provider_arg;
+            cell::config::select_provider(cfg, provider_arg);
         else
         {
             cell::config::provider_entry ne;
@@ -7862,7 +7908,8 @@ int main(int argc, char const *argv[])
                             ne.key_id = kid;
                         }
                         cfg.providers.push_back(std::move(ne));
-                        cfg.current_provider = name;
+                        cfg.current_model.clear(); // the model belonged to the previous provider
+                        cell::config::select_provider(cfg, name);
                         cell::config::save(cfg);
                         auto &reg = cfg.providers.back();
                         log.info("provider", std::format("added name={} style={} base={} proxy={} key={}",
@@ -8059,12 +8106,14 @@ int main(int argc, char const *argv[])
                         cell::sys::error("provider not found: {} (use /provide add openai:URL to add one)", name);
                         continue;
                     }
-                    cfg.current_provider = name;
+                    cell::config::select_provider(cfg, name);
                     cell::config::save(cfg);
-                    log.info("provider", std::format("selected name={} model={}", name, cfg.current_model));
+                    log.info("provider", std::format("selected name={} model={}", name, cfg.current_model.empty() ? "(none)" : cfg.current_model));
                     cell::sys::println("provider selected: {}", name);
                     if (cfg.current_model.empty())
                         cell::sys::println("  no model set - use /models to list and /model NAME to pick one");
+                    else
+                        cell::sys::println("  model: {}", cfg.current_model);
                     continue;
                 }
                 if (cmd == "/models")
