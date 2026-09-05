@@ -4685,8 +4685,8 @@ namespace cell
                 if (tools.is_array() && !tools.empty())
                     b["tools"] = tools;
                 b["stream"] = stream;
-                if (stream)
-                    b["stream_options"] = {{"include_usage", true}};
+                // Responses API reports usage via the response.completed event; it
+                // does not accept the Chat-Completions-only stream_options field.
                 return b;
             }
 
@@ -4775,9 +4775,12 @@ namespace cell
                 std::string text;
                 std::string sse_buf;
                 size_t sse_base = 0;
-                // track function_call deltas by call_id
-                std::unordered_map<std::string, std::string> func_call_args;
-                std::unordered_map<std::string, std::string> func_call_names;
+                // track function_call deltas by item_id (OpenAI Responses streaming
+                // keys the argument deltas with item_id; the call_id that the
+                // tool_result must reference is recovered from output_item.added)
+                std::unordered_map<std::string, std::string> func_call_args;    // item_id -> accumulated arguments
+                std::unordered_map<std::string, std::string> func_call_names;   // item_id -> function name
+                std::unordered_map<std::string, std::string> func_call_callids; // item_id -> call_id
                 std::string url = api_base + "/responses";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
@@ -4787,8 +4790,45 @@ namespace cell
                         if (type == "response.completed" && ev.contains("response"))
                         {
                             auto &resp = ev["response"];
+                            // usage arrives here (Responses API does not use stream_options)
                             if (resp.contains("usage") && resp["usage"].is_object())
                                 usage = resp["usage"];
+                            // function_call names are also available in the final response
+                            if (resp.contains("output") && resp["output"].is_array())
+                            {
+                                for (auto &item : resp["output"])
+                                {
+                                    if (item.value("type", "") == "function_call")
+                                    {
+                                        std::string iid = item.value("id", "");
+                                        std::string cid = item.value("call_id", "");
+                                        if (!iid.empty())
+                                        {
+                                            func_call_names[iid] = item.value("name", "");
+                                            if (!cid.empty())
+                                                func_call_callids[iid] = cid;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else if (type == "response.output_item.added")
+                        {
+                            // the canonical, streaming-time source of function_call
+                            // identity: item.id (== item_id of the argument deltas),
+                            // item.call_id (used by function_call_output), and name.
+                            auto &item = ev["item"];
+                            if (item.value("type", "") == "function_call")
+                            {
+                                std::string iid = item.value("id", "");
+                                if (!iid.empty())
+                                {
+                                    func_call_names[iid] = item.value("name", "");
+                                    std::string cid = item.value("call_id", "");
+                                    if (!cid.empty())
+                                        func_call_callids[iid] = cid;
+                                }
+                            }
                         }
                         else if (type == "response.output_text.delta")
                         {
@@ -4801,37 +4841,16 @@ namespace cell
                         }
                         else if (type == "response.function_call_arguments.delta")
                         {
-                            if (ev.contains("call_id") && ev["call_id"].is_string())
-                            {
-                                std::string call_id = ev["call_id"].get_ref<const std::string &>();
-                                if (ev.contains("delta") && ev["delta"].is_string())
-                                    func_call_args[call_id] += ev["delta"].get_ref<const std::string &>();
-                            }
+                            // OpenAI keys these deltas by item_id, not call_id
+                            std::string iid = ev.value("item_id", ev.value("call_id", ""));
+                            if (!iid.empty() && ev.contains("delta") && ev["delta"].is_string())
+                                func_call_args[iid] += ev["delta"].get_ref<const std::string &>();
                         }
                         else if (type == "response.function_call_arguments.done")
                         {
-                            if (ev.contains("call_id") && ev["call_id"].is_string())
-                            {
-                                std::string call_id = ev["call_id"].get_ref<const std::string &>();
-                                if (ev.contains("arguments") && ev["arguments"].is_string())
-                                    func_call_args[call_id] = ev["arguments"].get_ref<const std::string &>();
-                            }
-                        }
-                        else if (type == "response.completed" && ev.contains("response"))
-                        {
-                            // extract function_call names from the completed response
-                            auto &resp = ev["response"];
-                            if (resp.contains("output") && resp["output"].is_array())
-                            {
-                                for (auto &item : resp["output"])
-                                {
-                                    if (item.value("type", "") == "function_call")
-                                    {
-                                        std::string cid = item.value("call_id", "");
-                                        func_call_names[cid] = item.value("name", "");
-                                    }
-                                }
-                            }
+                            std::string iid = ev.value("item_id", ev.value("call_id", ""));
+                            if (!iid.empty() && ev.contains("arguments") && ev["arguments"].is_string())
+                                func_call_args[iid] = ev["arguments"].get_ref<const std::string &>();
                         }
                     };
                     sse_feed(sse_buf, sse_base, data, handle);
@@ -4853,17 +4872,23 @@ namespace cell
                     err = "stream request failed";
                 // assemble the reply in Chat Completions-compatible format
                 reply["role"] = "assistant";
-                if (text.empty() && func_call_args.empty())
+                // when the model produced tool calls, content must be null (per the
+                // Chat Completions contract) even if no text was streamed
+                if (!func_call_args.empty())
+                    reply["content"] = nullptr;
+                else if (text.empty())
                     reply["content"] = nullptr;
                 else
                     reply["content"] = text;
-                // assemble tool_calls from accumulated deltas
-                for (auto &[call_id, args] : func_call_args)
+                // assemble tool_calls from accumulated deltas. func_call_args is keyed
+                // by item_id; resolve the function name and the call_id (used by the
+                // tool_result's function_call_output) through the mappings built above.
+                for (auto &[item_id, args] : func_call_args)
                 {
                     nlohmann::json tc;
-                    tc["id"] = call_id;
+                    tc["id"] = func_call_callids.count(item_id) ? func_call_callids[item_id] : item_id;
                     tc["type"] = "function";
-                    tc["function"]["name"] = func_call_names.count(call_id) ? func_call_names[call_id] : "";
+                    tc["function"]["name"] = func_call_names.count(item_id) ? func_call_names[item_id] : "";
                     tc["function"]["arguments"] = args;
                     tool_calls.push_back(std::move(tc));
                 }
