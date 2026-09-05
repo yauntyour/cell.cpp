@@ -187,6 +187,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
+| `/model NAME [api_style:STYLE]` | Optionally switch the current provider's API wire style on the fly (`openai-chat` \| `openai-responses` \| `anthropic`; `openai` is accepted as an alias of `openai-chat`); the new style is persisted in `config.json` and shown by `/model` and `/provides` |
 | `/think [off\|low\|med\|high\|max]` | Cycle or set chain-of-thought level (persisted); bare `/think` cycles: off → low → med → high → max → off; levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192) |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
 | `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); reminds you that network egress is blocked in every mode |

@@ -3428,6 +3428,30 @@ namespace cell
                 else
                     api_style = "openai-chat";
             }
+            // parse a user-supplied api_style name into its canonical value;
+            // returns "" when unknown ("openai" is accepted as an alias for
+            // the chat-completions style)
+            static std::string parse_api_style(std::string name)
+            {
+                lower_ascii(name);
+                if (name == "openai")
+                    return "openai-chat";
+                if (name == "openai-chat" || name == "openai-responses" || name == "anthropic")
+                    return name;
+                return "";
+            }
+            // set a canonical api_style and keep the legacy style field in sync
+            // so env-var hints and provider display stay consistent
+            void set_api_style(const std::string &canonical)
+            {
+                api_style = canonical;
+                if (canonical == "anthropic")
+                    style = "anthropic";
+                else if (canonical == "openai-responses")
+                    style = "openai-responses";
+                else
+                    style = "openai";
+            }
 
             nlohmann::json to_json() const
             {
@@ -5657,7 +5681,7 @@ static void print_help()
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 api_style:openai-responses key:sk-xxx");
     cell::sys::println("  /models                     fetch the model list from the current provider");
-    cell::sys::println("  /model NAME                 switch to a model of the current provider");
+    cell::sys::println("  /model NAME [api_style:STYLE]  switch model; optionally pick the API style (openai-chat|openai-responses|anthropic)");
     cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sandbox [mode]             sandbox mode: read-only | workspace-write (default) | full-access | outer-full");
@@ -7691,7 +7715,9 @@ int main(int argc, char const *argv[])
                     if (toks.size() < 2)
                     {
                         cell::sys::println("current: {}", cfg.model_label());
-                        cell::sys::println("  model:  {}", cfg.current_model.empty() ? "(none - use /models to list, /model NAME to switch)" : cfg.current_model);
+                        cell::sys::println("  model:     {}", cfg.current_model.empty() ? "(none - use /models to list, /model NAME to switch)" : cfg.current_model);
+                        if (const cell::config::provider_entry *cur = cfg.current_provider_entry(); cur)
+                            cell::sys::println("  api_style: {}", cur->api_style);
                         continue;
                     }
                     const cell::config::provider_entry *p = cfg.current_provider_entry();
@@ -7700,11 +7726,46 @@ int main(int argc, char const *argv[])
                         cell::sys::error("no provider configured - add one with /provide add openai:URL");
                         continue;
                     }
-                    std::string m = toks[1];
+                    std::string m;
+                    std::string new_api_style;
+                    // extra key:value options after the model name: api_style:STYLE
+                    // switches the API wire style of the current provider on the fly
+                    for (size_t i = 2; i < toks.size(); i++)
+                    {
+                        if (toks[i].rfind("api_style:", 0) == 0)
+                            new_api_style = toks[i].size() > 10 ? toks[i].substr(10) : (i + 1 < toks.size() ? toks[++i] : "");
+                        else
+                            cell::sys::warn("ignoring /model option: {}", toks[i]);
+                    }
+                    bool style_changed = false;
+                    if (!new_api_style.empty())
+                    {
+                        std::string canonical = cell::config::provider_entry::parse_api_style(cell::text::trim(new_api_style));
+                        if (canonical.empty())
+                        {
+                            cell::sys::error("unknown api_style '{}' - usage: /model MODEL [api_style:openai-chat|openai-responses|anthropic]", new_api_style);
+                            continue;
+                        }
+                        if (canonical != p->api_style)
+                        {
+                            // mutate the current provider entry in place and persist
+                            cell::config::provider_entry *pe = cfg.current_provider_entry();
+                            if (pe)
+                            {
+                                std::string old_style = pe->api_style;
+                                pe->set_api_style(canonical);
+                                style_changed = true;
+                                log.info("model", std::format("api_style changed provider={} old={} new={}", pe->name, old_style, canonical));
+                            }
+                        }
+                    }
+                    m = toks[1];
                     cfg.current_model = m;
                     cell::config::save(cfg);
-                    log.info("model", std::format("switched provider={} model={}", p->name, m));
+                    log.info("model", std::format("switched provider={} model={} api_style={}", p->name, m, p->api_style));
                     cell::sys::println("switched to {}/{}", p->name, m);
+                    if (style_changed)
+                        cell::sys::println("  api_style: {}", p->api_style);
                     std::vector<std::string> models;
                     std::string ferr;
                     if (fetch_models(*p, models, ferr))
