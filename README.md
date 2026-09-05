@@ -12,6 +12,8 @@ search / execute inside a strict sandbox, and keep every credential in an encryp
 [![Single file](https://img.shields.io/badge/layout-single%20translation%20unit-orange)](cell.cpp)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+</div>
+
 ```bash
 shell> cell
 cell: cwd=path/to/ session=82db5d5997826cfd-1788623888 model=Z.AI:glm-5.3-flash sandbox=full-access
@@ -77,8 +79,6 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 
 > 
 ```
-
-</div>
 
 ---
 
