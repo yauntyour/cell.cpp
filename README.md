@@ -101,7 +101,7 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 ## Features
 
 | | Feature | Where it lives |
-|---|---|---|
+| --- | --- | --- |
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
 | 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `todo` | `cell::box`, `cell::tools` |
@@ -188,7 +188,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 ```
 
 | Option | Value | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`); for OpenAI-style providers with no explicit style, the API style defaults to `openai-chat`. Switching to a **different** provider clears `current_model` — the stored model name belonged to the previous provider — while re-selecting the already-active provider (including the empty `current_provider` case, which means "first provider is active") keeps it; an explicit `--model` on the same command line is applied afterwards. |
 | `--base` | URL | Sets `base` on the current provider. There is **no built-in default base** — an empty base means the provider is unusable until you set one. |
 | `--model` | string | Active model name, stored as-is (it need not appear in `/models`; a mismatch only warns). |
@@ -223,7 +223,7 @@ default instead of throwing.
 Input starting with `/` is split on whitespace and handled locally — it is never sent to the model.
 
 | Command | Description |
-|---|---|
+| --- | --- |
 | `/help` | Print the command list |
 | `/provides` | List configured providers (style, api_style, base, proxy, key state, model) |
 | `/provide NAME` | Select a provider (persisted immediately). Switching to a **different** provider resets the model to unset — the stored model belonged to the previous provider — so pick a new one with `/models` + `/model NAME`; re-selecting the active provider keeps its model. After a switch the REPL prints either the kept model or a "no model set" hint. |
@@ -317,7 +317,7 @@ Eight tools are registered, with schemas emitted for the active API style
 `{"type":"function","name":…,"parameters":…}` for the Responses API).
 
 | Tool | Policy | Arguments | Behaviour |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ls` | Allow | `path`, `page`, `page_size` (≤500) | One level, non-recursive; directories first, then case-insensitive name order; each entry is printed as `[dir ] NAME` or `[file] NAME  N bytes`, and the header reports `total`, the page window and the path |
 | `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; every returned line is prefixed with a right-aligned 6-column line number (`{:>6}: content`); records the returned line range for the read-before-edit rule |
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
@@ -376,7 +376,7 @@ Set with `/sandbox [mode]`, `--sandbox MODE` or the `sandbox_mode` config key. T
 refused by mode before any command runs:
 
 | Mode | Allowed tools | `exec` |
-|---|---|---|
+| --- | --- | --- |
 | `read-only` | `read`, `rg`, `find`, `ls` (and anything run read-only) | **blocked entirely** — refused before the confirmation prompt is ever shown |
 | `edit-only` | `read`/`rg`/`find`/`ls` **plus** `write`/`edit` | allowed, subject to gates 2–3 |
 | `full-access` (default) | all tools | allowed, subject to gates 2–3 |
@@ -512,7 +512,7 @@ never appears in the vault file — the self-test asserts this.
 ```
 
 | Field | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `api_style` (`openai-chat` \| `openai-responses` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
 | `current_provider` | first entry | Active provider when empty |
 | `current_model` | — | Active model name; cleared automatically whenever the active provider actually changes (see [`/provide`](#slash-commands)) |
@@ -584,6 +584,7 @@ cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResp
 cell::chat       session (per-cwd persistence) and history (in-memory session map)
 cell::skills     front-matter parser, recursive scanner, metadata prompt
 cell::stats      usage counters in .cell/usages.json
+cell::todos      session-persisted Todos (schema validation, ordering, rendering)
 ```
 
 ## The agent loop
@@ -609,7 +610,7 @@ once and retried immediately instead of burning a retry attempt (see
 
 ## Streaming UI and keyboard control
 
-- `> ` prompt, `reply> ` prefix for streamed answers; the reasoning stream is printed **dim**, the
+- `>` prompt, `reply>` prefix for streamed answers; the reasoning stream is printed **dim**, the
   answer **plain**, tool results and their echo **cyan**.
 - While waiting for the first token a `⏳ Ns` spinner is refreshed every 500 ms; afterwards a
   `~N tok` counter is refreshed on line boundaries.
@@ -629,7 +630,7 @@ is; `DEBUG` only with `--verbose`), so the terminal stays readable while the fil
 Writes are buffered in 16 KiB chunks and flushed immediately for `ERROR`.
 
 | Situation | Exit code |
-|---|---|
+| --- | --- |
 | Normal exit, or `--selftest` passed | `0` |
 | Unknown option / missing option value | `1` |
 | Non-interactive run with no provider configured | `1` |
@@ -688,8 +689,6 @@ intentionally simpler than it looks:
   five user/assistant text messages are printed again, excluding thinking and tool-call content.
   `--session` / the `session` field are still persisted for compatibility, but startup uses the
   active-session record instead.
-- The comment above `cwd_id()` says "sha3-256"; the implementation uses `crypto_hash_sha256`
-  (SHA-256, truncated to 16 hex characters).
 - `exec` is the only tool whose output is scanned for injection fingerprints; the other tools are
   considered sandboxed at call time and get a size cap only. The tool descriptions themselves can
   also drift from the implementation (e.g. `exec`'s denies-network claim, `read`'s numbered lines),
