@@ -817,6 +817,55 @@ namespace cell
             }
             return out;
         }
+
+        // return valid UTF-8 for JSON/API transport: valid sequences pass
+        // through unchanged, invalid bytes become U+FFFD, and when max_bytes is
+        // set the result is cut on a code-point boundary (never inside one).
+        static std::string utf8_safe(std::string_view s, size_t max_bytes = std::string_view::npos)
+        {
+            std::string out;
+            out.reserve(s.size() < max_bytes ? s.size() : max_bytes);
+            size_t i = 0;
+            while (i < s.size() && out.size() < max_bytes)
+            {
+                unsigned char c = (unsigned char)s[i];
+                size_t n = 0;
+                if (c < 0x80)
+                    n = 1;
+                else if (c >= 0xC2 && c <= 0xDF)
+                    n = 2;
+                else if (c >= 0xE0 && c <= 0xEF)
+                    n = 3;
+                else if (c >= 0xF0 && c <= 0xF4)
+                    n = 4;
+                bool valid = n != 0 && i + n <= s.size();
+                if (valid)
+                {
+                    if (n >= 2)
+                    {
+                        // reject overlong forms and UTF-16 surrogates
+                        unsigned char c1 = (unsigned char)s[i + 1];
+                        if ((c == 0xE0 && c1 < 0xA0) ||
+                            (c == 0xED && c1 > 0x9F) ||
+                            (c == 0xF0 && c1 < 0x90) ||
+                            (c == 0xF4 && c1 > 0x8F))
+                            valid = false;
+                    }
+                    for (size_t k = 1; valid && k < n; k++)
+                        if (((unsigned char)s[i + k] & 0xC0) != 0x80)
+                            valid = false;
+                }
+                size_t emit = valid ? n : 3; // invalid -> EF BF BD (U+FFFD)
+                if (out.size() + emit > max_bytes)
+                    break;
+                if (valid)
+                    out.append(s.substr(i, n));
+                else
+                    out += "\xEF\xBF\xBD";
+                i += valid ? n : 1;
+            }
+            return out;
+        }
     } // namespace text
     namespace box
     {
@@ -2967,6 +3016,7 @@ namespace cell
             red = 31,
             green = 32,
             yellow = 33,
+            magenta = 35,
             cyan = 36,
         };
 
@@ -6556,6 +6606,14 @@ static int run_selftest()
         expect(cs1 == "ared\nline2\n", "console_safe strips ANSI, keeps newlines");
         expect(cell::text::console_safe("\x1b]0;title\x07x") == "x", "console_safe strips OSC sequences");
         expect(cell::text::console_safe(std::string("a\x01") + "b") == "ab", "console_safe drops C0 controls");
+        std::string bad_utf8 = std::string("a\xE4\xB8\xAD\xE4\xB8."); // valid sequence, then split sequence
+        std::string fixed_utf8 = cell::text::utf8_safe(bad_utf8);
+        expect(cell::text::utf8_safe(bad_utf8) == std::string("a\xE4\xB8\xAD\xEF\xBF\xBD\xEF\xBF\xBD."),
+               "utf8_safe replaces invalid and split UTF-8 sequences");
+        expect(cell::text::utf8_safe(bad_utf8, 2) == "a", "utf8_safe truncates on a code-point boundary");
+        expect(cell::text::utf8_safe(bad_utf8, 4) == std::string("a\xE4\xB8\xAD"),
+               "utf8_safe keeps a complete sequence at the byte limit");
+        expect(fixed_utf8.find('\xE4') != std::string::npos, "utf8_safe preserves valid multi-byte UTF-8");
     }
 
     // sanitizer hardening: multi-line splits, word insertion, punctuation, homoglyphs, paraphrases
@@ -7607,11 +7665,6 @@ int main(int argc, char const *argv[])
         return client.chat(key, model, msgs, tools, reply, tc, usage, err);
     };
 
-    auto on_token = [](std::span<const char> data)
-    {
-        std::fwrite(data.data(), 1, data.size(), stdout);
-        std::fflush(stdout);
-    };
     auto trunc = [](const std::string &s, size_t n) -> std::string
     {
         return s.size() <= n ? s : s.substr(0, n) + "...";
@@ -8184,8 +8237,10 @@ int main(int argc, char const *argv[])
             if (it->is_string())
             {
                 std::string body = it->get<std::string>();
-                if (body.size() > 400)
-                    body = body.substr(0, 400) + "...";
+                bool truncated = body.size() > 400;
+                body = cell::text::utf8_safe(body, 400);
+                if (truncated)
+                    body += "...";
                 conv_text += std::format("{}: {}\n", role, body);
                 continue;
             }
@@ -8204,10 +8259,12 @@ int main(int argc, char const *argv[])
                 else if (bt == "text" && b.contains("text") && b["text"].is_string())
                     conv_body += b["text"].get_ref<const std::string &>();
                 else if (bt == "tool_use" || bt == "tool_result" || b.contains("text") || b.contains("input") || b.contains("content"))
-                    conv_body += b.dump() + "\n";
+                    conv_body += b.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
             }
-            if (conv_body.size() > 400)
-                conv_body = conv_body.substr(0, 400) + "...";
+            bool conv_truncated = conv_body.size() > 400;
+            conv_body = cell::text::utf8_safe(conv_body, 400);
+            if (conv_truncated)
+                conv_body += "...";
             conv_text += std::format("{}: {}\n", role, conv_body);
         }
     };
@@ -8215,7 +8272,8 @@ int main(int argc, char const *argv[])
     // run one summarization request via the compression model (or session model)
     // and return the summary text; empty on failure (caller falls back).
     auto summarize_part = [&](const std::string &instruction, const std::string &body,
-                              const std::string &label) -> std::string
+                              const std::string &label, const char *stream_header,
+                              cell::sys::color stream_color) -> std::string
     {
         const cell::config::provider_entry *p = nullptr;
         std::string model;
@@ -8247,15 +8305,30 @@ int main(int argc, char const *argv[])
         if (key.empty())
             return "";
         nlohmann::json prompt = nlohmann::json::array();
+        const std::string safe_body = cell::text::utf8_safe(body);
         prompt.push_back({{"role", "user"},
-                          {"content", std::format("{}\n\n{}", instruction, body)}});
+                          {"content", std::format("{}\n\n{}", instruction, safe_body)}});
         nlohmann::json reply, tc, usage;
         std::string err;
         log.info("ctx", std::format("summarizing {} via={}:{} chars={} tools=off", label, p->name, model, body.size()));
-        cell::sys::print("summary> ");
+        cell::sys::pprintln(stream_color, "\n{}", stream_header);
+        cell::sys::print("> ");
         auto t0 = cell::sys::detail::clock::now();
         total_llm_requests++;
-        if (!do_chat(*p, key, model, prompt, true, on_token, nullptr, reply, tc, usage, err, false, 0))
+        cell::net::StreamCallback stream_cb = [stream_color](std::span<const char> data)
+        {
+            if (cell::sys::detail::color_enabled)
+            {
+                std::string out = std::format("\x1b[{}m", (int)stream_color);
+                out.append(data.data(), data.size());
+                out += "\x1b[0m";
+                std::fwrite(out.data(), 1, out.size(), stdout);
+            }
+            else
+                std::fwrite(data.data(), 1, data.size(), stdout);
+            std::fflush(stdout);
+        };
+        if (!do_chat(*p, key, model, prompt, true, std::move(stream_cb), nullptr, reply, tc, usage, err, false, 0))
         {
             cell::sys::println();
             log.warn("ctx", std::format("summarization_failed part={} err={}", label, err.empty() ? "n/a" : err));
@@ -8268,7 +8341,7 @@ int main(int argc, char const *argv[])
             return "";
         // prompt-injection defence: re-sanitize the summary so a re-stated
         // malicious instruction cannot survive into the new system message
-        summary = cell::box::sanitize_output(summary);
+        summary = cell::text::utf8_safe(cell::box::sanitize_output(summary));
         log.info("ctx", std::format("summary {} chars={} time={:.2f}s tok_in={} tok_out={}",
                                     label, summary.size(), sec,
                                     usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
@@ -8305,7 +8378,7 @@ int main(int argc, char const *argv[])
         std::string conv_summary = "(llm summarization unavailable; messages truncated)";
         if (std::string r = summarize_part(
                 "Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.",
-                conv_text, "conversation");
+                conv_text, "conversation", "Context Summary", cell::sys::color::cyan);
             !r.empty())
             conv_summary = std::move(r);
         std::string think_summary;
@@ -8314,7 +8387,7 @@ int main(int argc, char const *argv[])
             think_summary = "(agent reasoning summary unavailable)";
             if (std::string r = summarize_part(
                     "Summarize the agent's reasoning based on the preceding conversation. Focus on the key insights, decisions, and conclusions reached. Output only the summary.",
-                    think_text, "reasoning");
+                    think_text, "reasoning", "Thinking Summary", cell::sys::color::magenta);
                 !r.empty())
                 think_summary = std::move(r);
         }
