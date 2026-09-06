@@ -4,9 +4,7 @@
 
 **A single-file AI coding agent in modern C++26**
 
-One translation unit, one executable: talk to OpenAI- / Anthropic-compatible endpoints (OpenAI
-Chat Completions, OpenAI Responses, and Anthropic messages), let the model read / write / edit /
-search / execute inside a strict sandbox, and keep every credential in an encrypted on-disk vault.
+A lightweight AI coding agent written in modern C++26. Connect to OpenAI or Anthropic, chat with your codebase, and let the LLM read, write, edit, and execute — all sandboxed.
 
 [![C++26](https://img.shields.io/badge/C%2B%2B-26-blue?logo=cplusplus)](https://isocpp.org/)
 [![Single file](https://img.shields.io/badge/layout-single%20translation%20unit-orange)](cell.cpp)
