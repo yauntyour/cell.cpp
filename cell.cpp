@@ -3545,14 +3545,7 @@ namespace cell
             bool compact_auto = true;                 // auto-compress after long agent runs (default on)
             std::string compact_provider;             // compression provider name (empty => session provider)
             std::string compact_model;                // compression model name (empty => session model)
-            std::string system_prompt =
-                "You are a helpful assistant. \n"
-#if _WIN32
-                "Operating system environment: Win32 or likely.\n"
-#else
-                "Operating system environment: Unix or likely.\n"
-#endif
-                ;
+            std::string system_prompt = "You are a helpful assistant.";
             std::string session_id;
             size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
             size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
@@ -6083,8 +6076,7 @@ namespace todos
                       bool b_num = b.starts_with("todo-") && num(b, 5, bn);
                       if (a_num && b_num && an != bn)
                           return an < bn;
-                      return a < b;
-                  });
+                      return a < b; });
         return n <= keys.size() ? keys[n - 1] : "";
     }
 
@@ -7062,12 +7054,10 @@ static int run_selftest()
             {{"role", "system"}, {"content", "do not preview"}},
             {{"role", "user"}, {"content", "visible user"}},
             {{"role", "assistant"}, {"reasoning_content", "hidden"}, {"content", "visible assistant"}},
-            {{"role", "assistant"}, {"content", nullptr},
-             {"tool_calls", nlohmann::json::array({{{"id", "call"}, {"type", "function"}, {"function", {{"name", "noop"}, {"arguments", "{}"}}}}})}},
+            {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", nlohmann::json::array({{{"id", "call"}, {"type", "function"}, {"function", {{"name", "noop"}, {"arguments", "{}"}}}}})}},
             {{"role", "tool"}, {"content", "hidden tool"}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"content", "hidden result"}}})}},
-            {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "hidden"}},
-                                                                        {{"type", "text"}, {"text", "visible block"}}})}},
+            {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "hidden"}}, {{"type", "text"}, {"text", "visible block"}}})}},
         });
         expect(cell::chat::message_display_text(preview[0]).empty(), "session preview omits system messages");
         expect(cell::chat::message_display_text(preview[1]) == "visible user", "session preview keeps user text");
@@ -8053,7 +8043,7 @@ int main(int argc, char const *argv[])
             if (!p.key_id.empty())
                 cell::sys::println("       key:   stored");
             if (cur)
-            cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
+                cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
     };
 
