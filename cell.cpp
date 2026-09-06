@@ -937,12 +937,14 @@ namespace cell
             case SandboxMode::ReadOnly:
                 // Only read-only tools allowed
                 return tool_name == "read" || tool_name == "rg" ||
-                       tool_name == "find" || tool_name == "ls";
+                       tool_name == "find" || tool_name == "ls" ||
+                       tool_name == "todo";
             case SandboxMode::EditOnly:
                 // Read-only tools plus write and edit allowed
                 return tool_name == "read" || tool_name == "rg" ||
                        tool_name == "find" || tool_name == "ls" ||
-                       tool_name == "write" || tool_name == "edit";
+                       tool_name == "write" || tool_name == "edit" ||
+                       tool_name == "todo";
             case SandboxMode::FullAccess:
                 // All tools allowed
                 return true;
@@ -5319,6 +5321,7 @@ namespace cell
             std::string session_id;
             std::string cwd;                                   // working directory this session belongs to
             nlohmann::json messages = nlohmann::json::array(); // [{"role":"user","content":"hi"},...]
+            nlohmann::json todos = nlohmann::json::object();   // {"todo-id":{"todo-0":{"What":"...","done":false}}}
             std::filesystem::path file;
             bool loaded = false;
 
@@ -5375,10 +5378,12 @@ namespace cell
                         cell::sys::logger::instance().info("sess", std::format("loaded id={} msgs={}", session_id, messages.size()));
                     }
                     cwd = j.value("cwd", cwd);
+                    todos = j.contains("todos") && j["todos"].is_object() ? j["todos"] : nlohmann::json::object();
                 }
                 catch (const std::exception &)
                 {
                     messages = nlohmann::json::array();
+                    todos = nlohmann::json::object();
                     cell::sys::logger::instance().warn("sess", std::format("corrupt id={} action=start_empty", session_id));
                 }
             }
@@ -5388,6 +5393,7 @@ namespace cell
                 j["id"] = session_id;
                 j["cwd"] = cwd;
                 j["messages"] = messages;
+                j["todos"] = todos;
                 // serialize on this thread, hand the bytes to the background writer;
                 // call async_io::flush() before reading session files back
                 async_io::submit(file, j.dump(2));
@@ -5397,6 +5403,7 @@ namespace cell
             const std::string &cwd_path() const { return cwd; }
             const std::filesystem::path &path() const { return file; }
             nlohmann::json &msg() { return messages; }
+            nlohmann::json &todos_state() { return todos; }
             void append(const std::string &role, const nlohmann::json &content)
             {
                 messages.push_back({{"role", role}, {"content", content}});
@@ -5863,11 +5870,199 @@ static void print_help()
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
+    cell::sys::println("  /todo                       show current Todos");
+    cell::sys::println("  /todo update todo-id:N TEXT change todo-N text");
+    cell::sys::println("  /todo rm todo-id:N          remove todo-N");
+    cell::sys::println("  /todo add todo-id:N TEXT    add a todo after todo-N");
+    cell::sys::println("  /todo sub todo-id:N TEXT    make todo-N parallel and add a sub-todo");
+    cell::sys::println("  /todo clear                 clear the current Todos");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
     cell::sys::println("  /exit | /quit               exit");
 }
+
+namespace todos
+{
+    static cell::chat::session *active_session = nullptr;
+    static nlohmann::json *active_todos()
+    {
+        if (active_session)
+            return &active_session->todos_state();
+        static nlohmann::json empty = nlohmann::json::object();
+        return &empty;
+    }
+
+    // A list is an object keyed by todo-N. A value is either a leaf
+    // {"What":"...","done":bool} or an array of parallel sub-todos.
+    static bool valid_id(const std::string &id)
+    {
+        return !id.empty() && id.size() <= 128 &&
+               std::all_of(id.begin(), id.end(), [](unsigned char c)
+                           { return std::isalnum(c) || c == '-' || c == '_'; });
+    }
+
+    static bool leaf(const nlohmann::json &v)
+    {
+        return v.is_object() && v.contains("What") && v["What"].is_string() &&
+               v.contains("done") && v["done"].is_boolean();
+    }
+
+    static bool valid_list(const nlohmann::json &list)
+    {
+        if (!list.is_object())
+            return false;
+        for (auto it = list.begin(); it != list.end(); ++it)
+        {
+            if (!valid_id(it.key()))
+                return false;
+            if (leaf(it.value()))
+                continue;
+            if (!it.value().is_array())
+                return false;
+            for (const auto &sub : it.value())
+                if (!leaf(sub))
+                    return false;
+        }
+        return true;
+    }
+
+    static nlohmann::json make_leaf(const std::string &what, bool done = false)
+    {
+        return {{"What", what}, {"done", done}};
+    }
+
+    static std::string next_key(const nlohmann::json &container, const std::string &prefix)
+    {
+        size_t max_n = 0;
+        if (container.is_object())
+        {
+            for (auto it = container.begin(); it != container.end(); ++it)
+            {
+                if (it.key().starts_with(prefix))
+                {
+                    try
+                    {
+                        max_n = std::max(max_n, (size_t)std::stoull(it.key().substr(prefix.size())));
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+            }
+        }
+        return prefix + std::to_string(max_n + 1);
+    }
+
+    static nlohmann::json normalize(const nlohmann::json &list)
+    {
+        if (!list.is_object())
+            return nlohmann::json::object();
+        nlohmann::json out = nlohmann::json::object();
+        for (auto it = list.begin(); it != list.end(); ++it)
+        {
+            if (leaf(it.value()))
+            {
+                out[it.key()] = {{"What", it.value()["What"].get<std::string>()},
+                                 {"done", it.value()["done"].get<bool>()}};
+            }
+            else if (it.value().is_array())
+            {
+                nlohmann::json subs = nlohmann::json::array();
+                for (const auto &sub : it.value())
+                    if (leaf(sub))
+                        subs.push_back({{"id", sub.value("id", next_key(subs, "sub-"))},
+                                        {"What", sub["What"].get<std::string>()},
+                                        {"done", sub["done"].get<bool>()}});
+                if (!subs.empty())
+                    out[it.key()] = subs;
+            }
+        }
+        return out;
+    }
+
+    static nlohmann::json *find_leaf(nlohmann::json &list, const std::string &todo_key,
+                                     const std::string &sub_key = "")
+    {
+        if (!list.is_object())
+            return nullptr;
+        auto it = list.find(todo_key);
+        if (it == list.end())
+            return nullptr;
+        if (sub_key.empty())
+            return leaf(*it) ? &*it : nullptr;
+        if (!it->is_array())
+            return nullptr;
+        for (auto &sub : *it)
+            if (sub.is_object() && sub.value("id", "") == sub_key)
+                return &sub;
+        return nullptr;
+    }
+
+    static std::string key_at(const nlohmann::json &list, size_t n)
+    {
+        if (!list.is_object() || n == 0)
+            return "";
+        std::vector<std::string> keys;
+        for (auto it = list.begin(); it != list.end(); ++it)
+            keys.push_back(it.key());
+        std::sort(keys.begin(), keys.end(), [](const std::string &a, const std::string &b)
+                  {
+                      auto num = [](const std::string &s, size_t pos, size_t &v)
+                      {
+                          size_t p = pos;
+                          while (p < s.size() && std::isdigit((unsigned char)s[p])) ++p;
+                          if (p == pos)
+                              return false;
+                          v = (size_t)std::stoull(s.substr(pos, p - pos));
+                          return true;
+                      };
+                      size_t an = 0, bn = 0;
+                      bool a_num = a.starts_with("todo-") && num(a, 5, an);
+                      bool b_num = b.starts_with("todo-") && num(b, 5, bn);
+                      if (a_num && b_num && an != bn)
+                          return an < bn;
+                      return a < b;
+                  });
+        return n <= keys.size() ? keys[n - 1] : "";
+    }
+
+    static void render(const nlohmann::json &todos, std::string &out)
+    {
+        if (todos.empty())
+        {
+            out = "(no Todos)";
+            return;
+        }
+        out.clear();
+        for (auto it = todos.begin(); it != todos.end(); ++it)
+        {
+            if (leaf(it.value()))
+            {
+                out += std::format("[{}] {}: {}\n", it.value()["done"].get<bool>() ? "x" : " ",
+                                   it.key(), it.value()["What"].get<std::string>());
+            }
+            else if (it.value().is_array())
+            {
+                out += std::format("[ ] {}: parallel group\n", it.key());
+                for (const auto &sub : it.value())
+                    out += std::format("  [{}] {}: {}\n", sub["done"].get<bool>() ? "x" : " ",
+                                       sub["id"].get<std::string>(), sub["What"].get<std::string>());
+            }
+        }
+        while (!out.empty() && out.back() == '\n')
+            out.pop_back();
+    }
+
+    static std::string merge_report(const std::string &todo_id,
+                                    const std::vector<std::pair<std::string, std::string>> &summaries)
+    {
+        std::string report = std::format("# Parallel {} Summary\n", todo_id);
+        for (const auto &[id, summary] : summaries)
+            report += std::format("## {}\n{}\n", id, summary);
+        return report;
+    }
+} // namespace todos
 
 // parse tool arguments as JSON without throwing; false on any invalid input
 static bool json_args(const std::string &in, nlohmann::json &j)
@@ -6038,6 +6233,186 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    j.value("name", ""),
                                    dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
                                    std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
+        });
+    add("todo", "Create, inspect, edit, and run the session Todos. Actions: get, clear, create (id,todos), set (todos), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), sub (list_id, todo_id, what), run_parallel (list_id, todo_id).",
+        {{"action", str_prop("get | clear | create | set | update | add | rm | sub | run_parallel")},
+         {"id", str_prop("new Todos list id for create (todo-id)")},
+         {"todos", {{"type", "object"}, {"description", "Todos list for create/set"}}},
+         {"list_id", str_prop("existing Todos list id, e.g. my-list")},
+         {"todo_id", str_prop("existing item id, e.g. todo-0 or the numeric display position N")},
+         {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")},
+         {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")},
+         {"what", str_prop("new or updated todo text")},
+         {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}},
+        {"action"}, Policy::Allow,
+        [](const nlohmann::json &j, std::string &out)
+        {
+            const std::string action = j.value("action", "");
+            auto get_list = [&](const std::string &id) -> nlohmann::json *
+            {
+                if (!todos::valid_id(id))
+                    return nullptr;
+                auto it = todos::active_todos()->find(id);
+                return it == todos::active_todos()->end() ? nullptr : &*it;
+            };
+            if (action == "get" || action.empty())
+            {
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            if (action == "clear")
+            {
+                *todos::active_todos() = nlohmann::json::object();
+                out = "Todos cleared";
+                return true;
+            }
+            if (action == "create" || action == "set")
+            {
+                if (!j.contains("todos") || !j["todos"].is_object())
+                {
+                    out = "[todo] todos must be an object";
+                    return false;
+                }
+                if (action == "create")
+                {
+                    const std::string id = j.value("id", "");
+                    if (!todos::valid_id(id))
+                    {
+                        out = "[todo] create requires a valid id";
+                        return false;
+                    }
+                    (*todos::active_todos())[id] = todos::normalize(j["todos"]);
+                }
+                else
+                    *todos::active_todos() = todos::normalize(j["todos"]);
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            const std::string list_id = j.value("list_id", j.value("id", ""));
+            nlohmann::json *list = get_list(list_id);
+            if (!list)
+            {
+                out = std::format("[todo] unknown list: {}", list_id);
+                return false;
+            }
+            auto resolve_todo = [&](const std::string &raw) -> std::string
+            {
+                if (list->contains(raw))
+                    return raw;
+                size_t n = 0;
+                try
+                {
+                    n = (size_t)std::stoull(raw);
+                }
+                catch (const std::exception &)
+                {
+                }
+                return n ? todos::key_at(*list, n) : "";
+            };
+            if (action == "update")
+            {
+                std::string todo_id = resolve_todo(j.value("todo_id", ""));
+                const std::string sub_id = j.value("sub_id", "");
+                nlohmann::json *item = todos::find_leaf(*list, todo_id, sub_id);
+                if (!item)
+                {
+                    out = std::format("[todo] unknown todo: {}{}", todo_id, sub_id.empty() ? "" : ":" + sub_id);
+                    return false;
+                }
+                if (j.contains("what") && j["what"].is_string())
+                    (*item)["What"] = j["what"].get<std::string>();
+                if (j.contains("done") && j["done"].is_boolean())
+                    (*item)["done"] = j["done"].get<bool>();
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            if (action == "add")
+            {
+                if (!j.contains("what") || !j["what"].is_string())
+                {
+                    out = "[todo] add requires what";
+                    return false;
+                }
+                nlohmann::json new_list = nlohmann::json::object();
+                std::string after_key = resolve_todo(j.value("after_id", ""));
+                bool inserted = false;
+                for (auto it = list->begin(); it != list->end(); ++it)
+                {
+                    new_list[it.key()] = *it;
+                    if (it.key() == after_key)
+                    {
+                        new_list[todos::next_key(*list, "todo-")] = todos::make_leaf(j["what"].get<std::string>());
+                        inserted = true;
+                    }
+                }
+                if (!inserted)
+                    new_list[todos::next_key(*list, "todo-")] = todos::make_leaf(j["what"].get<std::string>());
+                *list = std::move(new_list);
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            if (action == "rm")
+            {
+                std::string todo_id = resolve_todo(j.value("todo_id", ""));
+                if (!list->erase(todo_id))
+                {
+                    out = std::format("[todo] unknown todo: {}", todo_id);
+                    return false;
+                }
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            if (action == "sub")
+            {
+                if (!j.contains("what") || !j["what"].is_string())
+                {
+                    out = "[todo] sub requires what";
+                    return false;
+                }
+                std::string todo_id = resolve_todo(j.value("todo_id", ""));
+                auto it = list->find(todo_id);
+                if (it == list->end())
+                {
+                    out = std::format("[todo] unknown todo: {}", todo_id);
+                    return false;
+                }
+                if (todos::leaf(it.value()))
+                {
+                    std::string parent_what = it.value()["What"].get<std::string>();
+                    nlohmann::json group = nlohmann::json::array({
+                        {{"id", "sub-0"}, {"What", parent_what}, {"done", it.value()["done"].get<bool>()}},
+                    });
+                    group.push_back({{"id", "sub-1"}, {"What", j["what"].get<std::string>()}, {"done", false}});
+                    it.value() = std::move(group);
+                }
+                else if (it.value().is_array())
+                {
+                    it.value().push_back({{"id", todos::next_key(it.value(), "sub-")},
+                                          {"What", j["what"].get<std::string>()},
+                                          {"done", false}});
+                }
+                else
+                {
+                    out = "[todo] invalid todo item";
+                    return false;
+                }
+                todos::render(*todos::active_todos(), out);
+                return true;
+            }
+            if (action == "run_parallel")
+            {
+                std::string todo_id = resolve_todo(j.value("todo_id", ""));
+                auto it = list->find(todo_id);
+                if (it == list->end() || !it->is_array() || it->empty())
+                {
+                    out = std::format("[todo] no parallel sub-todos in {}", todo_id);
+                    return false;
+                }
+                out = std::format("run_parallel:{}:{}:{}", list_id, todo_id, it->size());
+                return true;
+            }
+            out = std::format("[todo] unknown action: {}", action);
+            return false;
         });
     return {list, defs};
 }
@@ -6366,11 +6741,11 @@ static int run_selftest()
     {
         // tool registry: exactly the 6 redesigned tools with correct policies
         auto [tool_list, tool_defs] = build_tools(false);
-        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "find"};
-        bool all_present = tool_list.size() == 7 && tool_defs.size() == 7;
+        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "find", "todo"};
+        bool all_present = tool_list.size() == 8 && tool_defs.size() == 8;
         for (auto n : expected)
             all_present = all_present && tool_list.find(n) != tool_list.end();
-        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find");
+        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find/todo");
         expect(tool_list["read"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["rg"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["find"]->policy() == cell::tools::Policy::Allow &&
@@ -6384,6 +6759,26 @@ static int run_selftest()
             expect(d.contains("name") ? d.contains("description")
                                       : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
                    "tool schema carries name+description");
+    }
+
+    {
+        // Todos helpers: schema, stable ordering, branch sub-todos and report merge
+        nlohmann::json list = nlohmann::json::object();
+        list["todo-0"] = {{"What", "first"}, {"done", true}};
+        list["todo-10"] = {{"What", "eleventh"}, {"done", false}};
+        list["todo-2"] = nlohmann::json::array({
+            {{"id", "sub-0"}, {"What", "a"}, {"done", false}},
+            {{"id", "sub-1"}, {"What", "b"}, {"done", true}},
+        });
+        expect(todos::valid_list(list), "valid todo list accepted");
+        expect(todos::key_at(list, 2) == "todo-2", "todo ordering is numeric");
+        expect(todos::key_at(list, 3) == "todo-10", "todo ordering handles multi-digit keys");
+        nlohmann::json normalized = todos::normalize(list);
+        expect(normalized.contains("todo-0") && normalized["todo-0"]["done"].get<bool>(), "todo normalize keeps leaves");
+        expect(normalized["todo-2"].is_array() && normalized["todo-2"][1]["id"] == "sub-1", "todo normalize keeps sub-todos");
+        expect(todos::find_leaf(list, "todo-2", "sub-0") != nullptr, "todo finds sub-todo by id");
+        std::string report = todos::merge_report("todo-2", {{"sub-0", "A"}, {"sub-1", "B"}});
+        expect(report == "# Parallel todo-2 Summary\n## sub-0\nA\n## sub-1\nB\n", "todo report merge is deterministic");
     }
 
     {
@@ -7079,15 +7474,6 @@ int main(int argc, char const *argv[])
         }
     }
 
-    // tool definitions for all API styles
-    auto tools_o = build_tools(false);
-    auto tools_a = build_tools(true);
-    auto tools_r = build_tools(false, true); // Responses API format
-    auto &tool_list = tools_o.first;
-    const nlohmann::json &tool_defs_openai = tools_o.second;
-    const nlohmann::json &tool_defs_anthropic = tools_a.second;
-    const nlohmann::json &tool_defs_responses = tools_r.second;
-
     // per-(provider, base) client cache
     struct client_cache
     {
@@ -7149,6 +7535,30 @@ int main(int argc, char const *argv[])
         return vault.get("api_key");
     };
 
+    // tool definitions for all API styles
+    auto tools_o = build_tools(false);
+    auto tools_a = build_tools(true);
+    auto tools_r = build_tools(false, true); // Responses API format
+    auto &tool_list = tools_o.first;
+    const nlohmann::json &tool_defs_openai = tools_o.second;
+    const nlohmann::json &tool_defs_anthropic = tools_a.second;
+    const nlohmann::json &tool_defs_responses = tools_r.second;
+    auto tool_defs_openai_no_todo = tools_o.second;
+    auto tool_defs_anthropic_no_todo = tools_a.second;
+    auto tool_defs_responses_no_todo = tools_r.second;
+    for (auto *defs : {&tool_defs_openai_no_todo, &tool_defs_anthropic_no_todo, &tool_defs_responses_no_todo})
+        for (size_t i = 0; i < defs->size();)
+        {
+            auto &d = (*defs)[i];
+            const std::string name = d.contains("function") ? d["function"].value("name", "")
+                                                            : d.value("name", "");
+            if (name == "todo")
+                defs->erase(i);
+            else
+                ++i;
+        }
+    const bool tools_were_enabled = cfg.tools;
+
     // unified request dispatch: picks the right client + tool schema for any provider entry
     auto do_chat = [&](const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
                        const std::string &model, const nlohmann::json &msgs, bool stream,
@@ -7158,9 +7568,10 @@ int main(int argc, char const *argv[])
                        cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
         nlohmann::json no_tools = nlohmann::json::array();
+        bool with_todo = !tools_were_enabled || with_tools;
         if (p.api_style == "anthropic")
         {
-            const nlohmann::json &tools = with_tools ? tool_defs_anthropic : no_tools;
+            const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_anthropic : tool_defs_anthropic_no_todo) : no_tools;
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
@@ -7169,7 +7580,7 @@ int main(int argc, char const *argv[])
         }
         if (p.api_style == "openai-responses")
         {
-            const nlohmann::json &tools = with_tools ? tool_defs_responses : no_tools;
+            const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_responses : tool_defs_responses_no_todo) : no_tools;
             auto &client = cache.r(p.base);
             client.set_proxy(p.proxy);
             if (stream)
@@ -7177,7 +7588,7 @@ int main(int argc, char const *argv[])
             return client.chat(key, model, msgs, tools, reply, tc, usage, err);
         }
         // default: openai-chat (Chat Completions)
-        const nlohmann::json &tools = with_tools ? tool_defs_openai : no_tools;
+        const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_openai : tool_defs_openai_no_todo) : no_tools;
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
@@ -7399,6 +7810,19 @@ int main(int argc, char const *argv[])
     if (!boot_session_id.empty())
         h.use(boot_session_id);
     cell::chat::session *s = &h.now();
+    todos::active_session = s;
+    auto get_todo_list = [&](const std::string &id) -> nlohmann::json *
+    {
+        if (!todos::valid_id(id))
+            return nullptr;
+        auto it = s->todos_state().find(id);
+        return it == s->todos_state().end() ? nullptr : &it.value();
+    };
+    auto set_todo_session = [&](cell::chat::session *next)
+    {
+        s = next;
+        todos::active_session = s;
+    };
     // a resumed session may belong to another cwd: follow it so tools operate there
     if (const std::string &sc = s->cwd_path(); !sc.empty() && !cell::same_path(sc, cell::workdir().string()))
     {
@@ -7565,8 +7989,137 @@ int main(int argc, char const *argv[])
             if (!p.key_id.empty())
                 cell::sys::println("       key:   stored");
             if (cur)
-                cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
+            cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
+    };
+
+    // execute a single parallel sub-todo in an isolated message branch. The
+    // branch starts from the injected system context only, so main-session tool
+    // results and later report messages cannot leak into sibling branches.
+    auto run_todo_parallel_branches = [&](const std::string &list_id, const std::string &todo_key,
+                                          std::vector<std::pair<std::string, std::string>> &summaries) -> bool
+    {
+        summaries.clear();
+        auto *root_list = get_todo_list(list_id);
+        if (!root_list)
+            return false;
+        auto root_it = root_list->find(todo_key);
+        if (root_it == root_list->end() || !root_it->is_array() || root_it->empty())
+            return false;
+        nlohmann::json subtasks = root_it.value();
+        const cell::config::provider_entry *p = cfg.current_provider_entry();
+        if (!p || cfg.current_model.empty())
+            return false;
+        cell::encrypt::secure_string key = resolve_key(*p);
+        if (key.empty())
+            return false;
+
+        nlohmann::json branch_system = nlohmann::json::array();
+        for (const auto &m : s->msg())
+        {
+            if (m.value("role", "") != "system")
+                break;
+            branch_system.push_back(m);
+        }
+        std::string todo_snapshot;
+        todos::render(*root_list, todo_snapshot);
+
+        for (const auto &sub : subtasks)
+        {
+            if (!sub.is_object())
+                continue;
+            std::string sub_id = sub.value("id", "");
+            std::string sub_what = sub.value("What", "");
+            std::string prompt = std::format(
+                "Execute the parallel sub-todo {} from the current Todos list.\n"
+                "Parent todo: {}\n"
+                "Sub-todo: {}\n"
+                "Current Todos:\n{}\n\n"
+                "Complete only this sub-todo. When finished, return a concise summary of the result.",
+                sub_id, todo_key, sub_what, todo_snapshot);
+            nlohmann::json msgs = branch_system;
+            msgs.push_back({{"role", "user"}, {"content", prompt}});
+            std::string summary;
+            bool success = true;
+            const size_t branch_round_limit = 16;
+            for (size_t round = 0; round < branch_round_limit; ++round)
+            {
+                nlohmann::json reply, tool_calls, usage;
+                std::string err;
+                ++total_llm_requests;
+                if (!do_chat(*p, key, cfg.current_model, msgs, false, nullptr, nullptr,
+                             reply, tool_calls, usage, err, cfg.tools, cfg.think_level))
+                {
+                    summary = std::format("[branch failed] {}", err.empty() ? "request failed" : err);
+                    success = false;
+                    break;
+                }
+                msgs.push_back(reply);
+                if (tool_calls.empty())
+                {
+                    summary = reply_text(reply);
+                    if (summary.empty())
+                        summary = "[empty summary]";
+                    break;
+                }
+                for (const auto &tc : tool_calls)
+                {
+                    std::string name = tc["function"].value("name", "");
+                    std::string args = tc["function"].value("arguments", "");
+                    std::string output;
+                    auto it = tool_list.find(name);
+                    bool tool_ok = it != tool_list.end() && it->second->execute(args, output);
+                    if (!output.empty())
+                        (void)tool_ok;
+                    else if (tool_ok)
+                        output = "(ok)";
+                    else
+                        output = "[tool failed]";
+                    std::string body = name == "exec" ? cell::box::sanitize_output(output, 1024 * 1024 * 512)
+                                                      : cell::box::truncate_output(output, 1024 * 1024 * 512);
+                    std::string marker;
+                    try
+                    {
+                        auto ja = nlohmann::json::parse(args, nullptr, false);
+                        if (ja.is_object())
+                        {
+                            for (const char *k : {"path", "dirpath", "cmd", "pattern"})
+                                if (ja.contains(k) && ja[k].is_string())
+                                {
+                                    marker = ja[k].get<std::string>();
+                                    if (marker.size() > 160)
+                                        marker = marker.substr(0, 157) + "...";
+                                    break;
+                                }
+                        }
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                    std::string wrapped = cell::box::wrap_tool_output(name, marker, body);
+                    if (p->api_style != "anthropic")
+                        msgs.push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
+                    else
+                        msgs.push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
+                }
+                if (round + 1 == branch_round_limit)
+                {
+                    summary = reply_text(reply);
+                    if (summary.empty())
+                        summary = "[branch stopped: round limit]";
+                    success = false;
+                }
+            }
+            if (success)
+            {
+                nlohmann::json *list_now = get_todo_list(list_id);
+                nlohmann::json *item = list_now ? todos::find_leaf(*list_now, todo_key, sub_id) : nullptr;
+                if (item)
+                    (*item)["done"] = true;
+            }
+            summaries.emplace_back(sub_id, cell::box::sanitize_output(summary));
+        }
+        return !summaries.empty();
     };
 
     // context compaction: keep the first system prompt message, aggregate every other message
@@ -7736,7 +8289,7 @@ int main(int argc, char const *argv[])
                     s->unload();
                     cell::async_io::flush(); // the old session must survive a crash
                     h.forget_current();
-                    s = &h.now();
+                    set_todo_session(&h.now());
                     ensure_prompt(s);
                     log.info("sess", std::format("new id={} previous={} kept=true", s->id(), old_id));
                     cell::sys::println("new session: {} cwd={}", s->id(), cell::workdir().string());
@@ -7776,6 +8329,162 @@ int main(int argc, char const *argv[])
                     log.info("ins", std::format("interject chars={}", ins_text.size()));
                     // message already added, skip the normal user message addition
                     goto llm_start;
+                }
+                if (cmd == "/todo")
+                {
+                    auto todo_rest = [&](size_t begin)
+                    {
+                        std::string text;
+                        for (size_t i = begin; i < toks.size(); i++)
+                        {
+                            if (i > begin)
+                                text += ' ';
+                            text += toks[i];
+                        }
+                        return text;
+                    };
+                    auto parse_target = [&](const std::string &raw, std::string &list_id, std::string &todo_key,
+                                            std::string &sub_id) -> nlohmann::json *
+                    {
+                        const size_t sep = raw.find(':');
+                        list_id = sep == std::string::npos ? raw : raw.substr(0, sep);
+                        std::string item = sep == std::string::npos ? "" : raw.substr(sep + 1);
+                        sub_id.clear();
+                        if (!todos::valid_id(list_id))
+                            return nullptr;
+                        auto lit = s->todos_state().find(list_id);
+                        if (lit == s->todos_state().end())
+                            return nullptr;
+                        const size_t sub_sep = item.rfind(':');
+                        if (sub_sep != std::string::npos)
+                        {
+                            sub_id = item.substr(sub_sep + 1);
+                            item = item.substr(0, sub_sep);
+                        }
+                        if (lit->contains(item))
+                            todo_key = item;
+                        else
+                        {
+                            size_t n = 0;
+                            try
+                            {
+                                n = (size_t)std::stoull(item);
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            todo_key = todos::key_at(lit.value(), n);
+                        }
+                        return todo_key.empty() ? nullptr : &lit.value();
+                    };
+                    if (toks.size() >= 2 && toks[1] == "clear")
+                    {
+                        s->todos_state() = nlohmann::json::object();
+                        log.info("todo", "cleared");
+                        cell::sys::println("Todos cleared");
+                        continue;
+                    }
+                    if (toks.size() >= 4 && toks[1] == "update")
+                    {
+                        std::string list_id, todo_key, sub_id;
+                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
+                        if (!list)
+                        {
+                            cell::sys::error("unknown todo target: {}", toks[2]);
+                            continue;
+                        }
+                        nlohmann::json *item = todos::find_leaf(*list, todo_key, sub_id);
+                        if (!item)
+                        {
+                            cell::sys::error("todo target is not a single todo: {}", toks[2]);
+                            continue;
+                        }
+                        (*item)["What"] = todo_rest(3);
+                        log.info("todo", std::format("updated list={} todo={} sub={}", list_id, todo_key, sub_id));
+                        cell::sys::println("updated {}", toks[2]);
+                        continue;
+                    }
+                    if (toks.size() >= 4 && toks[1] == "add")
+                    {
+                        std::string list_id, todo_key, sub_id;
+                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
+                        if (!list)
+                        {
+                            cell::sys::error("unknown todo target: {}", toks[2]);
+                            continue;
+                        }
+                        nlohmann::json old = *list;
+                        nlohmann::json new_list = nlohmann::json::object();
+                        bool inserted = false;
+                        for (auto it = old.begin(); it != old.end(); ++it)
+                        {
+                            new_list[it.key()] = it.value();
+                            if (it.key() == todo_key)
+                            {
+                                new_list[todos::next_key(old, "todo-")] = todos::make_leaf(todo_rest(3));
+                                inserted = true;
+                            }
+                        }
+                        if (!inserted)
+                            new_list[todos::next_key(old, "todo-")] = todos::make_leaf(todo_rest(3));
+                        *list = std::move(new_list);
+                        log.info("todo", std::format("added after list={} todo={}", list_id, todo_key));
+                        cell::sys::println("added after {}", toks[2]);
+                        continue;
+                    }
+                    if (toks.size() >= 4 && toks[1] == "rm")
+                    {
+                        std::string list_id, todo_key, sub_id;
+                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
+                        if (!list || !list->erase(todo_key))
+                        {
+                            cell::sys::error("unknown todo target: {}", toks[2]);
+                            continue;
+                        }
+                        log.info("todo", std::format("removed list={} todo={}", list_id, todo_key));
+                        cell::sys::println("removed {}", toks[2]);
+                        continue;
+                    }
+                    if (toks.size() >= 4 && toks[1] == "sub")
+                    {
+                        std::string list_id, todo_key, sub_id;
+                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
+                        if (!list)
+                        {
+                            cell::sys::error("unknown todo target: {}", toks[2]);
+                            continue;
+                        }
+                        auto it = list->find(todo_key);
+                        if (it == list->end())
+                        {
+                            cell::sys::error("unknown todo target: {}", toks[2]);
+                            continue;
+                        }
+                        if (todos::leaf(it.value()))
+                        {
+                            nlohmann::json group = nlohmann::json::array({
+                                {{"id", "sub-0"}, {"What", it.value()["What"].get<std::string>()}, {"done", it.value()["done"].get<bool>()}},
+                            });
+                            group.push_back({{"id", "sub-1"}, {"What", todo_rest(3)}, {"done", false}});
+                            it.value() = std::move(group);
+                        }
+                        else if (it.value().is_array())
+                            it.value().push_back({{"id", todos::next_key(it.value(), "sub-")},
+                                                  {"What", todo_rest(3)},
+                                                  {"done", false}});
+                        else
+                        {
+                            cell::sys::error("invalid todo target: {}", toks[2]);
+                            continue;
+                        }
+                        log.info("todo", std::format("sub added list={} todo={}", list_id, todo_key));
+                        cell::sys::println("sub added to {}", toks[2]);
+                        continue;
+                    }
+                    std::string state;
+                    todos::render(s->todos_state(), state);
+                    cell::sys::println("{}", state);
+                    continue;
                 }
                 if (cmd == "/provides")
                 {
@@ -8407,7 +9116,7 @@ int main(int argc, char const *argv[])
                         if (target == s->id())
                         {
                             h.forget_current();
-                            s = &h.now();
+                            set_todo_session(&h.now());
                             ensure_prompt(s);
                             cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, s->id(), cell::workdir().string());
                         }
@@ -8446,7 +9155,7 @@ int main(int argc, char const *argv[])
                             cell::sys::println("cwd -> {}", cell::workdir().string());
                     }
                     h.use(target);
-                    s = &h.now();
+                    set_todo_session(&h.now());
                     ensure_prompt(s);
                     log.info("sess", std::format("switched to={} msgs={} previous={}", target, s->msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
                     cell::sys::println("switched to session {} cwd={} ({} message(s))", s->id(), cell::workdir().string(), s->msg().size());
@@ -8919,6 +9628,47 @@ int main(int argc, char const *argv[])
                     cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
                     if (approval_refused)
                         done = true;
+                    // after the tool results are stored, run any requested
+                    // parallel group; its report is injected into the current
+                    // session as the system message the next round will see.
+                    if (!approval_refused)
+                    {
+                        for (size_t i = 0; i < tool_calls.size(); i++)
+                        {
+                            if (res[i].name != "todo" || !res[i].output.starts_with("run_parallel:"))
+                                continue;
+                            std::vector<std::string> parts;
+                            size_t start = 0;
+                            while (true)
+                            {
+                                size_t end = res[i].output.find(':', start);
+                                if (end == std::string::npos)
+                                {
+                                    parts.push_back(res[i].output.substr(start));
+                                    break;
+                                }
+                                parts.push_back(res[i].output.substr(start, end - start));
+                                start = end + 1;
+                            }
+                            if (parts.size() != 4)
+                                continue;
+                            const std::string &list_id = parts[1];
+                            const std::string &todo_key = parts[2];
+                            std::vector<std::pair<std::string, std::string>> branch_summaries;
+                            cell::sys::println("todo: running parallel group {}", todo_key);
+                            if (run_todo_parallel_branches(list_id, todo_key, branch_summaries))
+                            {
+                                std::string report = todos::merge_report(todo_key, branch_summaries);
+                                s->msg().push_back({{"role", "system"}, {"content", std::format("Report:\n{}", report)}});
+                                log.info("todo", std::format("parallel report list={} todo={} branches={} chars={}", list_id, todo_key, branch_summaries.size(), report.size()));
+                            }
+                            else
+                            {
+                                cell::sys::warn("[todo] parallel group did not produce summaries: {}", todo_key);
+                                log.warn("todo", std::format("parallel failed list={} todo={}", list_id, todo_key));
+                            }
+                        }
+                    }
                     continue;
                 }
                 done = true;
