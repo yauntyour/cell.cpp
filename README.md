@@ -111,6 +111,7 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
+| 🗜️ | **Automatic context compaction** — on context-overflow errors (compress + retry once) and after long tool-heavy turns; the compression model can differ from the chat model | `cell::chat`, `compact()` |
 | 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max); OpenAI streams `reasoning_content`, Anthropic streams `thinking_delta`, both rendered dim; reasoning content is persisted in sessions | `cell::llm` |
 | 🔎 | **Numbered reads** — `read` returns every line prefixed with a right-aligned line number, and `rg` groups hits as `=== file ===` + `line: content`, so the model can cite exact lines to `edit` | `cell::box` |
 | 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
@@ -242,7 +243,9 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
 | `/session rm ID` | Delete a session file and its usage record |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
-| `/compact` | Aggregate the conversation into one summary message |
+| `/compact` | Aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
+| `/compact auto [on\|off]` | Show or toggle automatic compaction after long agent runs (persisted, default on) |
+| `/compact model provider:model` | Route summarization through a specific registered provider/model; `inherit` resets it to the session model |
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
 | `/skills` | List available skills |
 | `/skill NAME` | Inject a skill body into the current session as a system message |
@@ -287,13 +290,27 @@ through `display_safe` (control/ANSI stripping) but are not fingerprint-redacted
 reserved for `exec` output.
 
 **Context compaction (`/compact`).** The first `system` message is kept verbatim; every other
-message (skills injection, user, assistant, tool results — each truncated to 400 chars) is sent to
-the current model with tools disabled and replaced by a single
-`{"role":"system","content":"Here is a summary that captures the previous conversation: …"}`
-message. With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if the
+message is split into conversation text and agent reasoning (thinking blocks are summarized in a
+second pass), each message truncated to 400 chars, and both parts are sent to the compression model
+(`compact_provider` / `compact_model`, falling back to the session model) with tools disabled. The
+two summaries are merged into a single
+`{"role":"system","content":"# Here is a summary that captures the previous conversation: …"}`
+message. With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if a
 summarization call fails, a truncation placeholder is used. The summary is re-run through the
 injection sanitizer before it is inserted, and the read-before-edit log is reset because the earlier
-`read` results are gone from context. Compaction is itself one LLM request and counts toward usage.
+`read` results are gone from context. Compaction is itself one LLM request per part and counts
+toward usage.
+
+**Automatic compaction.** Two triggers, both using the same `compact()` path:
+
+- **On context overflow** — when a request fails with an error matching known OpenAI Chat
+  Completions / OpenAI Responses / Anthropic "context length exceeded" phrases (matched
+  case-insensitively, e.g. `maximum context length`, `context_length_exceeded`, `prompt is too
+  long`), the session is compacted once and the same round is retried against the compacted context
+  without counting as a failed attempt (`[auto-compact on context overflow]`).
+- **After long agent runs** — when `compact_auto` is on (the default) and a turn recorded
+  ≥ 3 tool calls plus reasoning/thinking entries, the context is compacted after the turn
+  (`[auto-compact] …`). Disable with `/compact auto off`.
 
 ## Tools
 
@@ -316,11 +333,12 @@ The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `nam
 `larger_than_bytes` metadata filters.
 
 **Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
-(`ls`/`read`/`rg`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
+(`ls`/`read`/`rg`/`find`/`todo`) are dispatched **concurrently** on the shared worker pool; `write`
 and `edit` are deliberately deferred to a second, **sequential** pass so that same-message reads
 always complete first (read-before-edit) and two edits of one file never race; `exec` runs
 sequentially after an interactive confirmation. Results are appended to the transcript in the
-original `tool_call` order.
+original `tool_call` order. (`todo` runs in pass 1; its `run_parallel` action reports work to be
+fanned out, which the loop then executes in its own sequential branch phase.)
 
 **Read-before-edit rule.** Paths are canonicalized (`weakly_canonical`, lowercased on Windows) and
 the line ranges returned by read tools are logged. `edit` refuses to touch any line not covered by a
@@ -416,7 +434,8 @@ the model as normal feedback.
 ### 5. Output hardening
 
 - **`sanitize_output`** (applied to `exec` results, and to `exec`-tagged results reloaded from disk):
-  truncates to a byte cap (128 KiB), then redacts line-by-line against ~50 command-override
+  truncates to a byte cap (default 128 KiB; the agent loop passes 512 MiB), then redacts
+  line-by-line against ~50 command-override
   fingerprints plus three regex families (verb + filler + `instructions|rules|system prompt|sandbox|
   safety`, `you are now …`, `no longer bound …`). Matching runs on a flattened form of each line:
   UTF-8 decoded, fullwidth/Latin-1/Cyrillic/Greek homoglyphs folded to ASCII, zero-width and bidi
@@ -483,6 +502,9 @@ never appears in the vault file — the self-test asserts this.
   "tools": true,
   "sandbox_mode": "full-access",
   "autoallow": false,
+  "compact_auto": true,
+  "compact_provider": "",
+  "compact_model": "",
   "system": "You are a helpful assistant.…",
   "session": "6333a2b6f7084f1a-1787819024",
   "log_max_lines": 1000,
@@ -500,6 +522,8 @@ never appears in the vault file — the self-test asserts this.
 | `tools` | `true` | Tool calling enabled |
 | `sandbox_mode` | `full-access` | See [sandbox modes](#1-sandbox-modes) |
 | `autoallow` | `false` | LLM decides whether exec commands run (only effective in full-access) |
+| `compact_auto` | `true` | Automatically compact the context after long tool-heavy turns (`/compact auto`) |
+| `compact_provider` / `compact_model` | *(empty)* | Provider/model used for compaction summaries; empty means inherit the session model (`/compact model provider:model`, reset with `inherit`) |
 | `system` | short assistant prompt | System prompt |
 | `log_max_lines` | `1000` (min 10) | `logs/cell.log` is trimmed to its tail on every startup |
 | `thread_pool_size` | `16` (clamped 1–16) | Max concurrent read-only tool workers; the pool spawns lazily and idles with zero workers |
@@ -579,6 +603,12 @@ blocked/rejected, the user cancels, or an error occurs. Each round logs `round=`
 counts, cache hit rate, total time and time-to-first-token. After every user turn the session and
 config are persisted.
 
+**Failures and retries.** A failed LLM request is retried up to 5 attempts per round with a 5-second
+delay between attempts (`[retrying in 5s... attempt N/5]`); exhausting them ends the turn with
+`[llm error after 5 attempts]`. If the failure is a context-overflow error, the round is compacted
+once and retried immediately instead of burning a retry attempt (see
+[automatic compaction](#slash-commands)).
+
 ## Streaming UI and keyboard control
 
 - `> ` prompt, `reply> ` prefix for streamed answers; the reasoning stream is printed **dim**, the
@@ -623,7 +653,8 @@ sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-ac
 punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
 read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
 `rg`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
-the tool registry and its policies, 16-way concurrent read-only tool calls, incremental SSE parsing
+the tool registry and its policies, todo list normalization/ordering/sub-todos/report merging,
+16-way concurrent read-only tool calls, incremental SSE parsing
 and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
 semantics, the cwd index, load-time re-sanitization of exec results, skill discovery (including
