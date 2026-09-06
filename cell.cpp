@@ -3492,6 +3492,9 @@ namespace cell
             bool tools = true;                        // tool calls enabled (configurable via /tool on|off)
             std::string sandbox_mode = "full-access"; // exec sandbox: "read-only" | "edit-only" | "full-access" (default)
             bool autoallow = false;                   // autoallow mode: LLM decides whether exec commands run (only in full-access)
+            bool compact_auto = true;                 // auto-compress after long agent runs (default on)
+            std::string compact_provider;             // compression provider name (empty => session provider)
+            std::string compact_model;                // compression model name (empty => session model)
             std::string system_prompt =
                 "You are a helpful assistant. \n"
 #if _WIN32
@@ -3716,6 +3719,9 @@ namespace cell
                 s.tools = j.value("tools", true);
                 s.sandbox_mode = j.value("sandbox_mode", "workspace-write");
                 s.autoallow = j.value("autoallow", false);
+                s.compact_auto = j.value("compact_auto", true);
+                s.compact_provider = j.value("compact_provider", "");
+                s.compact_model = j.value("compact_model", "");
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
@@ -3742,6 +3748,9 @@ namespace cell
             j["tools"] = s.tools;
             j["sandbox_mode"] = s.sandbox_mode;
             j["autoallow"] = s.autoallow;
+            j["compact_auto"] = s.compact_auto;
+            j["compact_provider"] = s.compact_provider;
+            j["compact_model"] = s.compact_model;
             j["system"] = s.system_prompt;
             j["session"] = s.session_id;
             j["log_max_lines"] = s.log_max_lines;
@@ -5867,6 +5876,8 @@ static void print_help()
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
     cell::sys::println("  /usages                     show per-model and per-session usage statistics");
     cell::sys::println("  /compact                    compress the current session context");
+    cell::sys::println("  /compact auto [on|off]      show or toggle automatic compaction after long runs (default on)");
+    cell::sys::println("  /compact model provider:model  set the compression model (registered providers only; `inherit` resets it)");
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
@@ -8122,8 +8133,153 @@ int main(int argc, char const *argv[])
         return !summaries.empty();
     };
 
-    // context compaction: keep the first system prompt message, aggregate every other message
-    // (skills/system, user, assistant, tool) into a single {"role":"system","content":"Here is a summary that ..."}
+    // context-overflow detection: covers OpenAI Chat Completions, OpenAI
+    // Responses, and Anthropic error phrases. matched case-insensitively
+    // against the human-readable error message returned by the API clients.
+    auto is_context_overflow = [](const std::string &err) -> bool
+    {
+        if (err.empty())
+            return false;
+        std::string lower = cell::box::to_lower(err);
+        static constexpr std::string_view phrases[] = {
+            // OpenAI Chat Completions
+            "maximum context length",
+            "context_length_exceeded",
+            "context length exceeded",
+            "context window",
+            "too many tokens",
+            "request too large",
+            "input length exceeds",
+            "reduce the length",
+            // OpenAI Responses
+            "context window exceeded",
+            "too much input",
+            "input too large",
+            "input length and `max_tokens`",
+            // Anthropic
+            "prompt is too long",
+            "prompt length exceeds",
+            "input length and max_tokens",
+            "above the model's maximum",
+            "token limit",
+        };
+        for (auto ph : phrases)
+            if (lower.find(ph) != std::string::npos)
+                return true;
+        return false;
+    };
+
+    // extract conversation text (no thinking) and thinking text from messages.
+    // thinking blocks are {"type":"reasoning","reasoning":...} (OpenAI) or
+    // {"type":"thinking","thinking":...} (Anthropic) inside content arrays.
+    auto extract_parts = [](const nlohmann::json &rest,
+                            std::string &conv_text, std::string &think_text)
+    {
+        for (auto &m : rest)
+        {
+            std::string role = m.value("role", "");
+            auto it = m.find("content");
+            if (it == m.end())
+                continue;
+            if (it->is_string())
+            {
+                std::string body = it->get<std::string>();
+                if (body.size() > 400)
+                    body = body.substr(0, 400) + "...";
+                conv_text += std::format("{}: {}\n", role, body);
+                continue;
+            }
+            if (!it->is_array())
+                continue;
+            std::string conv_body;
+            for (auto &b : *it)
+            {
+                if (!b.is_object())
+                    continue;
+                std::string bt = b.value("type", "");
+                if (bt == "reasoning" && b.contains("reasoning") && b["reasoning"].is_string())
+                    think_text += b["reasoning"].get_ref<const std::string &>() + "\n";
+                else if (bt == "thinking" && b.contains("thinking") && b["thinking"].is_string())
+                    think_text += b["thinking"].get_ref<const std::string &>() + "\n";
+                else if (bt == "text" && b.contains("text") && b["text"].is_string())
+                    conv_body += b["text"].get_ref<const std::string &>();
+                else if (bt == "tool_use" || bt == "tool_result" || b.contains("text") || b.contains("input") || b.contains("content"))
+                    conv_body += b.dump() + "\n";
+            }
+            if (conv_body.size() > 400)
+                conv_body = conv_body.substr(0, 400) + "...";
+            conv_text += std::format("{}: {}\n", role, conv_body);
+        }
+    };
+
+    // run one summarization request via the compression model (or session model)
+    // and return the summary text; empty on failure (caller falls back).
+    auto summarize_part = [&](const std::string &instruction, const std::string &body,
+                              const std::string &label) -> std::string
+    {
+        const cell::config::provider_entry *p = nullptr;
+        std::string model;
+        if (!cfg.compact_provider.empty())
+        {
+            for (auto &pe : cfg.providers)
+                if (pe.name == cfg.compact_provider)
+                {
+                    p = &pe;
+                    break;
+                }
+            if (!p)
+            {
+                log.warn("ctx", std::format("compact provider '{}' not registered, falling back to session model", cfg.compact_provider));
+                p = cfg.current_provider_entry();
+                model = cfg.current_model;
+            }
+            else
+                model = cfg.compact_model.empty() ? cfg.current_model : cfg.compact_model;
+        }
+        else
+        {
+            p = cfg.current_provider_entry();
+            model = cfg.current_model;
+        }
+        if (!p || model.empty())
+            return "";
+        cell::encrypt::secure_string key = resolve_key(*p);
+        if (key.empty())
+            return "";
+        nlohmann::json prompt = nlohmann::json::array();
+        prompt.push_back({{"role", "user"},
+                          {"content", std::format("{}\n\n{}", instruction, body)}});
+        nlohmann::json reply, tc, usage;
+        std::string err;
+        log.info("ctx", std::format("summarizing {} via={}:{} chars={} tools=off", label, p->name, model, body.size()));
+        cell::sys::print("summary> ");
+        auto t0 = cell::sys::detail::clock::now();
+        total_llm_requests++;
+        if (!do_chat(*p, key, model, prompt, true, on_token, nullptr, reply, tc, usage, err, false, 0))
+        {
+            cell::sys::println();
+            log.warn("ctx", std::format("summarization_failed part={} err={}", label, err.empty() ? "n/a" : err));
+            return "";
+        }
+        double sec = cell::sys::elapsed_ms(t0) / 1000.0;
+        cell::sys::println();
+        std::string summary = reply_text(reply);
+        if (summary.empty())
+            return "";
+        // prompt-injection defence: re-sanitize the summary so a re-stated
+        // malicious instruction cannot survive into the new system message
+        summary = cell::box::sanitize_output(summary);
+        log.info("ctx", std::format("summary {} chars={} time={:.2f}s tok_in={} tok_out={}",
+                                    label, summary.size(), sec,
+                                    usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
+                                    usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a"));
+        cell::stats::add(s->id(), std::format("{}:{}", p->name, model), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
+        return summary;
+    };
+
+    // context compaction: keep the first system prompt message, split the rest
+    // into conversation text and thinking text, summarize each separately, then
+    // organize both into a single {"role":"system","content": ...} message.
     auto compact = [&](cell::chat::session *sess) -> std::string
     {
         auto &msgs = sess->msg();
@@ -8144,72 +8300,32 @@ int main(int argc, char const *argv[])
                 rest.push_back(msgs[i]);
         if (rest.size() <= 12)
             return std::format("context already small ({} messages to aggregate)", rest.size());
-        std::string mid_text;
-        for (auto &m : rest)
+        std::string conv_text, think_text;
+        extract_parts(rest, conv_text, think_text);
+        std::string conv_summary = "(llm summarization unavailable; messages truncated)";
+        if (std::string r = summarize_part(
+                "Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.",
+                conv_text, "conversation");
+            !r.empty())
+            conv_summary = std::move(r);
+        std::string think_summary;
+        if (!think_text.empty())
         {
-            std::string role = m.value("role", "");
-            std::string body;
-            auto it = m.find("content");
-            if (it != m.end())
-            {
-                if (it->is_string())
-                    body = it->get<std::string>();
-                else if (it->is_array())
-                    for (auto &b : *it)
-                        body += b.dump() + "\n";
-            }
-            if (body.size() > 400)
-                body = body.substr(0, 400) + "...";
-            mid_text += std::format("{}: {}\n", role, body);
+            think_summary = "(agent reasoning summary unavailable)";
+            if (std::string r = summarize_part(
+                    "Summarize the agent's reasoning based on the preceding conversation. Focus on the key insights, decisions, and conclusions reached. Output only the summary.",
+                    think_text, "reasoning");
+                !r.empty())
+                think_summary = std::move(r);
         }
-        std::string summary = "(llm summarization unavailable; messages truncated)";
-        if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p && !cfg.current_model.empty())
-        {
-            cell::encrypt::secure_string key = resolve_key(*p);
-            if (!key.empty())
-            {
-                nlohmann::json prompt = nlohmann::json::array();
-                prompt.push_back({{"role", "user"},
-                                  {"content", std::format("Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.\n\n{}", mid_text)}});
-                nlohmann::json reply, tc, usage;
-                std::string err;
-                log.info("ctx", std::format("compacting aggregated_msgs={} via={} tools=off", rest.size(), cfg.model_label()));
-                cell::sys::print("summary> ");
-                auto t0 = cell::sys::detail::clock::now();
-                total_llm_requests++;
-                if (do_chat(*p, key, cfg.current_model, prompt, true, on_token, nullptr, reply, tc, usage, err, false, cfg.think_level))
-                {
-                    double sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                    cell::sys::println();
-                    summary = reply_text(reply);
-                    if (summary.empty())
-                        summary = "(empty summary)";
-                    // prompt-injection defence: the summary is injected as a system
-                    // message; re-sanitize it so a re-stated malicious instruction
-                    // inside the aggregated conversation cannot survive into it
-                    summary = cell::box::sanitize_output(summary);
-                    auto in_tok = usage_in(usage);
-                    auto out_tok = usage_out(usage);
-                    auto cache_hit = usage_cache_hit(usage);
-                    log.info("ctx", std::format("summary chars={} time={:.2f}s tok_in={} tok_out={} cache={}",
-                                                summary.size(), sec,
-                                                in_tok.has_value() ? std::to_string(*in_tok) : "n/a",
-                                                out_tok.has_value() ? std::to_string(*out_tok) : "n/a",
-                                                cache_hit.has_value() ? std::format("{:.1f}%", *cache_hit * 100.0) : "n/a"));
-                    cell::stats::add(sess->id(), cfg.model_label(), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
-                }
-                else
-                {
-                    cell::sys::println();
-                    log.warn("ctx", std::format("summarization_failed fallback=truncation err={}", err.empty() ? "n/a" : err));
-                }
-            }
-        }
+        std::string content = std::format(
+            "# Here is a summary that captures the previous conversation:\n{}\n"
+            "# Summary of the agent's reasoning based on the preceding conversation:\n{}",
+            conv_summary, think_summary.empty() ? "(no reasoning content recorded)" : think_summary);
         nlohmann::json new_msgs = nlohmann::json::array();
         if (first_sys != (size_t)-1)
             new_msgs.push_back(base_sys);
-        new_msgs.push_back({{"role", "system"},
-                            {"content", std::format("Here is a summary that captures the previous conversation:\n{}", summary)}});
+        new_msgs.push_back({{"role", "system"}, {"content", content}});
         size_t removed = rest.size();
         msgs = new_msgs;
         return std::format("context compacted: aggregated {} message(s) into 1 summary, {} message(s) remain", removed, new_msgs.size());
@@ -9171,6 +9287,69 @@ int main(int argc, char const *argv[])
                 }
                 if (cmd == "/compact")
                 {
+                    if (toks.size() >= 2 && toks[1] == "auto")
+                    {
+                        if (toks.size() >= 3 && (toks[2] == "on" || toks[2] == "off"))
+                        {
+                            cfg.compact_auto = (toks[2] == "on");
+                            cell::config::save(cfg);
+                            log.info("ctx", std::format("compact_auto={}", cfg.compact_auto));
+                            cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
+                        }
+                        else
+                            cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
+                        continue;
+                    }
+                    if (toks.size() >= 2 && toks[1] == "model")
+                    {
+                        if (toks.size() >= 3)
+                        {
+                            if (toks[2] == "inherit")
+                            {
+                                cfg.compact_provider.clear();
+                                cfg.compact_model.clear();
+                                cell::config::save(cfg);
+                                log.info("ctx", "compact model reset to session model");
+                                cell::sys::println("compact model: inherit session model");
+                            }
+                            else
+                            {
+                                const size_t sep = toks[2].find(':');
+                                if (sep == std::string::npos || sep == 0 || sep + 1 >= toks[2].size())
+                                {
+                                    cell::sys::error("usage: /compact model provider:model | /compact model inherit");
+                                    continue;
+                                }
+                                std::string prov = toks[2].substr(0, sep);
+                                std::string mdl = toks[2].substr(sep + 1);
+                                bool found = false;
+                                for (auto &pe : cfg.providers)
+                                    if (pe.name == prov)
+                                    {
+                                        found = true;
+                                        break;
+                                    }
+                                if (!found)
+                                {
+                                    cell::sys::error("unknown provider: {} (only registered providers can be set)", prov);
+                                    continue;
+                                }
+                                cfg.compact_provider = prov;
+                                cfg.compact_model = mdl;
+                                cell::config::save(cfg);
+                                log.info("ctx", std::format("compact model set to {}:{}", prov, mdl));
+                                cell::sys::println("compact model: {}:{}", prov, mdl);
+                            }
+                        }
+                        else
+                        {
+                            if (cfg.compact_provider.empty())
+                                cell::sys::println("compact model: inherit session model");
+                            else
+                                cell::sys::println("compact model: {}:{}", cfg.compact_provider, cfg.compact_model);
+                        }
+                        continue;
+                    }
                     cell::sys::println("{}", compact(s));
                     cell::box::reset_read_log(); // compaction drops read tool results from context
                     s->unload();
@@ -9232,6 +9411,8 @@ int main(int argc, char const *argv[])
 
             bool done = false;
             int rounds = 0;
+            long long turn_tool_calls = 0;
+            long long turn_thinking_entries = 0;
             while (!done)
             {
                 rounds++;
@@ -9290,6 +9471,7 @@ int main(int argc, char const *argv[])
                 bool ok = false;
                 std::string err;
                 int attempt = 0;
+                bool compacted_this_round = false;
                 while (attempt < kMaxRetries)
                 {
                     if (attempt > 0)
@@ -9403,6 +9585,27 @@ int main(int argc, char const *argv[])
                         ui.timer_line = false;
                         ui.tok_line = false;
                     }
+                    // context overflow: compress and retry immediately instead of
+                    // burning retry attempts on an error that compaction can fix
+                    if (!ok && !compacted_this_round && is_context_overflow(err) &&
+                        compact(s).find("context compacted") != std::string::npos)
+                    {
+                        log.info("ctx", std::format("auto_compact_on_overflow ctx_msgs={} round={}", (long long)s->msg().size(), rounds));
+                        cell::sys::println("[auto-compact on context overflow]");
+                        cell::box::reset_read_log();
+                        s->unload();
+                        cell::async_io::flush();
+                        ui = StreamUI{};
+                        ui.t0 = cell::sys::detail::clock::now();
+                        reply = nlohmann::json{};
+                        tool_calls = nlohmann::json{};
+                        usage = nlohmann::json{};
+                        err.clear();
+                        compacted_this_round = true;
+                        // the compacted context may now fit: give it one more try
+                        // without counting this as a normal failed attempt
+                        continue; // retry the same round against the compacted context
+                    }
                     if (ui.cancelled)
                     {
                         log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
@@ -9450,6 +9653,11 @@ int main(int argc, char const *argv[])
                 cell::sys::println();
                 long long out_chars = reply_text_len(reply);
                 s->msg().push_back(reply);
+                // count reasoning/thinking entries for the auto-compact threshold
+                if (reply.contains("content") && reply["content"].is_array())
+                    for (auto &b : reply["content"])
+                        if (b.is_object() && (b.value("type", "") == "reasoning" || b.value("type", "") == "thinking"))
+                            turn_thinking_entries++;
                 if (!tool_calls.empty())
                 {
                     struct tresult
@@ -9461,6 +9669,7 @@ int main(int argc, char const *argv[])
                     };
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
+                    turn_tool_calls += (long long)tool_calls.size();
                     // pass 1: read-only tools (Policy::Allow: ls/read/rg/find) run concurrently
                     // on the shared worker pool (dynamically scaled up to max_threads)
                     size_t allow_count = 0;
@@ -9673,6 +9882,19 @@ int main(int argc, char const *argv[])
                 }
                 done = true;
                 cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
+            }
+            // auto-compact after long agent runs: three or more tool calls or
+            // thinking entries since the last user message (minimum threshold)
+            if (cfg.compact_auto && turn_tool_calls + turn_thinking_entries >= 3)
+            {
+                std::string result = compact(s);
+                if (result.find("context compacted") != std::string::npos)
+                {
+                    log.info("ctx", std::format("auto_compact tool_calls={} thinking={} msgs={} result={}",
+                                                turn_tool_calls, turn_thinking_entries, (long long)s->msg().size(), result));
+                    cell::sys::println("[auto-compact] {}", result);
+                    cell::box::reset_read_log();
+                }
             }
             s->unload();
             log.debug("sess", std::format("persisted id={} msgs={}", s->id(), s->msg().size()));
