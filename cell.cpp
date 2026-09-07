@@ -39,6 +39,7 @@
 #include <string>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include <regex>
@@ -6100,6 +6101,17 @@ namespace cell
             return &empty;
         }
 
+        // A single pending run_parallel request set by the todo tool handler and
+        // consumed by the agent loop (main thread) immediately after the tool
+        // returns. Using a member of this namespace (rather than a magic string
+        // embedded in the tool output) keeps the trigger type-safe and removes
+        // the fragility of parsing the model-visible tool result.
+        static nlohmann::json &run_parallel_list()
+        {
+            static nlohmann::json pending = nlohmann::json::array();
+            return pending;
+        }
+
         // A list is an object keyed by todo-N. A value is either a leaf
         // {"What":"...","done":bool} or an array of parallel sub-todos.
         static bool valid_id(const std::string &id)
@@ -6176,11 +6188,27 @@ namespace cell
                 else if (it.value().is_array())
                 {
                     nlohmann::json subs = nlohmann::json::array();
+                    std::unordered_set<std::string> used;
                     for (const auto &sub : it.value())
-                        if (leaf(sub))
-                            subs.push_back({{"id", sub.value("id", next_key(subs, "sub-"))},
-                                            {"What", sub["What"].get<std::string>()},
-                                            {"done", sub["done"].get<bool>()}});
+                    {
+                        if (!leaf(sub))
+                            continue;
+                        // Preserve an existing id; otherwise assign a stable,
+                        // zero-based id (sub-0, sub-1, ...) that never collides
+                        // with an id already present in the group.
+                        std::string id = sub.value("id", "");
+                        if (id.empty() || used.count(id))
+                        {
+                            size_t n = used.size();
+                            id = std::format("sub-{}", n);
+                            while (used.count(id))
+                                id = std::format("sub-{}", ++n);
+                        }
+                        used.insert(id);
+                        subs.push_back({{"id", id},
+                                        {"What", sub["What"].get<std::string>()},
+                                        {"done", sub["done"].get<bool>()}});
+                    }
                     if (!subs.empty())
                         out[it.key()] = subs;
                 }
@@ -6563,6 +6591,11 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 auto it = cell::todos::active_todos()->find(id);
                 return it == cell::todos::active_todos()->end() ? nullptr : &*it;
             };
+            // When the 'run_parallel' action succeeds it records its resolved
+            // (list_id, todo_id) in cell::todos::run_parallel_list() so the
+            // orchestrator (main thread, sequential pass) can launch the
+            // branches. The tool no longer emits a magic sentinel string back
+            // to the model.
             if (action == "get" || action.empty())
             {
                 cell::todos::render(*cell::todos::active_todos(), out);
@@ -6713,10 +6746,15 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 auto it = list->find(todo_id);
                 if (it == list->end() || !it->is_array() || it->empty())
                 {
-                    out = std::format("[todo] no parallel sub-todos in {}", todo_id);
+                    out = std::format("[todo] no parallel sub-todos in {}", todo_id.empty() ? "(missing)" : todo_id);
                     return false;
                 }
-                out = std::format("run_parallel:{}:{}:{}", list_id, todo_id, it->size());
+                // Validate the resolved targets up front. Real execution is
+                // deferred to the orchestrator (main thread, after this tool
+                // call returns) so it runs sequentially and owned by the agent
+                // loop rather than a worker-pool thread.
+                cell::todos::run_parallel_list() = nlohmann::json::array({{list_id, todo_id}});
+                out = std::format("parallel group {} has {} sub-todo(s); launching.", todo_id, it->size());
                 return true;
             }
             out = std::format("[todo] unknown action: {}", action);
@@ -9993,6 +10031,9 @@ int main(int argc, char const *argv[])
                     turn_tool_calls += (long long)tool_calls.size();
                     // pass 1: read-only tools (Policy::Allow: ls/read/rg/find) run concurrently
                     // on the shared worker pool (dynamically scaled up to max_threads)
+                    // Start each tool-processing round with a clean parallel-trigger
+                    // slot; only a todo tool call in THIS round may populate it.
+                    cell::todos::run_parallel_list() = nlohmann::json::array();
                     size_t allow_count = 0;
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
@@ -10015,7 +10056,7 @@ int main(int argc, char const *argv[])
                             // read in the same message must complete first
                             // (read-before-edit rule) and two edits of one file
                             // must never race each other
-                            if (res[i].name == "write" || res[i].name == "edit")
+                            if (res[i].name == "write" || res[i].name == "edit" || res[i].name == "todo")
                             {
                                 res[i].policy = "defer"; // sequential, no prompt
                                 continue;
@@ -10160,31 +10201,20 @@ int main(int argc, char const *argv[])
                         natural_end = false; // user decline / autoallow deny aborts the turn
                     }
                     // after the tool results are stored, run any requested
-                    // parallel group; its report is injected into the current
-                    // session as the system message the next round will see.
+                    // parallel group. The todo tool set cell::todos::run_parallel_list()
+                    // to the resolved (list_id, todo_id) pair; we consume it here
+                    // on the main thread (this is the sequential pass), so the
+                    // branches never run on a worker-pool thread and the resolved
+                    // ids are already validated by the tool handler.
                     if (!approval_refused)
                     {
-                        for (size_t i = 0; i < tool_calls.size(); i++)
+                        nlohmann::json &pending = cell::todos::run_parallel_list();
+                        for (auto &pr : pending)
                         {
-                            if (res[i].name != "todo" || !res[i].output.starts_with("run_parallel:"))
+                            if (!pr.is_array() || pr.size() < 2 || !pr[0].is_string() || !pr[1].is_string())
                                 continue;
-                            std::vector<std::string> parts;
-                            size_t start = 0;
-                            while (true)
-                            {
-                                size_t end = res[i].output.find(':', start);
-                                if (end == std::string::npos)
-                                {
-                                    parts.push_back(res[i].output.substr(start));
-                                    break;
-                                }
-                                parts.push_back(res[i].output.substr(start, end - start));
-                                start = end + 1;
-                            }
-                            if (parts.size() != 4)
-                                continue;
-                            const std::string &list_id = parts[1];
-                            const std::string &todo_key = parts[2];
+                            const std::string &list_id = pr[0].get<std::string>();
+                            const std::string &todo_key = pr[1].get<std::string>();
                             std::vector<std::pair<std::string, std::string>> branch_summaries;
                             cell::sys::println("todo: running parallel group {}", todo_key);
                             if (run_todo_parallel_branches(list_id, todo_key, branch_summaries))
@@ -10199,6 +10229,7 @@ int main(int argc, char const *argv[])
                                 log.warn("todo", std::format("parallel failed list={} todo={}", list_id, todo_key));
                             }
                         }
+                        pending = nlohmann::json::array();
                     }
                     continue;
                 }
