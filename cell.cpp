@@ -22,7 +22,6 @@
 //      chat      session (per-cwd persistence) and history (in-memory session map)
 //      skills    front-matter parser, recursive scanner, metadata prompt
 //      stats     usage counters in .cell/usages.json
-//      todos     session-persisted Todos helpers (schema, ordering, rendering)
 //    [repl]    print_usage / print_help / build_tools (tool registry + schemas)
 //    [selftest] run_selftest
 //    [main]    argument parse, provider setup, slash commands, agent loop
@@ -1039,14 +1038,12 @@ namespace cell
             case SandboxMode::ReadOnly:
                 // Only read-only tools allowed
                 return tool_name == "read" || tool_name == "rg" ||
-                       tool_name == "find" || tool_name == "ls" ||
-                       tool_name == "todo";
+                       tool_name == "find" || tool_name == "ls";
             case SandboxMode::EditOnly:
                 // Read-only tools plus write and edit allowed
                 return tool_name == "read" || tool_name == "rg" ||
                        tool_name == "find" || tool_name == "ls" ||
-                       tool_name == "write" || tool_name == "edit" ||
-                       tool_name == "todo";
+                       tool_name == "write" || tool_name == "edit";
             case SandboxMode::FullAccess:
                 // All tools allowed
                 return true;
@@ -4425,9 +4422,8 @@ namespace cell
         //                with other Concurrent tools (read-only, no shared state).
         //   Deferred   — runs sequentially in pass 2, after every Concurrent tool
         //                in the same assistant message has finished. Use this for
-        //                any tool that mutates shared session state (the todo
-        //                store, run_parallel trigger) or that must observe the
-        //                results of pass-1 reads (write/edit read-before-edit rule).
+        //                any tool that mutates shared session state or that must
+        //                observe the results of pass-1 reads (write/edit read-before-edit rule).
         enum class Phase : unsigned char
         {
             Concurrent = 0,
@@ -5580,12 +5576,6 @@ namespace cell
     //  chat — session persistence: one JSON file per session, grouped in a
     //  directory per working-directory hash, plus the in-memory session map.
     // =========================================================================
-    // forward declaration so session::load() can call the todos store
-    // coercion helper defined later in the todos namespace.
-    namespace todos
-    {
-        static nlohmann::json coerce_store(nlohmann::json store);
-    }
 
     namespace chat
     {
@@ -5595,7 +5585,6 @@ namespace cell
             std::string session_id;
             std::string cwd;                                   // working directory this session belongs to
             nlohmann::json messages = nlohmann::json::array(); // [{"role":"user","content":"hi"},...]
-            nlohmann::json todos = nlohmann::json::object();   // {"todo-id":{"todo-0":{"What":"...","done":false}}}
             std::filesystem::path file;
             bool loaded = false;
 
@@ -5652,14 +5641,10 @@ namespace cell
                         cell::sys::logger::instance().info("sess", std::format("loaded id={} msgs={}", session_id, messages.size()));
                     }
                     cwd = j.value("cwd", cwd);
-                    todos = j.contains("todos") && j["todos"].is_object()
-                                ? cell::todos::coerce_store(j["todos"])
-                                : nlohmann::json::object();
                 }
                 catch (const std::exception &)
                 {
                     messages = nlohmann::json::array();
-                    todos = nlohmann::json::object();
                     cell::sys::logger::instance().warn("sess", std::format("corrupt id={} action=start_empty", session_id));
                 }
             }
@@ -5669,7 +5654,6 @@ namespace cell
                 j["id"] = session_id;
                 j["cwd"] = cwd;
                 j["messages"] = messages;
-                j["todos"] = todos;
                 // serialize on this thread, hand the bytes to the background writer;
                 // call async_io::flush() before reading session files back
                 async_io::submit(file, j.dump(2));
@@ -5679,7 +5663,6 @@ namespace cell
             const std::string &cwd_path() const { return cwd; }
             const std::filesystem::path &path() const { return file; }
             nlohmann::json &msg() { return messages; }
-            nlohmann::json &todos_state() { return todos; }
             void append(const std::string &role, const nlohmann::json &content)
             {
                 messages.push_back({{"role", role}, {"content", content}});
@@ -6112,384 +6095,6 @@ namespace cell
             return out;
         }
     } // namespace stats
-    // =========================================================================
-    //  todos — session-persisted Todos: schema validation, stable numeric
-    //  ordering, parallel sub-todos and report merging. Rendering helpers
-    //  shared by the todo tool and the /todo command.
-    // =========================================================================
-    namespace todos
-    {
-        static cell::chat::session *active_session = nullptr;
-        static nlohmann::json *active_todos()
-        {
-            if (active_session)
-                return &active_session->todos_state();
-            static nlohmann::json empty = nlohmann::json::object();
-            return &empty;
-        }
-
-        // A single pending run_parallel request set by the todo tool handler and
-        // consumed by the agent loop (main thread) immediately after the tool
-        // returns. Using a member of this namespace (rather than a magic string
-        // embedded in the tool output) keeps the trigger type-safe and removes
-        // the fragility of parsing the model-visible tool result.
-        static nlohmann::json &run_parallel_list()
-        {
-            static nlohmann::json pending = nlohmann::json::array();
-            return pending;
-        }
-
-        // A list is an object keyed by todo-N. A value is either a leaf
-        // {"What":"...","done":bool} or an array of parallel sub-todos.
-        static bool valid_id(const std::string &id)
-        {
-            return !id.empty() && id.size() <= 128 &&
-                   std::all_of(id.begin(), id.end(), [](unsigned char c)
-                               { return std::isalnum(c) || c == '-' || c == '_'; });
-        }
-
-        static bool leaf(const nlohmann::json &v)
-        {
-            return v.is_object() && v.contains("What") && v["What"].is_string() &&
-                   v.contains("done") && v["done"].is_boolean();
-        }
-
-        static bool valid_list(const nlohmann::json &list)
-        {
-            if (!list.is_object())
-                return false;
-            for (auto it = list.begin(); it != list.end(); ++it)
-            {
-                if (!valid_id(it.key()))
-                    return false;
-                if (leaf(it.value()))
-                    continue;
-                if (!it.value().is_array())
-                    return false;
-                for (const auto &sub : it.value())
-                    if (!leaf(sub))
-                        return false;
-            }
-            return true;
-        }
-
-        static nlohmann::json make_leaf(const std::string &what, bool done = false)
-        {
-            return {{"What", what}, {"done", done}};
-        }
-
-        static std::string next_key(const nlohmann::json &container, const std::string &prefix)
-        {
-            size_t max_n = 0;
-            if (container.is_object())
-            {
-                for (auto it = container.begin(); it != container.end(); ++it)
-                {
-                    if (it.key().starts_with(prefix))
-                    {
-                        try
-                        {
-                            max_n = std::max(max_n, (size_t)std::stoull(it.key().substr(prefix.size())));
-                        }
-                        catch (const std::exception &)
-                        {
-                        }
-                    }
-                }
-            }
-            return prefix + std::to_string(max_n + 1);
-        }
-
-        static nlohmann::json normalize(const nlohmann::json &list)
-        {
-            if (!list.is_object())
-                return nlohmann::json::object();
-            nlohmann::json out = nlohmann::json::object();
-            for (auto it = list.begin(); it != list.end(); ++it)
-            {
-                if (leaf(it.value()))
-                {
-                    out[it.key()] = {{"What", it.value()["What"].get<std::string>()},
-                                     {"done", it.value()["done"].get<bool>()}};
-                }
-                else if (it.value().is_array())
-                {
-                    nlohmann::json subs = nlohmann::json::array();
-                    std::unordered_set<std::string> used;
-                    for (const auto &sub : it.value())
-                    {
-                        if (!leaf(sub))
-                            continue;
-                        // Preserve an existing id; otherwise assign a stable,
-                        // zero-based id (sub-0, sub-1, ...) that never collides
-                        // with an id already present in the group.
-                        std::string id = sub.value("id", "");
-                        if (id.empty() || used.count(id))
-                        {
-                            size_t n = used.size();
-                            id = std::format("sub-{}", n);
-                            while (used.count(id))
-                                id = std::format("sub-{}", ++n);
-                        }
-                        used.insert(id);
-                        subs.push_back({{"id", id},
-                                        {"What", sub["What"].get<std::string>()},
-                                        {"done", sub["done"].get<bool>()}});
-                    }
-                    if (!subs.empty())
-                        out[it.key()] = subs;
-                }
-            }
-            return out;
-        }
-
-        static nlohmann::json *find_leaf(nlohmann::json &list, const std::string &todo_key,
-                                         const std::string &sub_key = "")
-        {
-            if (!list.is_object())
-                return nullptr;
-            auto it = list.find(todo_key);
-            if (it == list.end())
-                return nullptr;
-            if (sub_key.empty())
-                return leaf(*it) ? &*it : nullptr;
-            if (!it->is_array())
-                return nullptr;
-            for (auto &sub : *it)
-                if (sub.is_object() && sub.value("id", "") == sub_key)
-                    return &sub;
-            return nullptr;
-        }
-
-        static std::string key_at(const nlohmann::json &list, size_t n)
-        {
-            if (!list.is_object() || n == 0)
-                return "";
-            std::vector<std::string> keys;
-            for (auto it = list.begin(); it != list.end(); ++it)
-                keys.push_back(it.key());
-            std::sort(keys.begin(), keys.end(), [](const std::string &a, const std::string &b)
-                      {
-                      auto num = [](const std::string &s, size_t pos, size_t &v)
-                      {
-                          size_t p = pos;
-                          while (p < s.size() && std::isdigit((unsigned char)s[p])) ++p;
-                          if (p == pos)
-                              return false;
-                          v = (size_t)std::stoull(s.substr(pos, p - pos));
-                          return true;
-                      };
-                      size_t an = 0, bn = 0;
-                      bool a_num = a.starts_with("todo-") && num(a, 5, an);
-                      bool b_num = b.starts_with("todo-") && num(b, 5, bn);
-                      if (a_num && b_num && an != bn)
-                          return an < bn;
-                      return a < b; });
-            return n <= keys.size() ? keys[n - 1] : "";
-        }
-
-        static void render(const nlohmann::json &todos, std::string &out)
-        {
-            if (todos.empty())
-            {
-                out = "(no Todos)";
-                return;
-            }
-            out.clear();
-            for (auto it = todos.begin(); it != todos.end(); ++it)
-            {
-                if (leaf(it.value()))
-                {
-                    out += std::format("[{}] {}: {}\n", it.value()["done"].get<bool>() ? "x" : " ",
-                                       it.key(), it.value()["What"].get<std::string>());
-                }
-                else if (it.value().is_array())
-                {
-                    out += std::format("[ ] {}: parallel group\n", it.key());
-                    for (const auto &sub : it.value())
-                        out += std::format("  [{}] {}: {}\n", sub["done"].get<bool>() ? "x" : " ",
-                                           sub["id"].get<std::string>(), sub["What"].get<std::string>());
-                }
-            }
-            while (!out.empty() && out.back() == '\n')
-                out.pop_back();
-        }
-
-        static std::string merge_report(const std::string &todo_id,
-                                        const std::vector<std::pair<std::string, std::string>> &summaries)
-        {
-            std::string report = std::format("# Parallel {} Summary\n", todo_id);
-            for (const auto &[id, summary] : summaries)
-                report += std::format("## {}\n{}\n", id, summary);
-            return report;
-        }
-
-        // ---- multi-list helpers -------------------------------------------------
-        // The todos store is a map keyed by list id (todo-id), e.g.
-        //   {"my-list": {"todo-0": {...}}, "other": {"todo-0": {...}}}
-        // The helpers below make the store behave as a true collection of
-        // Todos lists that agents and users can create, modify and remove.
-
-        // A value in the store is a Todos list when it is an object (possibly
-        // empty) whose keys are valid ids and whose values are each a todo leaf
-        // or a parallel group (array). This distinguishes a single Todos list
-        // from a map of list-id -> list (where the values are themselves lists).
-        static bool is_list_object(const nlohmann::json &v)
-        {
-            if (!v.is_object())
-                return false;
-            for (auto it = v.begin(); it != v.end(); ++it)
-            {
-                if (!valid_id(it.key()))
-                    return false;
-                if (!leaf(it.value()) && !it.value().is_array())
-                    return false;
-            }
-            return true;
-        }
-
-        // Indent every line of `in` by `pad` spaces (used to nest lists under
-        // their id in the all-lists view).
-        static std::string indent(const std::string &in, size_t pad)
-        {
-            if (pad == 0)
-                return in;
-            std::string padstr(pad, ' ');
-            std::string out;
-            out.reserve(in.size() + padstr.size() * 2);
-            size_t pos = 0, nl;
-            while ((nl = in.find('\n', pos)) != std::string::npos)
-            {
-                out += padstr;
-                out += in.substr(pos, nl - pos + 1);
-                pos = nl + 1;
-            }
-            if (pos < in.size())
-            {
-                out += padstr;
-                out += in.substr(pos);
-            }
-            return out;
-        }
-
-        // Render a single named list (header + items, indented). Empty lists are
-        // rendered as "(empty)" so a freshly-created list is still visible.
-        static bool render_list(const std::string &list_id, const nlohmann::json &list, std::string &out)
-        {
-            if (!list.is_object())
-                return false;
-            std::string body;
-            if (list.empty())
-                body = "(empty)";
-            else
-                render(list, body);
-            out = std::format("## {} ({})\n{}", list_id, list.size(), indent(body, 2));
-            return true;
-        }
-
-        // Render every list in the store, one section per list.
-        static void render_all(const nlohmann::json &store, std::string &out)
-        {
-            if (!store.is_object() || store.empty())
-            {
-                out = "(no Todos)";
-                return;
-            }
-            std::vector<std::string> ids;
-            for (auto it = store.begin(); it != store.end(); ++it)
-                if (is_list_object(it.value()))
-                    ids.push_back(it.key());
-            std::sort(ids.begin(), ids.end());
-            out.clear();
-            for (const auto &id : ids)
-            {
-                std::string section;
-                if (render_list(id, store[id], section))
-                {
-                    if (!out.empty())
-                        out += "\n";
-                    out += section;
-                }
-            }
-            if (out.empty())
-                out = "(no Todos)";
-        }
-
-        // Normalize a whole store (map of list-id -> list) so every value is a
-        // valid normalized list.
-        static nlohmann::json normalize_all(const nlohmann::json &store)
-        {
-            nlohmann::json out = nlohmann::json::object();
-            if (!store.is_object())
-                return out;
-            for (auto it = store.begin(); it != store.end(); ++it)
-            {
-                if (!valid_id(it.key()))
-                    continue;
-                if (is_list_object(it.value()))
-                    out[it.key()] = normalize(it.value());
-            }
-            return out;
-        }
-
-        // Build a registry of existing list ids (for uniqueness checks).
-        static std::vector<std::string> list_ids(const nlohmann::json &store)
-        {
-            std::vector<std::string> ids;
-            if (store.is_object())
-                for (auto it = store.begin(); it != store.end(); ++it)
-                    if (is_list_object(it.value()))
-                        ids.push_back(it.key());
-            return ids;
-        }
-
-        // Coerce legacy or malformed stores into the canonical multi-list shape
-        // {"list-id": <todos list>}. A value that is itself a single Todos list
-        // (object of todo-N leaves / parallel groups) is wrapped under "my-list";
-        // anything else (empty, array, scalar) becomes an empty store. This keeps
-        // existing sessions (which stored a bare list) working unmodified.
-        static nlohmann::json coerce_store(nlohmann::json store)
-        {
-            nlohmann::json out = nlohmann::json::object();
-            if (!store.is_object())
-                return out;
-            // Preserve every value that is itself a valid Todos list (handles a
-            // proper multi-list store and any mixed/garbage store alike).
-            for (auto it = store.begin(); it != store.end(); ++it)
-                if (valid_id(it.key()) && is_list_object(it.value()))
-                    out[it.key()] = normalize(it.value());
-            // A bare legacy single-list store (no recognised list-id keys) gets
-            // wrapped under "my-list" so it is not lost.
-            if (out.empty() && is_list_object(store))
-                out["my-list"] = normalize(store);
-            return out;
-        }
-
-        // Resolve a user/proposed list id against the store. If `proposed` is
-        // non-empty it must be a valid, currently-unused id. If it is empty (or
-        // already taken) a unique id is auto-generated — guaranteeing that the
-        // returned id does not collide with any existing list. This is the
-        // single place where list-id uniqueness is enforced.
-        static std::string resolve_new_list_id(const std::string &proposed, const nlohmann::json &store)
-        {
-            std::unordered_set<std::string> used;
-            for (const auto &id : list_ids(store))
-                used.insert(id);
-            if (!proposed.empty())
-            {
-                if (valid_id(proposed) && !used.count(proposed))
-                    return proposed;
-            }
-            // auto-generate: list-1, list-2, ... (skip anything already used)
-            size_t n = 1;
-            std::string id;
-            do
-            {
-                id = std::format("list-{}", n++);
-            } while (used.count(id));
-            return id;
-        }
-    } // namespace todos
 
 } // namespace cell
 
@@ -6540,16 +6145,6 @@ static void print_help()
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
-    cell::sys::println("  /todo                       show all Todos lists");
-    cell::sys::println("  /todo list                  list all Todos list ids");
-    cell::sys::println("  /todo new XXX               create a new Todos list with id XXX (uniqueness auto-checked)");
-    cell::sys::println("  /todo update XXX:N TEXT     change todo-N text in list XXX");
-    cell::sys::println("  /todo rm XXX:N              remove todo-N from list XXX");
-    cell::sys::println("  /todo add XXX:N TEXT        add a todo after todo-N in list XXX");
-    cell::sys::println("  /todo add XXX TEXT          add a todo to the end of list XXX");
-    cell::sys::println("  /todo sub XXX:N TEXT        make todo-N parallel and add a sub-todo in list XXX");
-    cell::sys::println("  /todo rm-list XXX           remove a whole Todos list XXX");
-    cell::sys::println("  /todo clear                 clear all Todos lists");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
@@ -6757,306 +6352,6 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
                                    std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
-    add("todo", "Create, inspect, edit, and run session Todos lists. The store is a collection of named lists keyed by a todo-id; you may keep several lists at once and switch between them. Actions: get (render all lists; list_id limits to one), clear (drop every list), create (id,todos — id is optional and a unique one is auto-generated if omitted/duplicated), set (todos — replace the whole store; a single list is kept under its first id, or 'my-list' if empty), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), rm_list (list_id — remove a whole list), sub (list_id, todo_id, what), run_parallel (list_id, todo_id). For list_id / todo_id you may use the list/todo id, its 1-based position N, or the keywords 'last'/'first'.", {{"action", str_prop("get | clear | create | set | update | add | rm | rm_list | sub | run_parallel")}, {"id", str_prop("new Todos list id for create; optional — a unique id (e.g. list-N) is auto-generated when omitted or already taken")}, {"todos", {{"type", "object"}, {"description", "a Todos list, or a map of list-id -> list, for create/set"}}}, {"list_id", str_prop("existing Todos list id (todo-id); omit to use the first list, or use 'last'/'first'. Also 'id' is accepted.")}, {"todo_id", str_prop("existing item id, e.g. todo-0, its 1-based position N, or 'last'/'first'")}, {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")}, {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")}, {"what", str_prop("new or updated todo text")}, {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}}, {"action"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
-        {
-            const std::string action = j.value("action", "");
-            // Normalise the underlying store to the canonical multi-list shape
-            // (legacy sessions stored a bare list). Done once per call so the
-            // rest of the handler can assume {"list-id": <todos list>}.
-            *cell::todos::active_todos() = cell::todos::coerce_store(*cell::todos::active_todos());
-            auto get_list = [&](const std::string &id) -> nlohmann::json *
-            {
-                if (!cell::todos::valid_id(id))
-                    return nullptr;
-                auto it = cell::todos::active_todos()->find(id);
-                return it == cell::todos::active_todos()->end() ? nullptr : &*it;
-            };
-            // Resolve a list selector ("last"/"first", a 1-based position N, or
-            // a literal id) to a concrete list id. Returns "" when no list
-            // exists. Lets the agent target a list without memorising its id.
-            auto resolve_list_alias = [&](std::string &list_id) -> bool
-            {
-                auto is_digits = [](const std::string &s)
-                {
-                    return !s.empty() && std::all_of(s.begin(), s.end(),
-                                                     [](unsigned char c) { return std::isdigit(c); });
-                };
-                if (list_id == "last" || list_id == "first" || is_digits(list_id))
-                {
-                    auto ids = cell::todos::list_ids(*cell::todos::active_todos());
-                    std::sort(ids.begin(), ids.end());
-                    if (list_id == "last")
-                        list_id = ids.empty() ? "" : ids.back();
-                    else if (list_id == "first")
-                        list_id = ids.empty() ? "" : ids.front();
-                    else
-                    {
-                        size_t pos = 0;
-                        try { pos = (size_t)std::stoull(list_id); } catch (const std::exception &) { pos = 0; }
-                        list_id = (pos && pos <= ids.size()) ? ids[pos - 1] : "";
-                    }
-                }
-                return !list_id.empty() && cell::todos::valid_id(list_id);
-            };
-            // When the 'run_parallel' action succeeds it records its resolved
-            // (list_id, todo_id) in cell::todos::run_parallel_list() so the
-            // orchestrator (main thread, sequential pass) can launch the
-            // branches. The tool no longer emits a magic sentinel string back
-            // to the model.
-            if (action == "get" || action.empty())
-            {
-                if (j.contains("list_id"))
-                {
-                    std::string lid = j.value("list_id", "");
-                    if (!resolve_list_alias(lid))
-                    {
-                        out = std::format("[todo] unknown list: {}", lid.empty() ? "(none)" : lid);
-                        return false;
-                    }
-                    nlohmann::json *one = get_list(lid);
-                    if (one)
-                        cell::todos::render(*one, out);
-                    else
-                    {
-                        out = std::format("[todo] unknown list: {}", lid);
-                        return false;
-                    }
-                }
-                else
-                    cell::todos::render_all(*cell::todos::active_todos(), out);
-                return true;
-            }
-            if (action == "clear")
-            {
-                *cell::todos::active_todos() = nlohmann::json::object();
-                out = "Todos cleared";
-                return true;
-            }
-            if (action == "create" || action == "set")
-            {
-                if (!j.contains("todos") || !j["todos"].is_object())
-                {
-                    out = "[todo] todos must be an object (a Todos list, or a map of list-id -> list)";
-                    return false;
-                }
-                nlohmann::json store = *cell::todos::active_todos();
-                if (!store.is_object())
-                    store = nlohmann::json::object();
-                std::string created_list_id;
-
-                if (action == "set")
-                {
-                    // Whole-store replacement. Accept either a map of
-                    // list-id -> list, or a single Todos list (preserved under
-                    // its first existing id, or 'my-list' when the store was
-                    // empty).
-                    nlohmann::json next = j["todos"];
-                    std::string single_id = store.empty() ? "my-list" : cell::todos::list_ids(store).front();
-                    store = cell::todos::normalize_all(
-                        cell::todos::is_list_object(next)
-                            ? nlohmann::json::object({{single_id, next}})
-                            : next);
-                }
-                else // create
-                {
-                    // 'todos' is always a single Todos list (the common,
-                    // unambiguous agent path). It is stored under a unique
-                    // list id: the requested 'id' if it is valid and unused,
-                    // otherwise an auto-generated one (list-N).
-                    const std::string raw_id = j.value("id", "");
-                    const std::string id = cell::todos::resolve_new_list_id(raw_id, store);
-                    store[id] = cell::todos::normalize(j["todos"]);
-                    created_list_id = id;
-                }
-                *cell::todos::active_todos() = store;
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                if (action == "create" && !created_list_id.empty())
-                    out += std::format("\n[created list: {}]", created_list_id);
-                return true;
-            }
-            // resolve the target list: a literal id, "last"/"first", a 1-based
-            // position N, or (when omitted) the first list — so the agent never
-            // has to memorise the todo-id.
-            std::string list_id = j.value("list_id", j.value("id", ""));
-            if (list_id.empty())
-            {
-                auto ids = cell::todos::list_ids(*cell::todos::active_todos());
-                list_id = ids.empty() ? "" : ids.front();
-            }
-            else if (!resolve_list_alias(list_id))
-                list_id = "";
-            nlohmann::json *list = get_list(list_id);
-            if (!list)
-            {
-                out = std::format("[todo] unknown list: {}", list_id.empty() ? "(none)" : list_id);
-                return false;
-            }
-            auto resolve_todo = [&](const std::string &raw) -> std::string
-            {
-                if (raw == "last" || raw == "first")
-                {
-                    // positional keyword: pick the last/first todo in the list
-                    std::vector<std::string> k;
-                    for (auto it = list->begin(); it != list->end(); ++it)
-                        k.push_back(it.key());
-                    std::sort(k.begin(), k.end(), [](const std::string &a, const std::string &b)
-                              {
-                                  auto num = [](const std::string &s, size_t &v)
-                                  {
-                                      size_t p = 0;
-                                      while (p < s.size() && std::isdigit((unsigned char)s[p]))
-                                          ++p;
-                                      if (p == 0)
-                                          return false;
-                                      v = (size_t)std::stoull(s.substr(0, p));
-                                      return true;
-                                  };
-                                  size_t an = 0, bn = 0;
-                                  bool a_num = a.starts_with("todo-") && num(a.substr(5), an);
-                                  bool b_num = b.starts_with("todo-") && num(b.substr(5), bn);
-                                  if (a_num && b_num && an != bn)
-                                      return an < bn;
-                                  return a < b;
-                              });
-                    if (k.empty())
-                        return "";
-                    return (raw == "first") ? k.front() : k.back();
-                }
-                if (list->contains(raw))
-                    return raw;
-                size_t n = 0;
-                try
-                {
-                    n = (size_t)std::stoull(raw);
-                }
-                catch (const std::exception &)
-                {
-                }
-                return n ? cell::todos::key_at(*list, n) : "";
-            };
-            if (action == "rm_list")
-            {
-                std::string target = j.value("list_id", j.value("id", ""));
-                if (!target.empty() && !resolve_list_alias(target))
-                    target = "";
-                if (!cell::todos::valid_id(target) || !cell::todos::active_todos()->erase(target))
-                {
-                    out = std::format("[todo] unknown list: {}", target.empty() ? "(none)" : target);
-                    return false;
-                }
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                out = std::format("removed list: {}\n{}", target, out);
-                return true;
-            }
-            if (action == "update")
-            {
-                std::string todo_id = resolve_todo(j.value("todo_id", ""));
-                const std::string sub_id = j.value("sub_id", "");
-                nlohmann::json *item = cell::todos::find_leaf(*list, todo_id, sub_id);
-                if (!item)
-                {
-                    out = std::format("[todo] unknown todo: {}{}", todo_id, sub_id.empty() ? "" : ":" + sub_id);
-                    return false;
-                }
-                if (j.contains("what") && j["what"].is_string())
-                    (*item)["What"] = j["what"].get<std::string>();
-                if (j.contains("done") && j["done"].is_boolean())
-                    (*item)["done"] = j["done"].get<bool>();
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                return true;
-            }
-            if (action == "add")
-            {
-                if (!j.contains("what") || !j["what"].is_string())
-                {
-                    out = "[todo] add requires what";
-                    return false;
-                }
-                nlohmann::json new_list = nlohmann::json::object();
-                std::string after_key = resolve_todo(j.value("after_id", ""));
-                bool inserted = false;
-                for (auto it = list->begin(); it != list->end(); ++it)
-                {
-                    new_list[it.key()] = *it;
-                    if (it.key() == after_key)
-                    {
-                        new_list[cell::todos::next_key(*list, "todo-")] = cell::todos::make_leaf(j["what"].get<std::string>());
-                        inserted = true;
-                    }
-                }
-                if (!inserted)
-                    new_list[cell::todos::next_key(*list, "todo-")] = cell::todos::make_leaf(j["what"].get<std::string>());
-                *list = std::move(new_list);
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                return true;
-            }
-            if (action == "rm")
-            {
-                std::string todo_id = resolve_todo(j.value("todo_id", ""));
-                if (!list->erase(todo_id))
-                {
-                    out = std::format("[todo] unknown todo: {}", todo_id);
-                    return false;
-                }
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                return true;
-            }
-            if (action == "sub")
-            {
-                if (!j.contains("what") || !j["what"].is_string())
-                {
-                    out = "[todo] sub requires what";
-                    return false;
-                }
-                std::string todo_id = resolve_todo(j.value("todo_id", ""));
-                auto it = list->find(todo_id);
-                if (it == list->end())
-                {
-                    out = std::format("[todo] unknown todo: {}", todo_id);
-                    return false;
-                }
-                if (cell::todos::leaf(it.value()))
-                {
-                    std::string parent_what = it.value()["What"].get<std::string>();
-                    nlohmann::json group = nlohmann::json::array({
-                        {{"id", "sub-0"}, {"What", parent_what}, {"done", it.value()["done"].get<bool>()}},
-                    });
-                    group.push_back({{"id", "sub-1"}, {"What", j["what"].get<std::string>()}, {"done", false}});
-                    it.value() = std::move(group);
-                }
-                else if (it.value().is_array())
-                {
-                    it.value().push_back({{"id", cell::todos::next_key(it.value(), "sub-")},
-                                          {"What", j["what"].get<std::string>()},
-                                          {"done", false}});
-                }
-                else
-                {
-                    out = "[todo] invalid todo item";
-                    return false;
-                }
-                cell::todos::render_all(*cell::todos::active_todos(), out);
-                return true;
-            }
-            if (action == "run_parallel")
-            {
-                std::string todo_id = resolve_todo(j.value("todo_id", ""));
-                auto it = list->find(todo_id);
-                if (it == list->end() || !it->is_array() || it->empty())
-                {
-                    out = std::format("[todo] no parallel sub-todos in {}", todo_id.empty() ? "(missing)" : todo_id);
-                    return false;
-                }
-                // Validate the resolved targets up front. Real execution is
-                // deferred to the orchestrator (main thread, after this tool
-                // call returns) so it runs sequentially and owned by the agent
-                // loop rather than a worker-pool thread.
-                cell::todos::run_parallel_list() = nlohmann::json::array({{list_id, todo_id}});
-                out = std::format("parallel group {} has {} sub-todo(s); launching.", todo_id, it->size());
-                return true;
-            }
-            out = std::format("[todo] unknown action: {}", action);
-            return false; }, Phase::Deferred);
     return {list, defs};
 }
 
@@ -7396,13 +6691,13 @@ static int run_selftest()
     }
 
     {
-        // tool registry: exactly the 6 redesigned tools with correct policies
+        // tool registry: exactly the 7 redesigned tools with correct policies
         auto [tool_list, tool_defs] = build_tools(false);
-        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "find", "todo"};
-        bool all_present = tool_list.size() == 8 && tool_defs.size() == 8;
+        const char *expected[] = {"ls", "read", "write", "edit", "rg", "exec", "find"};
+        bool all_present = tool_list.size() == 7 && tool_defs.size() == 7;
         for (auto n : expected)
             all_present = all_present && tool_list.find(n) != tool_list.end();
-        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find/todo");
+        expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find");
         expect(tool_list["read"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["rg"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["find"]->policy() == cell::tools::Policy::Allow &&
@@ -7413,91 +6708,19 @@ static int run_selftest()
                    tool_list["exec"]->policy() == cell::tools::Policy::Ask,
                "mutating tool policies: write/edit Allow, exec Ask");
         // Phase is orthogonal to Policy: read-only tools are Concurrent (pass 1,
-        // parallel worker pool); todo/write/edit are Deferred (pass 2, sequential).
+        // parallel worker pool); write/edit are Deferred (pass 2, sequential).
         expect(tool_list["ls"]->schedule() == cell::tools::Phase::Concurrent &&
                    tool_list["read"]->schedule() == cell::tools::Phase::Concurrent &&
                    tool_list["rg"]->schedule() == cell::tools::Phase::Concurrent &&
                    tool_list["find"]->schedule() == cell::tools::Phase::Concurrent,
                "read-only tools are Concurrent phase");
         expect(tool_list["write"]->schedule() == cell::tools::Phase::Deferred &&
-                   tool_list["edit"]->schedule() == cell::tools::Phase::Deferred &&
-                   tool_list["todo"]->schedule() == cell::tools::Phase::Deferred,
-               "write/edit/todo are Deferred phase");
+                   tool_list["edit"]->schedule() == cell::tools::Phase::Deferred,
+               "write/edit are Deferred phase");
         for (auto &d : tool_defs)
             expect(d.contains("name") ? d.contains("description")
                                       : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
                    "tool schema carries name+description");
-    }
-
-    {
-        // Todos helpers: schema, stable ordering, branch sub-todos and report merge
-        nlohmann::json list = nlohmann::json::object();
-        list["todo-0"] = {{"What", "first"}, {"done", true}};
-        list["todo-10"] = {{"What", "eleventh"}, {"done", false}};
-        list["todo-2"] = nlohmann::json::array({
-            {{"id", "sub-0"}, {"What", "a"}, {"done", false}},
-            {{"id", "sub-1"}, {"What", "b"}, {"done", true}},
-        });
-        expect(cell::todos::valid_list(list), "valid todo list accepted");
-        expect(cell::todos::key_at(list, 2) == "todo-2", "todo ordering is numeric");
-        expect(cell::todos::key_at(list, 3) == "todo-10", "todo ordering handles multi-digit keys");
-        nlohmann::json normalized = cell::todos::normalize(list);
-        expect(normalized.contains("todo-0") && normalized["todo-0"]["done"].get<bool>(), "todo normalize keeps leaves");
-        expect(normalized["todo-2"].is_array() && normalized["todo-2"][1]["id"] == "sub-1", "todo normalize keeps sub-todos");
-        expect(cell::todos::find_leaf(list, "todo-2", "sub-0") != nullptr, "todo finds sub-todo by id");
-        std::string report = cell::todos::merge_report("todo-2", {{"sub-0", "A"}, {"sub-1", "B"}});
-        expect(report == "# Parallel todo-2 Summary\n## sub-0\nA\n## sub-1\nB\n", "todo report merge is deterministic");
-    }
-
-    {
-        // Multi-list helpers: coercion, unique-id generation, rendering of a
-        // collection of named lists, and the /todo new + rm_list round-trip.
-        nlohmann::json legacy = nlohmann::json::object({
-            {"todo-0", {{"What", "a"}, {"done", false}}},
-            {"todo-1", {{"What", "b"}, {"done", true}}},
-        });
-        nlohmann::json coerced = cell::todos::coerce_store(legacy);
-        expect(coerced.contains("my-list"), "coerce_store wraps a legacy bare list under my-list");
-        expect(coerced["my-list"].is_object() && coerced["my-list"].size() == 2, "coerce_store keeps legacy items");
-
-        nlohmann::json store = nlohmann::json::object();
-        std::string id1 = cell::todos::resolve_new_list_id("my-list", store);
-        expect(id1 == "my-list", "resolve_new_list_id accepts a free id");
-        store[id1] = nlohmann::json::object();
-        std::string id2 = cell::todos::resolve_new_list_id("my-list", store);
-        expect(id2 != "my-list" && cell::todos::valid_id(id2), "resolve_new_list_id renames a colliding id");
-        std::string id3 = cell::todos::resolve_new_list_id("", store);
-        expect(id3 != "my-list" && cell::todos::valid_id(id3), "resolve_new_list_id auto-generates when empty");
-        std::string id4 = cell::todos::resolve_new_list_id("bad id!", store);
-        expect(cell::todos::valid_id(id4) && id4 != "bad id!", "resolve_new_list_id fixes an invalid id");
-
-        nlohmann::json multi = nlohmann::json::object({
-            {"plan", nlohmann::json::object({
-                        {"todo-0", {{"What", "one"}, {"done", false}}},
-                        {"todo-1", {{"What", "two"}, {"done", true}}},
-                    })},
-            {"research", nlohmann::json::object({
-                             {"todo-0", {{"What", "read"}, {"done", false}}},
-                         })},
-        });
-        expect(cell::todos::list_ids(multi).size() == 2, "list_ids enumerates every list");
-        std::string all;
-        cell::todos::render_all(multi, all);
-        expect(all.find("## plan (2)") != std::string::npos, "render_all prints a list header with count");
-        expect(all.find("## research (1)") != std::string::npos, "render_all prints every list");
-        expect(all.find("one") != std::string::npos && all.find("read") != std::string::npos, "render_all prints items from every list");
-        // is_list_object accepts a single list (one leaf); an empty object is an
-        // (empty) list; a value that is neither leaf nor group is rejected.
-        expect(cell::todos::is_list_object(nlohmann::json::object({{"todo-0", {{"What", "x"}, {"done", false}}}})), "a one-item list is a list");
-        expect(cell::todos::is_list_object(nlohmann::json::object()), "an empty object is an (empty) list");
-        expect(!cell::todos::is_list_object(nlohmann::json::object({{"weird", 42}})), "a non-leaf, non-group value is not a list");
-        // coerce_store keeps an already-multi-list store intact
-        nlohmann::json multi2 = nlohmann::json::object({
-            {"plan", nlohmann::json::object({{"todo-0", {{"What", "x"}, {"done", false}}}})},
-            {"research", nlohmann::json::object({{"todo-0", {{"What", "y"}, {"done", false}}}})},
-        });
-        nlohmann::json coerced2 = cell::todos::coerce_store(multi2);
-        expect(coerced2.contains("plan") && coerced2.contains("research"), "coerce_store preserves a multi-list store");
     }
 
     {
@@ -8268,21 +7491,6 @@ int main(int argc, char const *argv[])
     const nlohmann::json &tool_defs_openai = tools_o.second;
     const nlohmann::json &tool_defs_anthropic = tools_a.second;
     const nlohmann::json &tool_defs_responses = tools_r.second;
-    auto tool_defs_openai_no_todo = tools_o.second;
-    auto tool_defs_anthropic_no_todo = tools_a.second;
-    auto tool_defs_responses_no_todo = tools_r.second;
-    for (auto *defs : {&tool_defs_openai_no_todo, &tool_defs_anthropic_no_todo, &tool_defs_responses_no_todo})
-        for (size_t i = 0; i < defs->size();)
-        {
-            auto &d = (*defs)[i];
-            const std::string name = d.contains("function") ? d["function"].value("name", "")
-                                                            : d.value("name", "");
-            if (name == "todo")
-                defs->erase(i);
-            else
-                ++i;
-        }
-    const bool tools_were_enabled = cfg.tools;
 
     // unified request dispatch: picks the right client + tool schema for any provider entry
     auto do_chat = [&](const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
@@ -8293,10 +7501,9 @@ int main(int argc, char const *argv[])
                        cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
     {
         nlohmann::json no_tools = nlohmann::json::array();
-        bool with_todo = !tools_were_enabled || with_tools;
         if (p.api_style == "anthropic")
         {
-            const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_anthropic : tool_defs_anthropic_no_todo) : no_tools;
+            const nlohmann::json &tools = with_tools ? tool_defs_anthropic : no_tools;
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
@@ -8305,7 +7512,7 @@ int main(int argc, char const *argv[])
         }
         if (p.api_style == "openai-responses")
         {
-            const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_responses : tool_defs_responses_no_todo) : no_tools;
+            const nlohmann::json &tools = with_tools ? tool_defs_responses : no_tools;
             auto &client = cache.r(p.base);
             client.set_proxy(p.proxy);
             if (stream)
@@ -8313,7 +7520,7 @@ int main(int argc, char const *argv[])
             return client.chat(key, model, msgs, tools, reply, tc, usage, err);
         }
         // default: openai-chat (Chat Completions)
-        const nlohmann::json &tools = with_tools ? (with_todo ? tool_defs_openai : tool_defs_openai_no_todo) : no_tools;
+        const nlohmann::json &tools = with_tools ? tool_defs_openai : no_tools;
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
@@ -8532,19 +7739,6 @@ int main(int argc, char const *argv[])
     if (!boot_session_id.empty())
         h.use(boot_session_id);
     cell::chat::session *s = &h.now();
-    cell::todos::active_session = s;
-    auto get_todo_list = [&](const std::string &id) -> nlohmann::json *
-    {
-        if (!cell::todos::valid_id(id))
-            return nullptr;
-        auto it = s->todos_state().find(id);
-        return it == s->todos_state().end() ? nullptr : &it.value();
-    };
-    auto set_todo_session = [&](cell::chat::session *next)
-    {
-        s = next;
-        cell::todos::active_session = s;
-    };
     // a resumed session may belong to another cwd: follow it so tools operate there
     if (const std::string &sc = s->cwd_path(); !sc.empty() && !cell::same_path(sc, cell::workdir().string()))
     {
@@ -8713,114 +7907,6 @@ int main(int argc, char const *argv[])
             if (cur)
                 cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
-    };
-
-    // execute a single parallel sub-todo in an isolated message branch. The
-    // branch starts from the injected system context only, so main-session tool
-    // results and later report messages cannot leak into sibling branches.
-    auto run_todo_parallel_branches = [&](const std::string &list_id, const std::string &todo_key,
-                                          std::vector<std::pair<std::string, std::string>> &summaries) -> bool
-    {
-        summaries.clear();
-        auto *root_list = get_todo_list(list_id);
-        if (!root_list)
-            return false;
-        auto root_it = root_list->find(todo_key);
-        if (root_it == root_list->end() || !root_it->is_array() || root_it->empty())
-            return false;
-        nlohmann::json subtasks = root_it.value();
-        const cell::config::provider_entry *p = cfg.current_provider_entry();
-        if (!p || cfg.current_model.empty())
-            return false;
-        cell::encrypt::secure_string key = resolve_key(*p);
-        if (key.empty())
-            return false;
-
-        nlohmann::json branch_system = nlohmann::json::array();
-        for (const auto &m : s->msg())
-        {
-            if (m.value("role", "") != "system")
-                break;
-            branch_system.push_back(m);
-        }
-        std::string todo_snapshot;
-        cell::todos::render(*root_list, todo_snapshot);
-
-        for (const auto &sub : subtasks)
-        {
-            if (!sub.is_object())
-                continue;
-            std::string sub_id = sub.value("id", "");
-            std::string sub_what = sub.value("What", "");
-            std::string prompt = std::format(
-                "Execute the parallel sub-todo {} from the current Todos list.\n"
-                "Parent todo: {}\n"
-                "Sub-todo: {}\n"
-                "Current Todos:\n{}\n\n"
-                "Complete only this sub-todo. When finished, return a concise summary of the result.",
-                sub_id, todo_key, sub_what, todo_snapshot);
-            nlohmann::json msgs = branch_system;
-            msgs.push_back({{"role", "user"}, {"content", prompt}});
-            std::string summary;
-            bool success = true;
-            const size_t branch_round_limit = 16;
-            for (size_t round = 0; round < branch_round_limit; ++round)
-            {
-                nlohmann::json reply, tool_calls, usage;
-                std::string err;
-                ++total_llm_requests;
-                if (!do_chat(*p, key, cfg.current_model, msgs, false, nullptr, nullptr,
-                             reply, tool_calls, usage, err, cfg.tools, cfg.think_level))
-                {
-                    summary = std::format("[branch failed] {}", err.empty() ? "request failed" : err);
-                    success = false;
-                    break;
-                }
-                msgs.push_back(reply);
-                if (tool_calls.empty())
-                {
-                    summary = reply_text(reply);
-                    if (summary.empty())
-                        summary = "[empty summary]";
-                    break;
-                }
-                for (const auto &tc : tool_calls)
-                {
-                    std::string name = tc["function"].value("name", "");
-                    std::string args = tc["function"].value("arguments", "");
-                    std::string output;
-                    auto it = tool_list.find(name);
-                    bool tool_ok = it != tool_list.end() && it->second->execute(args, output);
-                    if (!output.empty())
-                        (void)tool_ok;
-                    else if (tool_ok)
-                        output = "(ok)";
-                    else
-                        output = "[tool failed]";
-                    std::string wrapped = harden_tool_result(name, args, output);
-                    if (p->api_style != "anthropic")
-                        msgs.push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
-                    else
-                        msgs.push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
-                }
-                if (round + 1 == branch_round_limit)
-                {
-                    summary = reply_text(reply);
-                    if (summary.empty())
-                        summary = "[branch stopped: round limit]";
-                    success = false;
-                }
-            }
-            if (success)
-            {
-                nlohmann::json *list_now = get_todo_list(list_id);
-                nlohmann::json *item = list_now ? cell::todos::find_leaf(*list_now, todo_key, sub_id) : nullptr;
-                if (item)
-                    (*item)["done"] = true;
-            }
-            summaries.emplace_back(sub_id, cell::box::sanitize_output(summary));
-        }
-        return !summaries.empty();
     };
 
     // -------- phase: context maintenance — overflow detection and compaction --------
@@ -9118,7 +8204,7 @@ int main(int argc, char const *argv[])
                     s->unload();
                     cell::async_io::flush(); // the old session must survive a crash
                     h.forget_current();
-                    set_todo_session(&h.now());
+                    s = &h.now();
                     ensure_prompt(s);
                     log.info("sess", std::format("new id={} previous={} kept=true", s->id(), old_id));
                     cell::sys::println("new session: {} cwd={}", s->id(), cell::workdir().string());
@@ -9158,278 +8244,6 @@ int main(int argc, char const *argv[])
                     log.info("ins", std::format("interject chars={}", ins_text.size()));
                     // message already added, skip the normal user message addition
                     goto llm_start;
-                }
-                if (cmd == "/todo")
-                {
-                    auto todo_rest = [&](size_t begin)
-                    {
-                        std::string text;
-                        for (size_t i = begin; i < toks.size(); i++)
-                        {
-                            if (i > begin)
-                                text += ' ';
-                            text += toks[i];
-                        }
-                        return text;
-                    };
-                    auto resolve_list_alias = [&](std::string &list_id) -> bool
-                    {
-                        if (list_id == "last" || list_id == "first" ||
-                            (list_id.size() == 1 && std::isdigit((unsigned char)list_id[0])))
-                        {
-                            auto ids = cell::todos::list_ids(s->todos_state());
-                            std::sort(ids.begin(), ids.end());
-                            if (list_id == "last")
-                                list_id = ids.empty() ? "" : ids.back();
-                            else if (list_id == "first")
-                                list_id = ids.empty() ? "" : ids.front();
-                            else
-                            {
-                                size_t pos = 0;
-                                try { pos = (size_t)std::stoull(list_id); } catch (const std::exception &) {}
-                                list_id = (pos && pos <= ids.size()) ? ids[pos - 1] : "";
-                            }
-                        }
-                        return !list_id.empty() && cell::todos::valid_id(list_id);
-                    };
-                    auto parse_target = [&](const std::string &raw, std::string &list_id, std::string &todo_key,
-                                            std::string &sub_id) -> nlohmann::json *
-                    {
-                        const size_t sep = raw.find(':');
-                        list_id = sep == std::string::npos ? raw : raw.substr(0, sep);
-                        std::string item = sep == std::string::npos ? "" : raw.substr(sep + 1);
-                        sub_id.clear();
-                        if (!resolve_list_alias(list_id))
-                            return nullptr;
-                        auto lit = s->todos_state().find(list_id);
-                        if (lit == s->todos_state().end())
-                            return nullptr;
-                        const size_t sub_sep = item.rfind(':');
-                        if (sub_sep != std::string::npos)
-                        {
-                            sub_id = item.substr(sub_sep + 1);
-                            item = item.substr(0, sub_sep);
-                        }
-                        if (item == "last" || item == "first")
-                        {
-                            std::vector<std::string> k;
-                            for (auto it = lit->begin(); it != lit->end(); ++it)
-                                k.push_back(it.key());
-                            std::sort(k.begin(), k.end(), [](const std::string &a, const std::string &b)
-                                      {
-                                          auto num = [](const std::string &s, size_t &v)
-                                          {
-                                              size_t p = 0;
-                                              while (p < s.size() && std::isdigit((unsigned char)s[p])) ++p;
-                                              if (p == 0) return false;
-                                              v = (size_t)std::stoull(s.substr(0, p));
-                                              return true;
-                                          };
-                                          size_t an = 0, bn = 0;
-                                          bool a_num = a.starts_with("todo-") && num(a.substr(5), an);
-                                          bool b_num = b.starts_with("todo-") && num(b.substr(5), bn);
-                                          if (a_num && b_num && an != bn) return an < bn;
-                                          return a < b;
-                                      });
-                            if (!k.empty())
-                                item = (item == "first") ? k.front() : k.back();
-                        }
-                        if (lit->contains(item))
-                            todo_key = item;
-                        else
-                        {
-                            size_t n = 0;
-                            try
-                            {
-                                n = (size_t)std::stoull(item);
-                            }
-                            catch (const std::exception &)
-                            {
-                            }
-                            todo_key = cell::todos::key_at(lit.value(), n);
-                        }
-                        return todo_key.empty() ? nullptr : &lit.value();
-                    };
-                    if (toks.size() >= 2 && toks[1] == "clear")
-                    {
-                        s->todos_state() = nlohmann::json::object();
-                        log.info("todo", "cleared");
-                        cell::sys::println("Todos cleared");
-                        continue;
-                    }
-                    if (toks.size() >= 2 && toks[1] == "list")
-                    {
-                        auto ids = cell::todos::list_ids(s->todos_state());
-                        std::sort(ids.begin(), ids.end());
-                        if (ids.empty())
-                            cell::sys::println("(no Todos lists)");
-                        else
-                            for (const auto &id : ids)
-                                cell::sys::println("  {}", id);
-                        continue;
-                    }
-                    if (toks.size() >= 3 && toks[1] == "new")
-                    {
-                        // create a new (named) Todos list; uniqueness of the id
-                        // is guaranteed by resolve_new_list_id — a collision is
-                        // resolved to a fresh, unused id automatically.
-                        const std::string id = cell::todos::resolve_new_list_id(toks[2], s->todos_state());
-                        s->todos_state()[id] = nlohmann::json::object();
-                        log.info("todo", std::format("new list id={}", id));
-                        std::string state;
-                        cell::todos::render_all(s->todos_state(), state);
-                        cell::sys::println("created list '{}'\n{}", id, state);
-                        continue;
-                    }
-                    if (toks.size() >= 3 && toks[1] == "rm-list")
-                    {
-                        const std::string id = toks[2];
-                        if (!cell::todos::valid_id(id) || !s->todos_state().erase(id))
-                        {
-                            cell::sys::error("unknown todo list: {}", id);
-                            continue;
-                        }
-                        log.info("todo", std::format("removed list id={}", id));
-                        std::string state;
-                        cell::todos::render_all(s->todos_state(), state);
-                        cell::sys::println("removed list '{}'\n{}", id, state);
-                        continue;
-                    }
-                    if (toks.size() >= 4 && toks[1] == "update")
-                    {
-                        std::string list_id, todo_key, sub_id;
-                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
-                        if (!list)
-                        {
-                            cell::sys::error("unknown todo target: {}", toks[2]);
-                            continue;
-                        }
-                        nlohmann::json *item = cell::todos::find_leaf(*list, todo_key, sub_id);
-                        if (!item)
-                        {
-                            cell::sys::error("todo target is not a single todo: {}", toks[2]);
-                            continue;
-                        }
-                        (*item)["What"] = todo_rest(3);
-                        log.info("todo", std::format("updated list={} todo={} sub={}", list_id, todo_key, sub_id));
-                        cell::sys::println("updated {}", toks[2]);
-                        continue;
-                    }
-                    if (toks.size() >= 3 && toks[1] == "add")
-                    {
-                        // /todo add <list-id> <what>          -> append to the end of the list
-                        // /todo add <list-id>:<todo-N> <what>  -> insert after todo-N (legacy form)
-                        const bool has_target = toks[2].find(':') != std::string::npos;
-                        if (!has_target)
-                        {
-                            // Append 'what' directly to the end of the named list.
-                            std::string list_id = toks[2];
-                            if (toks.size() < 4)
-                            {
-                                cell::sys::error("usage: /todo add <list-id> <what>");
-                                continue;
-                            }
-                            if (!resolve_list_alias(list_id))
-                            {
-                                cell::sys::error("unknown todo list: {}", toks[2]);
-                                continue;
-                            }
-                            auto lit = s->todos_state().find(list_id);
-                            if (lit == s->todos_state().end())
-                            {
-                                cell::sys::error("unknown todo list: {}", toks[2]);
-                                continue;
-                            }
-                            (*lit)[cell::todos::next_key(lit.value(), "todo-")] =
-                                cell::todos::make_leaf(todo_rest(3));
-                            log.info("todo", std::format("appended to list={}", list_id));
-                            cell::sys::println("added to {}", list_id);
-                            continue;
-                        }
-                        if (toks.size() < 4)
-                        {
-                            cell::sys::error("usage: /todo add <list-id>:<todo-N> <what>");
-                            continue;
-                        }
-                        std::string list_id, todo_key, sub_id;
-                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
-                        if (!list)
-                        {
-                            cell::sys::error("unknown todo target: {}", toks[2]);
-                            continue;
-                        }
-                        nlohmann::json old = *list;
-                        nlohmann::json new_list = nlohmann::json::object();
-                        bool inserted = false;
-                        for (auto it = old.begin(); it != old.end(); ++it)
-                        {
-                            new_list[it.key()] = it.value();
-                            if (it.key() == todo_key)
-                            {
-                                new_list[cell::todos::next_key(old, "todo-")] = cell::todos::make_leaf(todo_rest(3));
-                                inserted = true;
-                            }
-                        }
-                        if (!inserted)
-                            new_list[cell::todos::next_key(old, "todo-")] = cell::todos::make_leaf(todo_rest(3));
-                        *list = std::move(new_list);
-                        log.info("todo", std::format("added after list={} todo={}", list_id, todo_key));
-                        cell::sys::println("added after {}", toks[2]);
-                        continue;
-                    }
-                    if (toks.size() >= 4 && toks[1] == "rm")
-                    {
-                        std::string list_id, todo_key, sub_id;
-                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
-                        if (!list || !list->erase(todo_key))
-                        {
-                            cell::sys::error("unknown todo target: {}", toks[2]);
-                            continue;
-                        }
-                        log.info("todo", std::format("removed list={} todo={}", list_id, todo_key));
-                        cell::sys::println("removed {}", toks[2]);
-                        continue;
-                    }
-                    if (toks.size() >= 4 && toks[1] == "sub")
-                    {
-                        std::string list_id, todo_key, sub_id;
-                        nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
-                        if (!list)
-                        {
-                            cell::sys::error("unknown todo target: {}", toks[2]);
-                            continue;
-                        }
-                        auto it = list->find(todo_key);
-                        if (it == list->end())
-                        {
-                            cell::sys::error("unknown todo target: {}", toks[2]);
-                            continue;
-                        }
-                        if (cell::todos::leaf(it.value()))
-                        {
-                            nlohmann::json group = nlohmann::json::array({
-                                {{"id", "sub-0"}, {"What", it.value()["What"].get<std::string>()}, {"done", it.value()["done"].get<bool>()}},
-                            });
-                            group.push_back({{"id", "sub-1"}, {"What", todo_rest(3)}, {"done", false}});
-                            it.value() = std::move(group);
-                        }
-                        else if (it.value().is_array())
-                            it.value().push_back({{"id", cell::todos::next_key(it.value(), "sub-")},
-                                                  {"What", todo_rest(3)},
-                                                  {"done", false}});
-                        else
-                        {
-                            cell::sys::error("invalid todo target: {}", toks[2]);
-                            continue;
-                        }
-                        log.info("todo", std::format("sub added list={} todo={}", list_id, todo_key));
-                        cell::sys::println("sub added to {}", toks[2]);
-                        continue;
-                    }
-                    std::string state;
-                    cell::todos::render_all(s->todos_state(), state);
-                    cell::sys::println("{}", state);
-                    continue;
                 }
                 if (cmd == "/provides")
                 {
@@ -10061,7 +8875,7 @@ int main(int argc, char const *argv[])
                         if (target == s->id())
                         {
                             h.forget_current();
-                            set_todo_session(&h.now());
+                            s = &h.now();
                             ensure_prompt(s);
                             cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, s->id(), cell::workdir().string());
                         }
@@ -10100,7 +8914,7 @@ int main(int argc, char const *argv[])
                             cell::sys::println("cwd -> {}", cell::workdir().string());
                     }
                     h.use(target);
-                    set_todo_session(&h.now());
+                    s = &h.now();
                     ensure_prompt(s);
                     log.info("sess", std::format("switched to={} msgs={} previous={}", target, s->msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
                     cell::sys::println("switched to session {} cwd={} ({} message(s))", s->id(), cell::workdir().string(), s->msg().size());
@@ -10506,10 +9320,7 @@ int main(int argc, char const *argv[])
                     turn_tool_calls += (long long)tool_calls.size();
                     // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
                     // run concurrently on the shared worker pool (max_threads); Deferred
-                    // Phase tools (Policy::Allow: write/edit/todo) are queued for pass 2.
-                    // Start each tool-processing round with a clean parallel-trigger
-                    // slot; only a todo tool call in THIS round may populate it.
-                    cell::todos::run_parallel_list() = nlohmann::json::array();
+                    // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
                     size_t allow_count = 0;
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
@@ -10528,11 +9339,10 @@ int main(int argc, char const *argv[])
                         }
                         else if (it->second->policy() == cell::tools::Policy::Allow)
                         {
-                            // Allow tools scheduled as Phase::Deferred (write/edit/
-                            // todo) run sequentially in pass 2: every read in the
-                            // same message must finish first (read-before-edit rule)
-                            // and the todo store / run_parallel trigger must never be
-                            // mutated from a worker-pool thread. Concurrent Allow
+                            // Allow tools scheduled as Phase::Deferred (write/edit)
+                            // run sequentially in pass 2: every read in the
+                            // same message must finish first (read-before-edit rule).
+                            // Concurrent Allow
                             // tools (read-only) run on the shared worker pool now.
                             if (it->second->schedule() == cell::tools::Phase::Deferred)
                             {
@@ -10581,7 +9391,7 @@ int main(int argc, char const *argv[])
                     }
                     if (allow_count)
                         cell::sys::pool().wait_all();
-                    // pass 2: Phase::Deferred tools (write/edit/todo — no prompt) and
+                    // pass 2: Phase::Deferred tools (write/edit — no prompt) and
                     // confirm-required tools (exec) run sequentially, in order
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
@@ -10677,37 +9487,6 @@ int main(int argc, char const *argv[])
                     {
                         done = true;
                         natural_end = false; // user decline / autoallow deny aborts the turn
-                    }
-                    // after the tool results are stored, run any requested
-                    // parallel group. The todo tool set cell::todos::run_parallel_list()
-                    // to the resolved (list_id, todo_id) pair; we consume it here
-                    // on the main thread (this is the sequential pass), so the
-                    // branches never run on a worker-pool thread and the resolved
-                    // ids are already validated by the tool handler.
-                    if (!approval_refused)
-                    {
-                        nlohmann::json &pending = cell::todos::run_parallel_list();
-                        for (auto &pr : pending)
-                        {
-                            if (!pr.is_array() || pr.size() < 2 || !pr[0].is_string() || !pr[1].is_string())
-                                continue;
-                            const std::string &list_id = pr[0].get<std::string>();
-                            const std::string &todo_key = pr[1].get<std::string>();
-                            std::vector<std::pair<std::string, std::string>> branch_summaries;
-                            cell::sys::println("todo: running parallel group {}", todo_key);
-                            if (run_todo_parallel_branches(list_id, todo_key, branch_summaries))
-                            {
-                                std::string report = cell::todos::merge_report(todo_key, branch_summaries);
-                                s->msg().push_back({{"role", "system"}, {"content", std::format("Report:\n{}", report)}});
-                                log.info("todo", std::format("parallel report list={} todo={} branches={} chars={}", list_id, todo_key, branch_summaries.size(), report.size()));
-                            }
-                            else
-                            {
-                                cell::sys::warn("[todo] parallel group did not produce summaries: {}", todo_key);
-                                log.warn("todo", std::format("parallel failed list={} todo={}", list_id, todo_key));
-                            }
-                        }
-                        pending = nlohmann::json::array();
                     }
                     continue;
                 }

@@ -104,7 +104,7 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 | --- | --- | --- |
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
-| 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `todo` | `cell::box`, `cell::tools` |
+| 🔧 | **7 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` | `cell::box`, `cell::tools` |
 | 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
@@ -247,16 +247,6 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
 | `/skills` | List available skills |
 | `/skill NAME` | Inject a skill body into the current session as a system message |
-| `/todo` | Show all Todos lists |
-| `/todo list` | List all Todos list ids |
-| `/todo new XXX` | Create a new Todos list with id `XXX` (uniqueness auto-checked) |
-| `/todo update XXX:N TEXT` | Change the text of `todo-N` in list `XXX` |
-| `/todo rm XXX:N` | Remove `todo-N` from list `XXX` |
-| `/todo add XXX:N TEXT` | Add a new todo immediately after `todo-N` in list `XXX` |
-| `/todo add XXX TEXT` | Add a new todo directly to the end of list `XXX` |
-| `/todo sub XXX:N TEXT` | Turn `todo-N` into a parallel group (if needed) and append a sub-todo in list `XXX` |
-| `/todo rm-list XXX` | Remove the whole Todos list `XXX` |
-| `/todo clear` | Remove all Todos lists |
 | `/save` | Persist the current session now (flushes the async writer) |
 | `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
 | `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
@@ -316,7 +306,7 @@ toward usage.
 
 ## Tools
 
-Eight tools are registered, with schemas emitted for the active API style
+Seven tools are registered, with schemas emitted for the active API style
 (`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic, and
 `{"type":"function","name":…,"parameters":…}` for the Responses API).
 
@@ -329,18 +319,16 @@ Eight tools are registered, with schemas emitted for the active API style
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget; nested/alternation-quantifier regexes and patterns over 200 chars are rejected |
 | `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata. When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Combine with metadata filters to narrow results. Returns `path  size bytes  mtime (UTC)` per match |
-| `todo` | Allow | `action`, `id`, `todos`, `list_id`, `todo_id`, `sub_id`, `after_id`, `what`, `done` | Session-persisted Todos CRUD and inspection over a collection of named lists. Actions: `get`, `clear`, `create`, `set`, `update`, `add`, `rm`, `rm_list`, `sub`, `run_parallel`. `create` takes an optional `id` and auto-generates a unique one when omitted or duplicated; `list_id`/`todo_id` accept the id, its 1-based position `N`, or the keywords `last`/`first`. Numeric `N` targets select a stable display position; sub-todos are addressed by `sub_id`. `run_parallel` executes each sub-todo in an isolated message branch and injects a merged system report |
 
 The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
 `larger_than_bytes` metadata filters.
 
 **Execution scheduling.** Within one assistant turn, all `Policy::Allow` read-only calls
-(`ls`/`read`/`rg`/`find`/`todo`) are dispatched **concurrently** on the shared worker pool; `write`
+(`ls`/`read`/`rg`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
 and `edit` are deliberately deferred to a second, **sequential** pass so that same-message reads
 always complete first (read-before-edit) and two edits of one file never race; `exec` runs
 sequentially after an interactive confirmation. Results are appended to the transcript in the
-original `tool_call` order. (`todo` runs in pass 1; its `run_parallel` action reports work to be
-fanned out, which the loop then executes in its own sequential branch phase.)
+original `tool_call` order.
 
 **Read-before-edit rule.** Paths are canonicalized (`weakly_canonical`, lowercased on Windows) and
 the line ranges returned by read tools are logged. `edit` refuses to touch any line not covered by a
@@ -349,32 +337,6 @@ previously read range, and the log is cleared whenever the visible context chang
 
 **File cache.** `edit` reads through a `(size, mtime)`-validated cache keyed by canonical path, so
 consecutive edits of one file skip the disk while an external writer is always picked up.
-
-**Todos.** Todos are stored in the session JSON and survive reloads. The store is a collection of
-named lists keyed by a `todo-id`; each list is an object keyed by `todo-N`, and a value is either
-`{"What":"...","done":false}` or an array of parallel sub-todos:
-
-```json
-{
-  "my-list": {
-    "todo-0": {"What": "first", "done": true},
-    "todo-1": [
-      {"id": "sub-0", "What": "branch one", "done": false},
-      {"id": "sub-1", "What": "branch two", "done": false}
-    ]
-  }
-}
-```
-
-You can keep several lists at once (e.g. `my-list`, `research`) and switch between them by `list_id`.
-`create` accepts an optional `id`; if it is omitted or already taken, a unique id (e.g. `list-1`) is
-generated automatically so the agent never has to invent or deduplicate ids by hand. `list_id` and
-`todo_id` also accept a 1-based position `N` or the keywords `last`/`first`.
-
-`run_parallel` starts each sub-todo from the session's system context in its own message branch,
-runs tool-enabled branches, stores each final response as the sub-todo summary, and injects the
-merged report into the main context as a system message. The current implementation runs branches
-sequentially to preserve interactive tool confirmation ordering.
 
 ## Security model
 
@@ -594,7 +556,6 @@ cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResp
 cell::chat       session (per-cwd persistence) and history (in-memory session map)
 cell::skills     front-matter parser, recursive scanner, metadata prompt
 cell::stats      usage counters in .cell/usages.json
-cell::todos      session-persisted Todos (schema validation, ordering, rendering)
 ```
 
 ## The agent loop
@@ -662,8 +623,7 @@ sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-ac
 punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
 read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
 `rg`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
-the tool registry and its policies, todo list normalization/ordering/sub-todos/report merging,
-16-way concurrent read-only tool calls, incremental SSE parsing
+the tool registry and its policies, 16-way concurrent read-only tool calls, incremental SSE parsing
 and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
 semantics, the cwd index, load-time re-sanitization of exec results, skill discovery (including
