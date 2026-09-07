@@ -2402,11 +2402,29 @@ namespace cell
             file_cache().erase(read_log_key(path));
         }
         // -------- read / write / edit --------
-        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false, size_t offset = 0, size_t limit = 0)
+        // optional 'reason' out-param receives a human-readable failure reason
+        bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false, size_t offset = 0, size_t limit = 0, std::string *reason = nullptr)
         {
+            auto fail = [&](std::string msg) -> bool
+            {
+                if (reason)
+                    *reason = std::move(msg);
+                return false;
+            };
+            // directory check up front: on POSIX ifstream can open a directory
+            // successfully and only fail at read time, so this cannot wait for
+            // the open-failure branch
+            std::error_code isdir_ec;
+            if (std::filesystem::is_directory(path, isdir_ec))
+                return fail(std::format("{} is a directory, not a file. Use the ls tool to list its entries, or append a file name to the path.", std::string(path)));
             std::ifstream file(std::filesystem::path(path), std::ios::binary);
             if (!file.is_open())
-                return false;
+            {
+                std::error_code ec;
+                if (!std::filesystem::exists(path, ec))
+                    return fail(std::format("{} does not exist. Check the path for typos (it is resolved relative to the working directory).", std::string(path)));
+                return fail(std::format("{} could not be opened (permission denied or locked by another process).", std::string(path)));
+            }
             // offset/limit mode: convert to start_line/end_line semantics
             if (offset > 0 || limit > 0)
             {
@@ -2430,14 +2448,14 @@ namespace cell
                         if ((buf[i] & 0xC0) != 0x80) // not a UTF-8 continuation byte
                             chars++;
                     if (chars > kMaxChars)
-                        return false;
+                        return fail(std::format("{} is too large: over the 128M character read cap. Use offset/limit to read it in segments.", std::string(path)));
                     content.append(buf, n);
                 }
                 if (!file.eof())
-                    return false;
+                    return fail(std::format("{} could not be read (I/O error mid-read).", std::string(path)));
                 // Binary file detection: reject files containing NUL bytes
                 if (content.find('\0') != std::string::npos)
-                    return false;
+                    return fail(std::format("{} looks like a binary file (contains NUL bytes); only text files can be read.", std::string(path)));
                 // Normalize CRLF to LF in place on all platforms (write may
                 // produce CRLF on Windows): single pass, no second buffer
                 {
@@ -2497,7 +2515,7 @@ namespace cell
                     carry.append(buf, seg, n - seg);
             }
             if (!stop && !file.eof())
-                return false;   // I/O error mid-read
+                return fail(std::format("{} could not be read (I/O error mid-read).", std::string(path))); // I/O error mid-read
             if (!carry.empty()) // trailing line without '\n'
             {
                 nline++;
@@ -2543,7 +2561,10 @@ namespace cell
             auto size = std::filesystem::file_size(path, ec);
             if (ec)
             {
-                err = "file does not exist or is unreadable";
+                if (std::filesystem::is_directory(path, ec))
+                    err = std::format("{} is a directory, not a file.", std::string(path));
+                else
+                    err = std::format("{} does not exist (or is unreadable). Check the path for typos; create the file first with the write tool.", std::string(path));
                 return false;
             }
             std::string key = read_log_key(path);
@@ -2557,9 +2578,10 @@ namespace cell
                 }
             }
             std::string fresh;
-            if (!read(path, fresh)) // whole-file mode, same 128M-char cap as read
+            std::string read_err;
+            if (!read(path, fresh, 0, 0, false, 0, 0, &read_err)) // whole-file mode, same 128M-char cap as read
             {
-                err = "file is too large (over 128M chars) or unreadable";
+                err = read_err.empty() ? std::format("{} is too large (over 128M chars) or unreadable.", std::string(path)) : read_err;
                 return false;
             }
             // re-stat after reading so a writer that raced us cannot seed a
@@ -2604,17 +2626,30 @@ namespace cell
             }
             if (exist(path))
             {
+                std::error_code ec;
+                if (std::filesystem::is_directory(path, ec))
+                {
+                    output = std::format("write refused: {} is a directory, not a file. Write to a file path inside it instead (e.g. {}/filename.txt).", std::string(path), std::string(path));
+                    return false;
+                }
                 output = std::format("write refused: {} already exists. To modify an existing file, use the edit tool with a SEARCH/REPLACE block.", std::string(path));
                 return false;
             }
             std::filesystem::path parent = std::filesystem::path(path).parent_path();
             if (!parent.empty() && !std::filesystem::is_directory(parent))
             {
-                output = std::format("write refused: parent directory does not exist: {}. Create it first with exec: mkdir -p {}", parent.string(), parent.string());
+                std::error_code ec;
+                if (std::filesystem::exists(parent, ec))
+                    output = std::format("write refused: parent path {} is a file, not a directory.", parent.string());
+                else
+                    output = std::format("write refused: parent directory does not exist: {}. Create it first with exec: mkdir -p {}", parent.string(), parent.string());
                 return false;
             }
             if (!write(path, input))
+            {
+                output = std::format("write failed: {} could not be written (permission denied, disk full, or locked by another process).", std::string(path));
                 return false;
+            }
             // seed the edit cache so a follow-up edit skips re-reading the disk
             std::error_code ec;
             auto mtime = std::filesystem::last_write_time(path, ec);
@@ -2667,7 +2702,7 @@ namespace cell
             std::string buf, err;
             if (!load_file(path, buf, err))
             {
-                output = std::format("edit failed: {} ({}).", err, std::string(path));
+                output = std::format("edit failed: {} (path: {})", err, std::string(path));
                 return false;
             }
             std::string m;
@@ -2807,7 +2842,7 @@ namespace cell
                 buf += content;
                 if (!store_file(path, std::move(buf), file_key))
                 {
-                    output = "edit failed: could not write the file.";
+                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
                     return false;
                 }
                 output = std::format("edit ok: appended {} chars at end of file", (long long)content.size());
@@ -2841,7 +2876,7 @@ namespace cell
                 buf.replace(at, search.size(), content);
                 if (!store_file(path, std::move(buf), file_key))
                 {
-                    output = "edit failed: could not write the file.";
+                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
                     return false;
                 }
                 output = std::format("edit ok: replaced 1 block ({} chars -> {} chars)", (long long)search.size(), (long long)content.size());
@@ -2876,7 +2911,7 @@ namespace cell
                 buf.insert(ins, content);
                 if (!store_file(path, std::move(buf), file_key))
                 {
-                    output = "edit failed: could not write the file.";
+                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
                     return false;
                 }
                 output = std::format("edit ok: inserted {} chars after line {}", (long long)content.size(), anchor_line);
@@ -2910,7 +2945,7 @@ namespace cell
             buf.erase(del_begin, del_end - del_begin);
             if (!store_file(path, std::move(buf), file_key))
             {
-                output = "edit failed: could not write the file.";
+                output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
                 return false;
             }
             output = std::format("edit ok: deleted {} chars (lines {}-{})", (long long)(del_end - del_begin), first_line, last_line);
@@ -6407,8 +6442,13 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            if (!cell::box::read(j.value("path", ""), out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0)))
+            std::string err;
+            if (!cell::box::read(j.value("path", ""), out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0), &err))
+            {
+                out = err.empty() ? std::format("read failed: {} could not be read.", j.value("path", ""))
+                                  : std::format("read failed: {}", err);
                 return false;
+            }
             // Add line numbers like rg tool: format {:>6}: content
             size_t start_line = num_arg(j, "offset", 0) + 1;
             std::string numbered;
@@ -9686,6 +9726,7 @@ int main(int argc, char const *argv[])
             cell::sys::print("reply> ");
 
             bool done = false;
+            bool natural_end = true; // false when the turn aborted early (error, cancel, refusal)
             int rounds = 0;
             long long turn_tool_calls = 0;
             long long turn_thinking_entries = 0;
@@ -9697,6 +9738,7 @@ int main(int argc, char const *argv[])
                 {
                     cell::sys::error("no model configured - add a provider with /provide add openai:URL, then pick a model with /models and /model NAME");
                     done = true;
+                    natural_end = false;
                     break;
                 }
                 cell::encrypt::secure_string key = resolve_key(*p);
@@ -9705,6 +9747,7 @@ int main(int argc, char const *argv[])
                     cell::sys::error("no api key for {}: set the {} env var, or use /provide add {}:URL key:KEY",
                                      p->name, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style);
                     done = true;
+                    natural_end = false;
                     break;
                 }
                 size_t before = s->msg().size();
@@ -9890,6 +9933,7 @@ int main(int argc, char const *argv[])
                         if (reply_text_len(reply) > 0 || !tool_calls.empty())
                             s->msg().push_back(reply);
                         done = true;
+                        natural_end = false;
                         break;
                     }
                     if (ok)
@@ -9921,6 +9965,7 @@ int main(int argc, char const *argv[])
                         cell::sys::println();
                         cell::sys::error("[llm error after {} attempts] {}", kMaxRetries, err.empty() ? "request failed" : err);
                         done = true;
+                        natural_end = false;
                         break;
                     }
                 }
@@ -9981,7 +10026,17 @@ int main(int argc, char const *argv[])
                                                      {
                                 auto t0 = cell::sys::detail::clock::now();
                                 std::string o;
-                                if (it->second->execute(res[i].args, o))
+                                bool ok = false;
+                                try
+                                {
+                                    ok = it->second->execute(res[i].args, o);
+                                }
+                                catch (const std::exception &e)
+                                {
+                                    o = std::format("[tool error: {}]", e.what());
+                                    res[i].status = "exception";
+                                }
+                                if (ok)
                                 {
                                     res[i].output = std::move(o);
                                     res[i].status = "ok";
@@ -9991,6 +10046,8 @@ int main(int argc, char const *argv[])
                                     res[i].blocked = true;
                                     res[i].rejected_for = it->second->rejected_for();
                                     res[i].status = "blocked";
+                                    if (!o.empty())
+                                        res[i].output = std::move(o); // surface the sandbox refusal reason to the model
                                 }
                                 else if (!o.empty())
                                 {
@@ -10014,7 +10071,17 @@ int main(int argc, char const *argv[])
                         auto t0 = cell::sys::detail::clock::now();
                         auto it = tool_list.find(res[i].name);
                         std::string o;
-                        if (it != tool_list.end() && it->second->execute(res[i].args, o))
+                        bool ok = false;
+                        try
+                        {
+                            ok = it != tool_list.end() && it->second->execute(res[i].args, o);
+                        }
+                        catch (const std::exception &e)
+                        {
+                            o = std::format("[tool error: {}]", e.what());
+                            res[i].status = "exception";
+                        }
+                        if (ok)
                         {
                             res[i].output = o;
                             res[i].status = "ok";
@@ -10024,6 +10091,8 @@ int main(int argc, char const *argv[])
                             res[i].blocked = true;
                             res[i].rejected_for = it->second->rejected_for();
                             res[i].status = "blocked";
+                            if (!o.empty())
+                                res[i].output = std::move(o); // surface the sandbox refusal reason to the model
                         }
                         else if (!o.empty())
                         {
@@ -10086,7 +10155,10 @@ int main(int argc, char const *argv[])
                         }
                     cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
                     if (approval_refused)
+                    {
                         done = true;
+                        natural_end = false; // user decline / autoallow deny aborts the turn
+                    }
                     // after the tool results are stored, run any requested
                     // parallel group; its report is injected into the current
                     // session as the system message the next round will see.
@@ -10134,8 +10206,11 @@ int main(int argc, char const *argv[])
                 cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
             }
             // auto-compact after long agent runs: three or more tool calls or
-            // thinking entries since the last user message (minimum threshold)
-            if (cfg.compact_auto && turn_tool_calls + turn_thinking_entries >= 3)
+            // thinking entries since the last user message (minimum threshold).
+            // only after turns that ended naturally — an aborted turn (request
+            // error, cancel, approval refusal) may be retried or resumed as-is,
+            // so compacting it automatically would rewrite history under it
+            if (cfg.compact_auto && natural_end && turn_tool_calls + turn_thinking_entries >= 3)
             {
                 std::string result = compact(s);
                 if (result.find("context compacted") != std::string::npos)
