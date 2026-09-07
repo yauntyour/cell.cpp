@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 //  cell.cpp — a single-file AI coding agent in modern C++26
 // =============================================================================
 //  Layout (single translation unit; namespace map, top to bottom):
@@ -5580,6 +5580,13 @@ namespace cell
     //  chat — session persistence: one JSON file per session, grouped in a
     //  directory per working-directory hash, plus the in-memory session map.
     // =========================================================================
+    // forward declaration so session::load() can call the todos store
+    // coercion helper defined later in the todos namespace.
+    namespace todos
+    {
+        static nlohmann::json coerce_store(nlohmann::json store);
+    }
+
     namespace chat
     {
         class session
@@ -5645,7 +5652,9 @@ namespace cell
                         cell::sys::logger::instance().info("sess", std::format("loaded id={} msgs={}", session_id, messages.size()));
                     }
                     cwd = j.value("cwd", cwd);
-                    todos = j.contains("todos") && j["todos"].is_object() ? j["todos"] : nlohmann::json::object();
+                    todos = j.contains("todos") && j["todos"].is_object()
+                                ? cell::todos::coerce_store(j["todos"])
+                                : nlohmann::json::object();
                 }
                 catch (const std::exception &)
                 {
@@ -6314,6 +6323,172 @@ namespace cell
                 report += std::format("## {}\n{}\n", id, summary);
             return report;
         }
+
+        // ---- multi-list helpers -------------------------------------------------
+        // The todos store is a map keyed by list id (todo-id), e.g.
+        //   {"my-list": {"todo-0": {...}}, "other": {"todo-0": {...}}}
+        // The helpers below make the store behave as a true collection of
+        // Todos lists that agents and users can create, modify and remove.
+
+        // A value in the store is a Todos list when it is an object (possibly
+        // empty) whose keys are valid ids and whose values are each a todo leaf
+        // or a parallel group (array). This distinguishes a single Todos list
+        // from a map of list-id -> list (where the values are themselves lists).
+        static bool is_list_object(const nlohmann::json &v)
+        {
+            if (!v.is_object())
+                return false;
+            for (auto it = v.begin(); it != v.end(); ++it)
+            {
+                if (!valid_id(it.key()))
+                    return false;
+                if (!leaf(it.value()) && !it.value().is_array())
+                    return false;
+            }
+            return true;
+        }
+
+        // Indent every line of `in` by `pad` spaces (used to nest lists under
+        // their id in the all-lists view).
+        static std::string indent(const std::string &in, size_t pad)
+        {
+            if (pad == 0)
+                return in;
+            std::string padstr(pad, ' ');
+            std::string out;
+            out.reserve(in.size() + padstr.size() * 2);
+            size_t pos = 0, nl;
+            while ((nl = in.find('\n', pos)) != std::string::npos)
+            {
+                out += padstr;
+                out += in.substr(pos, nl - pos + 1);
+                pos = nl + 1;
+            }
+            if (pos < in.size())
+            {
+                out += padstr;
+                out += in.substr(pos);
+            }
+            return out;
+        }
+
+        // Render a single named list (header + items, indented). Empty lists are
+        // rendered as "(empty)" so a freshly-created list is still visible.
+        static bool render_list(const std::string &list_id, const nlohmann::json &list, std::string &out)
+        {
+            if (!list.is_object())
+                return false;
+            std::string body;
+            if (list.empty())
+                body = "(empty)";
+            else
+                render(list, body);
+            out = std::format("## {} ({})\n{}", list_id, list.size(), indent(body, 2));
+            return true;
+        }
+
+        // Render every list in the store, one section per list.
+        static void render_all(const nlohmann::json &store, std::string &out)
+        {
+            if (!store.is_object() || store.empty())
+            {
+                out = "(no Todos)";
+                return;
+            }
+            std::vector<std::string> ids;
+            for (auto it = store.begin(); it != store.end(); ++it)
+                if (is_list_object(it.value()))
+                    ids.push_back(it.key());
+            std::sort(ids.begin(), ids.end());
+            out.clear();
+            for (const auto &id : ids)
+            {
+                std::string section;
+                if (render_list(id, store[id], section))
+                {
+                    if (!out.empty())
+                        out += "\n";
+                    out += section;
+                }
+            }
+            if (out.empty())
+                out = "(no Todos)";
+        }
+
+        // Normalize a whole store (map of list-id -> list) so every value is a
+        // valid normalized list.
+        static nlohmann::json normalize_all(const nlohmann::json &store)
+        {
+            nlohmann::json out = nlohmann::json::object();
+            if (!store.is_object())
+                return out;
+            for (auto it = store.begin(); it != store.end(); ++it)
+            {
+                if (!valid_id(it.key()))
+                    continue;
+                if (is_list_object(it.value()))
+                    out[it.key()] = normalize(it.value());
+            }
+            return out;
+        }
+
+        // Build a registry of existing list ids (for uniqueness checks).
+        static std::vector<std::string> list_ids(const nlohmann::json &store)
+        {
+            std::vector<std::string> ids;
+            if (store.is_object())
+                for (auto it = store.begin(); it != store.end(); ++it)
+                    if (is_list_object(it.value()))
+                        ids.push_back(it.key());
+            return ids;
+        }
+
+        // Coerce legacy or malformed stores into the canonical multi-list shape
+        // {"list-id": <todos list>}. A value that is itself a single Todos list
+        // (object of todo-N leaves / parallel groups) is wrapped under "my-list";
+        // anything else (empty, array, scalar) becomes an empty store. This keeps
+        // existing sessions (which stored a bare list) working unmodified.
+        static nlohmann::json coerce_store(nlohmann::json store)
+        {
+            nlohmann::json out = nlohmann::json::object();
+            if (!store.is_object())
+                return out;
+            // Preserve every value that is itself a valid Todos list (handles a
+            // proper multi-list store and any mixed/garbage store alike).
+            for (auto it = store.begin(); it != store.end(); ++it)
+                if (valid_id(it.key()) && is_list_object(it.value()))
+                    out[it.key()] = normalize(it.value());
+            // A bare legacy single-list store (no recognised list-id keys) gets
+            // wrapped under "my-list" so it is not lost.
+            if (out.empty() && is_list_object(store))
+                out["my-list"] = normalize(store);
+            return out;
+        }
+
+        // Resolve a user/proposed list id against the store. If `proposed` is
+        // non-empty it must be a valid, currently-unused id. If it is empty (or
+        // already taken) a unique id is auto-generated — guaranteeing that the
+        // returned id does not collide with any existing list. This is the
+        // single place where list-id uniqueness is enforced.
+        static std::string resolve_new_list_id(const std::string &proposed, const nlohmann::json &store)
+        {
+            std::unordered_set<std::string> used;
+            for (const auto &id : list_ids(store))
+                used.insert(id);
+            if (!proposed.empty())
+            {
+                if (valid_id(proposed) && !used.count(proposed))
+                    return proposed;
+            }
+            // auto-generate: list-1, list-2, ... (skip anything already used)
+            size_t n = 1;
+            std::string id;
+            do
+            {
+                id = std::format("list-{}", n++);
+            } while (used.count(id));
+            return id;
+        }
     } // namespace todos
 
 } // namespace cell
@@ -6365,12 +6540,15 @@ static void print_help()
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
-    cell::sys::println("  /todo                       show current Todos");
-    cell::sys::println("  /todo update todo-id:N TEXT change todo-N text");
-    cell::sys::println("  /todo rm todo-id:N          remove todo-N");
-    cell::sys::println("  /todo add todo-id:N TEXT    add a todo after todo-N");
-    cell::sys::println("  /todo sub todo-id:N TEXT    make todo-N parallel and add a sub-todo");
-    cell::sys::println("  /todo clear                 clear the current Todos");
+    cell::sys::println("  /todo                       show all Todos lists");
+    cell::sys::println("  /todo list                  list all Todos list ids");
+    cell::sys::println("  /todo new XXX               create a new Todos list with id XXX (uniqueness auto-checked)");
+    cell::sys::println("  /todo update XXX:N TEXT     change todo-N text in list XXX");
+    cell::sys::println("  /todo rm XXX:N              remove todo-N from list XXX");
+    cell::sys::println("  /todo add XXX:N TEXT        add a todo after todo-N in list XXX");
+    cell::sys::println("  /todo sub XXX:N TEXT        make todo-N parallel and add a sub-todo in list XXX");
+    cell::sys::println("  /todo rm-list XXX           remove a whole Todos list XXX");
+    cell::sys::println("  /todo clear                 clear all Todos lists");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
@@ -6578,15 +6756,46 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
                                    std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
-    add("todo", "Create, inspect, edit, and run the session Todos. Actions: get, clear, create (id,todos), set (todos), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), sub (list_id, todo_id, what), run_parallel (list_id, todo_id).", {{"action", str_prop("get | clear | create | set | update | add | rm | sub | run_parallel")}, {"id", str_prop("new Todos list id for create (todo-id)")}, {"todos", {{"type", "object"}, {"description", "Todos list for create/set"}}}, {"list_id", str_prop("existing Todos list id, e.g. my-list")}, {"todo_id", str_prop("existing item id, e.g. todo-0 or the numeric display position N")}, {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")}, {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")}, {"what", str_prop("new or updated todo text")}, {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}}, {"action"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
+    add("todo", "Create, inspect, edit, and run session Todos lists. The store is a collection of named lists keyed by a todo-id; you may keep several lists at once and switch between them. Actions: get (render all lists; list_id limits to one), clear (drop every list), create (id,todos — id is optional and a unique one is auto-generated if omitted/duplicated), set (todos — replace the whole store; a single list is kept under its first id, or 'my-list' if empty), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), rm_list (list_id — remove a whole list), sub (list_id, todo_id, what), run_parallel (list_id, todo_id). For list_id / todo_id you may use the list/todo id, its 1-based position N, or the keywords 'last'/'first'.", {{"action", str_prop("get | clear | create | set | update | add | rm | rm_list | sub | run_parallel")}, {"id", str_prop("new Todos list id for create; optional — a unique id (e.g. list-N) is auto-generated when omitted or already taken")}, {"todos", {{"type", "object"}, {"description", "a Todos list, or a map of list-id -> list, for create/set"}}}, {"list_id", str_prop("existing Todos list id (todo-id); omit to use the first list, or use 'last'/'first'. Also 'id' is accepted.")}, {"todo_id", str_prop("existing item id, e.g. todo-0, its 1-based position N, or 'last'/'first'")}, {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")}, {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")}, {"what", str_prop("new or updated todo text")}, {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}}, {"action"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
         {
             const std::string action = j.value("action", "");
+            // Normalise the underlying store to the canonical multi-list shape
+            // (legacy sessions stored a bare list). Done once per call so the
+            // rest of the handler can assume {"list-id": <todos list>}.
+            *cell::todos::active_todos() = cell::todos::coerce_store(*cell::todos::active_todos());
             auto get_list = [&](const std::string &id) -> nlohmann::json *
             {
                 if (!cell::todos::valid_id(id))
                     return nullptr;
                 auto it = cell::todos::active_todos()->find(id);
                 return it == cell::todos::active_todos()->end() ? nullptr : &*it;
+            };
+            // Resolve a list selector ("last"/"first", a 1-based position N, or
+            // a literal id) to a concrete list id. Returns "" when no list
+            // exists. Lets the agent target a list without memorising its id.
+            auto resolve_list_alias = [&](std::string &list_id) -> bool
+            {
+                auto is_digits = [](const std::string &s)
+                {
+                    return !s.empty() && std::all_of(s.begin(), s.end(),
+                                                     [](unsigned char c) { return std::isdigit(c); });
+                };
+                if (list_id == "last" || list_id == "first" || is_digits(list_id))
+                {
+                    auto ids = cell::todos::list_ids(*cell::todos::active_todos());
+                    std::sort(ids.begin(), ids.end());
+                    if (list_id == "last")
+                        list_id = ids.empty() ? "" : ids.back();
+                    else if (list_id == "first")
+                        list_id = ids.empty() ? "" : ids.front();
+                    else
+                    {
+                        size_t pos = 0;
+                        try { pos = (size_t)std::stoull(list_id); } catch (const std::exception &) { pos = 0; }
+                        list_id = (pos && pos <= ids.size()) ? ids[pos - 1] : "";
+                    }
+                }
+                return !list_id.empty() && cell::todos::valid_id(list_id);
             };
             // When the 'run_parallel' action succeeds it records its resolved
             // (list_id, todo_id) in cell::todos::run_parallel_list() so the
@@ -6595,7 +6804,25 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             // to the model.
             if (action == "get" || action.empty())
             {
-                cell::todos::render(*cell::todos::active_todos(), out);
+                if (j.contains("list_id"))
+                {
+                    std::string lid = j.value("list_id", "");
+                    if (!resolve_list_alias(lid))
+                    {
+                        out = std::format("[todo] unknown list: {}", lid.empty() ? "(none)" : lid);
+                        return false;
+                    }
+                    nlohmann::json *one = get_list(lid);
+                    if (one)
+                        cell::todos::render(*one, out);
+                    else
+                    {
+                        out = std::format("[todo] unknown list: {}", lid);
+                        return false;
+                    }
+                }
+                else
+                    cell::todos::render_all(*cell::todos::active_todos(), out);
                 return true;
             }
             if (action == "clear")
@@ -6608,33 +6835,92 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             {
                 if (!j.contains("todos") || !j["todos"].is_object())
                 {
-                    out = "[todo] todos must be an object";
+                    out = "[todo] todos must be an object (a Todos list, or a map of list-id -> list)";
                     return false;
                 }
-                if (action == "create")
+                nlohmann::json store = *cell::todos::active_todos();
+                if (!store.is_object())
+                    store = nlohmann::json::object();
+                std::string created_list_id;
+
+                if (action == "set")
                 {
-                    const std::string id = j.value("id", "");
-                    if (!cell::todos::valid_id(id))
-                    {
-                        out = "[todo] create requires a valid id";
-                        return false;
-                    }
-                    (*cell::todos::active_todos())[id] = cell::todos::normalize(j["todos"]);
+                    // Whole-store replacement. Accept either a map of
+                    // list-id -> list, or a single Todos list (preserved under
+                    // its first existing id, or 'my-list' when the store was
+                    // empty).
+                    nlohmann::json next = j["todos"];
+                    std::string single_id = store.empty() ? "my-list" : cell::todos::list_ids(store).front();
+                    store = cell::todos::normalize_all(
+                        cell::todos::is_list_object(next)
+                            ? nlohmann::json::object({{single_id, next}})
+                            : next);
                 }
-                else
-                    *cell::todos::active_todos() = cell::todos::normalize(j["todos"]);
-                cell::todos::render(*cell::todos::active_todos(), out);
+                else // create
+                {
+                    // 'todos' is always a single Todos list (the common,
+                    // unambiguous agent path). It is stored under a unique
+                    // list id: the requested 'id' if it is valid and unused,
+                    // otherwise an auto-generated one (list-N).
+                    const std::string raw_id = j.value("id", "");
+                    const std::string id = cell::todos::resolve_new_list_id(raw_id, store);
+                    store[id] = cell::todos::normalize(j["todos"]);
+                    created_list_id = id;
+                }
+                *cell::todos::active_todos() = store;
+                cell::todos::render_all(*cell::todos::active_todos(), out);
+                if (action == "create" && !created_list_id.empty())
+                    out += std::format("\n[created list: {}]", created_list_id);
                 return true;
             }
-            const std::string list_id = j.value("list_id", j.value("id", ""));
+            // resolve the target list: a literal id, "last"/"first", a 1-based
+            // position N, or (when omitted) the first list — so the agent never
+            // has to memorise the todo-id.
+            std::string list_id = j.value("list_id", j.value("id", ""));
+            if (list_id.empty())
+            {
+                auto ids = cell::todos::list_ids(*cell::todos::active_todos());
+                list_id = ids.empty() ? "" : ids.front();
+            }
+            else if (!resolve_list_alias(list_id))
+                list_id = "";
             nlohmann::json *list = get_list(list_id);
             if (!list)
             {
-                out = std::format("[todo] unknown list: {}", list_id);
+                out = std::format("[todo] unknown list: {}", list_id.empty() ? "(none)" : list_id);
                 return false;
             }
             auto resolve_todo = [&](const std::string &raw) -> std::string
             {
+                if (raw == "last" || raw == "first")
+                {
+                    // positional keyword: pick the last/first todo in the list
+                    std::vector<std::string> k;
+                    for (auto it = list->begin(); it != list->end(); ++it)
+                        k.push_back(it.key());
+                    std::sort(k.begin(), k.end(), [](const std::string &a, const std::string &b)
+                              {
+                                  auto num = [](const std::string &s, size_t &v)
+                                  {
+                                      size_t p = 0;
+                                      while (p < s.size() && std::isdigit((unsigned char)s[p]))
+                                          ++p;
+                                      if (p == 0)
+                                          return false;
+                                      v = (size_t)std::stoull(s.substr(0, p));
+                                      return true;
+                                  };
+                                  size_t an = 0, bn = 0;
+                                  bool a_num = a.starts_with("todo-") && num(a.substr(5), an);
+                                  bool b_num = b.starts_with("todo-") && num(b.substr(5), bn);
+                                  if (a_num && b_num && an != bn)
+                                      return an < bn;
+                                  return a < b;
+                              });
+                    if (k.empty())
+                        return "";
+                    return (raw == "first") ? k.front() : k.back();
+                }
                 if (list->contains(raw))
                     return raw;
                 size_t n = 0;
@@ -6647,6 +6933,20 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 }
                 return n ? cell::todos::key_at(*list, n) : "";
             };
+            if (action == "rm_list")
+            {
+                std::string target = j.value("list_id", j.value("id", ""));
+                if (!target.empty() && !resolve_list_alias(target))
+                    target = "";
+                if (!cell::todos::valid_id(target) || !cell::todos::active_todos()->erase(target))
+                {
+                    out = std::format("[todo] unknown list: {}", target.empty() ? "(none)" : target);
+                    return false;
+                }
+                cell::todos::render_all(*cell::todos::active_todos(), out);
+                out = std::format("removed list: {}\n{}", target, out);
+                return true;
+            }
             if (action == "update")
             {
                 std::string todo_id = resolve_todo(j.value("todo_id", ""));
@@ -6661,7 +6961,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     (*item)["What"] = j["what"].get<std::string>();
                 if (j.contains("done") && j["done"].is_boolean())
                     (*item)["done"] = j["done"].get<bool>();
-                cell::todos::render(*cell::todos::active_todos(), out);
+                cell::todos::render_all(*cell::todos::active_todos(), out);
                 return true;
             }
             if (action == "add")
@@ -6686,7 +6986,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 if (!inserted)
                     new_list[cell::todos::next_key(*list, "todo-")] = cell::todos::make_leaf(j["what"].get<std::string>());
                 *list = std::move(new_list);
-                cell::todos::render(*cell::todos::active_todos(), out);
+                cell::todos::render_all(*cell::todos::active_todos(), out);
                 return true;
             }
             if (action == "rm")
@@ -6697,7 +6997,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out = std::format("[todo] unknown todo: {}", todo_id);
                     return false;
                 }
-                cell::todos::render(*cell::todos::active_todos(), out);
+                cell::todos::render_all(*cell::todos::active_todos(), out);
                 return true;
             }
             if (action == "sub")
@@ -6734,7 +7034,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out = "[todo] invalid todo item";
                     return false;
                 }
-                cell::todos::render(*cell::todos::active_todos(), out);
+                cell::todos::render_all(*cell::todos::active_todos(), out);
                 return true;
             }
             if (action == "run_parallel")
@@ -7146,6 +7446,57 @@ static int run_selftest()
         expect(cell::todos::find_leaf(list, "todo-2", "sub-0") != nullptr, "todo finds sub-todo by id");
         std::string report = cell::todos::merge_report("todo-2", {{"sub-0", "A"}, {"sub-1", "B"}});
         expect(report == "# Parallel todo-2 Summary\n## sub-0\nA\n## sub-1\nB\n", "todo report merge is deterministic");
+    }
+
+    {
+        // Multi-list helpers: coercion, unique-id generation, rendering of a
+        // collection of named lists, and the /todo new + rm_list round-trip.
+        nlohmann::json legacy = nlohmann::json::object({
+            {"todo-0", {{"What", "a"}, {"done", false}}},
+            {"todo-1", {{"What", "b"}, {"done", true}}},
+        });
+        nlohmann::json coerced = cell::todos::coerce_store(legacy);
+        expect(coerced.contains("my-list"), "coerce_store wraps a legacy bare list under my-list");
+        expect(coerced["my-list"].is_object() && coerced["my-list"].size() == 2, "coerce_store keeps legacy items");
+
+        nlohmann::json store = nlohmann::json::object();
+        std::string id1 = cell::todos::resolve_new_list_id("my-list", store);
+        expect(id1 == "my-list", "resolve_new_list_id accepts a free id");
+        store[id1] = nlohmann::json::object();
+        std::string id2 = cell::todos::resolve_new_list_id("my-list", store);
+        expect(id2 != "my-list" && cell::todos::valid_id(id2), "resolve_new_list_id renames a colliding id");
+        std::string id3 = cell::todos::resolve_new_list_id("", store);
+        expect(id3 != "my-list" && cell::todos::valid_id(id3), "resolve_new_list_id auto-generates when empty");
+        std::string id4 = cell::todos::resolve_new_list_id("bad id!", store);
+        expect(cell::todos::valid_id(id4) && id4 != "bad id!", "resolve_new_list_id fixes an invalid id");
+
+        nlohmann::json multi = nlohmann::json::object({
+            {"plan", nlohmann::json::object({
+                        {"todo-0", {{"What", "one"}, {"done", false}}},
+                        {"todo-1", {{"What", "two"}, {"done", true}}},
+                    })},
+            {"research", nlohmann::json::object({
+                             {"todo-0", {{"What", "read"}, {"done", false}}},
+                         })},
+        });
+        expect(cell::todos::list_ids(multi).size() == 2, "list_ids enumerates every list");
+        std::string all;
+        cell::todos::render_all(multi, all);
+        expect(all.find("## plan (2)") != std::string::npos, "render_all prints a list header with count");
+        expect(all.find("## research (1)") != std::string::npos, "render_all prints every list");
+        expect(all.find("one") != std::string::npos && all.find("read") != std::string::npos, "render_all prints items from every list");
+        // is_list_object accepts a single list (one leaf); an empty object is an
+        // (empty) list; a value that is neither leaf nor group is rejected.
+        expect(cell::todos::is_list_object(nlohmann::json::object({{"todo-0", {{"What", "x"}, {"done", false}}}})), "a one-item list is a list");
+        expect(cell::todos::is_list_object(nlohmann::json::object()), "an empty object is an (empty) list");
+        expect(!cell::todos::is_list_object(nlohmann::json::object({{"weird", 42}})), "a non-leaf, non-group value is not a list");
+        // coerce_store keeps an already-multi-list store intact
+        nlohmann::json multi2 = nlohmann::json::object({
+            {"plan", nlohmann::json::object({{"todo-0", {{"What", "x"}, {"done", false}}}})},
+            {"research", nlohmann::json::object({{"todo-0", {{"What", "y"}, {"done", false}}}})},
+        });
+        nlohmann::json coerced2 = cell::todos::coerce_store(multi2);
+        expect(coerced2.contains("plan") && coerced2.contains("research"), "coerce_store preserves a multi-list store");
     }
 
     {
@@ -8820,6 +9171,26 @@ int main(int argc, char const *argv[])
                         }
                         return text;
                     };
+                    auto resolve_list_alias = [&](std::string &list_id) -> bool
+                    {
+                        if (list_id == "last" || list_id == "first" ||
+                            (list_id.size() == 1 && std::isdigit((unsigned char)list_id[0])))
+                        {
+                            auto ids = cell::todos::list_ids(s->todos_state());
+                            std::sort(ids.begin(), ids.end());
+                            if (list_id == "last")
+                                list_id = ids.empty() ? "" : ids.back();
+                            else if (list_id == "first")
+                                list_id = ids.empty() ? "" : ids.front();
+                            else
+                            {
+                                size_t pos = 0;
+                                try { pos = (size_t)std::stoull(list_id); } catch (const std::exception &) {}
+                                list_id = (pos && pos <= ids.size()) ? ids[pos - 1] : "";
+                            }
+                        }
+                        return !list_id.empty() && cell::todos::valid_id(list_id);
+                    };
                     auto parse_target = [&](const std::string &raw, std::string &list_id, std::string &todo_key,
                                             std::string &sub_id) -> nlohmann::json *
                     {
@@ -8827,7 +9198,7 @@ int main(int argc, char const *argv[])
                         list_id = sep == std::string::npos ? raw : raw.substr(0, sep);
                         std::string item = sep == std::string::npos ? "" : raw.substr(sep + 1);
                         sub_id.clear();
-                        if (!cell::todos::valid_id(list_id))
+                        if (!resolve_list_alias(list_id))
                             return nullptr;
                         auto lit = s->todos_state().find(list_id);
                         if (lit == s->todos_state().end())
@@ -8837,6 +9208,30 @@ int main(int argc, char const *argv[])
                         {
                             sub_id = item.substr(sub_sep + 1);
                             item = item.substr(0, sub_sep);
+                        }
+                        if (item == "last" || item == "first")
+                        {
+                            std::vector<std::string> k;
+                            for (auto it = lit->begin(); it != lit->end(); ++it)
+                                k.push_back(it.key());
+                            std::sort(k.begin(), k.end(), [](const std::string &a, const std::string &b)
+                                      {
+                                          auto num = [](const std::string &s, size_t &v)
+                                          {
+                                              size_t p = 0;
+                                              while (p < s.size() && std::isdigit((unsigned char)s[p])) ++p;
+                                              if (p == 0) return false;
+                                              v = (size_t)std::stoull(s.substr(0, p));
+                                              return true;
+                                          };
+                                          size_t an = 0, bn = 0;
+                                          bool a_num = a.starts_with("todo-") && num(a.substr(5), an);
+                                          bool b_num = b.starts_with("todo-") && num(b.substr(5), bn);
+                                          if (a_num && b_num && an != bn) return an < bn;
+                                          return a < b;
+                                      });
+                            if (!k.empty())
+                                item = (item == "first") ? k.front() : k.back();
                         }
                         if (lit->contains(item))
                             todo_key = item;
@@ -8859,6 +9254,44 @@ int main(int argc, char const *argv[])
                         s->todos_state() = nlohmann::json::object();
                         log.info("todo", "cleared");
                         cell::sys::println("Todos cleared");
+                        continue;
+                    }
+                    if (toks.size() >= 2 && toks[1] == "list")
+                    {
+                        auto ids = cell::todos::list_ids(s->todos_state());
+                        std::sort(ids.begin(), ids.end());
+                        if (ids.empty())
+                            cell::sys::println("(no Todos lists)");
+                        else
+                            for (const auto &id : ids)
+                                cell::sys::println("  {}", id);
+                        continue;
+                    }
+                    if (toks.size() >= 3 && toks[1] == "new")
+                    {
+                        // create a new (named) Todos list; uniqueness of the id
+                        // is guaranteed by resolve_new_list_id — a collision is
+                        // resolved to a fresh, unused id automatically.
+                        const std::string id = cell::todos::resolve_new_list_id(toks[2], s->todos_state());
+                        s->todos_state()[id] = nlohmann::json::object();
+                        log.info("todo", std::format("new list id={}", id));
+                        std::string state;
+                        cell::todos::render_all(s->todos_state(), state);
+                        cell::sys::println("created list '{}'\n{}", id, state);
+                        continue;
+                    }
+                    if (toks.size() >= 3 && toks[1] == "rm-list")
+                    {
+                        const std::string id = toks[2];
+                        if (!cell::todos::valid_id(id) || !s->todos_state().erase(id))
+                        {
+                            cell::sys::error("unknown todo list: {}", id);
+                            continue;
+                        }
+                        log.info("todo", std::format("removed list id={}", id));
+                        std::string state;
+                        cell::todos::render_all(s->todos_state(), state);
+                        cell::sys::println("removed list '{}'\n{}", id, state);
                         continue;
                     }
                     if (toks.size() >= 4 && toks[1] == "update")
@@ -8959,7 +9392,7 @@ int main(int argc, char const *argv[])
                         continue;
                     }
                     std::string state;
-                    cell::todos::render(s->todos_state(), state);
+                    cell::todos::render_all(s->todos_state(), state);
                     cell::sys::println("{}", state);
                     continue;
                 }
