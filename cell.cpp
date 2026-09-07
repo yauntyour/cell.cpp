@@ -2516,7 +2516,7 @@ namespace cell
             }
             if (!stop && !file.eof())
                 return fail(std::format("{} could not be read (I/O error mid-read).", std::string(path))); // I/O error mid-read
-            if (!carry.empty()) // trailing line without '\n'
+            if (!carry.empty())                                                                            // trailing line without '\n'
             {
                 nline++;
                 if (nline >= start_line && nline <= end_line)
@@ -8618,7 +8618,7 @@ int main(int argc, char const *argv[])
         extract_parts(rest, conv_text, think_text);
         std::string conv_summary = "(llm summarization unavailable; messages truncated)";
         if (std::string r = summarize_part(
-                "Summarize the following coding-agent conversation concisely, preserving key decisions, facts, file paths and unfinished tasks. Output only the summary.",
+                "Summarize the conversation content as the memory, preserving key decisions, facts, file paths and unfinished tasks. Output only the memory.",
                 conv_text, "conversation", "Context Summary", cell::sys::color::cyan);
             !r.empty())
             conv_summary = std::move(r);
@@ -8627,7 +8627,7 @@ int main(int argc, char const *argv[])
         {
             think_summary = "(agent reasoning summary unavailable)";
             if (std::string r = summarize_part(
-                    "Summarize the agent's reasoning based on the preceding conversation. Focus on the key insights, decisions, and conclusions reached. Output only the summary.",
+                    "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
                     think_text, "reasoning", "Thinking Summary", cell::sys::color::magenta);
                 !r.empty())
                 think_summary = std::move(r);
