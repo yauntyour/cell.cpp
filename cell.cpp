@@ -4419,6 +4419,20 @@ namespace cell
             Ask = 0,
             Allow = 1,
         };
+        // Scheduling phase for a tool call within a single agent turn. This is
+        // orthogonal to Policy (which governs sandbox/approval gating):
+        //   Concurrent — may run on the shared worker pool in pass 1, in parallel
+        //                with other Concurrent tools (read-only, no shared state).
+        //   Deferred   — runs sequentially in pass 2, after every Concurrent tool
+        //                in the same assistant message has finished. Use this for
+        //                any tool that mutates shared session state (the todo
+        //                store, run_parallel trigger) or that must observe the
+        //                results of pass-1 reads (write/edit read-before-edit rule).
+        enum class Phase : unsigned char
+        {
+            Concurrent = 0,
+            Deferred = 1,
+        };
         // distinguish policy/security refusals (the model may try another route)
         // from approval refusals (the run should stop immediately)
         enum class rejection_reason : unsigned char
@@ -4440,10 +4454,12 @@ namespace cell
             const size_t id = 0;
             const std::string key = "<null>";
             const Policy permission = Policy::Ask;
+            const Phase phase = Phase::Concurrent;
 
         public:
-            tool(const size_t id, const std::string key, const Policy permission)
-                : id(id), key(key), permission(permission) {}
+            tool(const size_t id, const std::string key, const Policy permission,
+                 const Phase phase = Phase::Concurrent)
+                : id(id), key(key), permission(permission), phase(phase) {}
             virtual bool execute(const std::string &input, std::string &output)
             {
                 (void)input;
@@ -4453,6 +4469,7 @@ namespace cell
             size_t tool_id() const { return id; }
             const std::string &name() const { return key; }
             Policy policy() const { return permission; }
+            Phase schedule() const { return phase; }
             virtual bool blocked() const { return false; }
             virtual rejection_reason rejected_for() const { return rejection_reason::none; }
         };
@@ -4471,8 +4488,9 @@ namespace cell
 
         public:
             template <tool_handler F>
-            callable_tool(size_t id, const std::string &key, Policy permission, F &&fn)
-                : tool(id, key, permission), handler_(std::forward<F>(fn)) {}
+            callable_tool(size_t id, const std::string &key, Policy permission, F &&fn,
+                          Phase phase = Phase::Concurrent)
+                : tool(id, key, permission, phase), handler_(std::forward<F>(fn)) {}
             bool blocked() const override { return blocked_.load(std::memory_order_relaxed); }
             rejection_reason rejected_for() const override { return rejected_for_.load(std::memory_order_relaxed); }
             bool execute(const std::string &input, std::string &output) override
@@ -6412,6 +6430,7 @@ static std::string harden_tool_result(std::string_view tool_name, const std::str
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false)
 {
     using cell::tools::Policy;
+    using cell::tools::Phase;
     std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> list;
     nlohmann::json defs = nlohmann::json::array();
     size_t id = 0;
@@ -6423,27 +6442,30 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "boolean"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy,
-                   std::move_only_function<bool(const nlohmann::json &, std::string &)> fn)
+                   std::move_only_function<bool(const nlohmann::json &, std::string &)> fn,
+                   Phase phase = Phase::Concurrent)
     {
-        list[name] = std::make_shared<cell::tools::callable_tool>(id++, name, policy,
-                                                                  [name, fn = std::move(fn)](const std::string &in, std::string &out) mutable -> bool
-                                                                  {
-                                                                      nlohmann::json j;
-                                                                      if (!json_args(in, j))
-                                                                      {
-                                                                          out = std::format("[{}] invalid JSON arguments: {}", name, in.size() > 200 ? in.substr(0, 200) + "..." : in);
-                                                                          return false;
-                                                                      }
-                                                                      try
-                                                                      {
-                                                                          return fn(j, out);
-                                                                      }
-                                                                      catch (const std::exception &e)
-                                                                      {
-                                                                          out = std::format("[{}] internal error: {}", name, e.what());
-                                                                          return false;
-                                                                      }
-                                                                  });
+        list[name] = std::make_shared<cell::tools::callable_tool>(
+            id++, name, policy,
+            [name, fn = std::move(fn)](const std::string &in, std::string &out) mutable -> bool
+            {
+                nlohmann::json j;
+                if (!json_args(in, j))
+                {
+                    out = std::format("[{}] invalid JSON arguments: {}", name, in.size() > 200 ? in.substr(0, 200) + "..." : in);
+                    return false;
+                }
+                try
+                {
+                    return fn(j, out);
+                }
+                catch (const std::exception &e)
+                {
+                    out = std::format("[{}] internal error: {}", name, e.what());
+                    return false;
+                }
+            },
+            phase);
         nlohmann::json schema = {{"type", "object"}, {"properties", props}, {"required", required}};
         if (responses_api)
             defs.push_back({{"type", "function"}, {"name", name}, {"description", desc}, {"parameters", schema}});
@@ -6503,7 +6525,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         [](const nlohmann::json &j, std::string &out)
         {
             return cell::box::write_new(j.value("path", ""), j.value("content", ""), out);
-        });
+        }, Phase::Deferred);
     add("edit", "Modify an existing file. The 'mode' parameter selects the operation (default 'replace'):\n"
                 "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
                 "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
@@ -6523,7 +6545,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return cell::box::edit(j.value("path", ""), j.value("mode", "replace"),
                                    j.value("search", ""), j.value("content", ""),
                                    num_arg(j, "from", 0), num_arg(j, "to", 0), out);
-        });
+        }, Phase::Deferred);
     add("rg", "Search file contents recursively with regex support. Skips hidden files/directories and .gitignore'd paths. Returns up to max_results matches grouped by file as 'line: content'. Supports case-insensitive search, context lines, file extension filtering, and count-only mode. Prefer this when searching by content.",
         {{"pattern", str_prop("regex pattern (supports full ECMAScript regex syntax)")},
          {"path", str_prop("directory to search (default .)")},
@@ -6759,7 +6781,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             }
             out = std::format("[todo] unknown action: {}", action);
             return false;
-        });
+        }, Phase::Deferred);
     return {list, defs};
 }
 
@@ -7115,6 +7137,17 @@ static int run_selftest()
                    tool_list["edit"]->policy() == cell::tools::Policy::Allow &&
                    tool_list["exec"]->policy() == cell::tools::Policy::Ask,
                "mutating tool policies: write/edit Allow, exec Ask");
+        // Phase is orthogonal to Policy: read-only tools are Concurrent (pass 1,
+        // parallel worker pool); todo/write/edit are Deferred (pass 2, sequential).
+        expect(tool_list["ls"]->schedule() == cell::tools::Phase::Concurrent &&
+                   tool_list["read"]->schedule() == cell::tools::Phase::Concurrent &&
+                   tool_list["rg"]->schedule() == cell::tools::Phase::Concurrent &&
+                   tool_list["find"]->schedule() == cell::tools::Phase::Concurrent,
+               "read-only tools are Concurrent phase");
+        expect(tool_list["write"]->schedule() == cell::tools::Phase::Deferred &&
+                   tool_list["edit"]->schedule() == cell::tools::Phase::Deferred &&
+                   tool_list["todo"]->schedule() == cell::tools::Phase::Deferred,
+               "write/edit/todo are Deferred phase");
         for (auto &d : tool_defs)
             expect(d.contains("name") ? d.contains("description")
                                       : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
@@ -10029,8 +10062,9 @@ int main(int argc, char const *argv[])
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
                     turn_tool_calls += (long long)tool_calls.size();
-                    // pass 1: read-only tools (Policy::Allow: ls/read/rg/find) run concurrently
-                    // on the shared worker pool (dynamically scaled up to max_threads)
+                    // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
+                    // run concurrently on the shared worker pool (max_threads); Deferred
+                    // Phase tools (Policy::Allow: write/edit/todo) are queued for pass 2.
                     // Start each tool-processing round with a clean parallel-trigger
                     // slot; only a todo tool call in THIS round may populate it.
                     cell::todos::run_parallel_list() = nlohmann::json::array();
@@ -10052,11 +10086,13 @@ int main(int argc, char const *argv[])
                         }
                         else if (it->second->policy() == cell::tools::Policy::Allow)
                         {
-                            // write/edit are Allow but deferred to pass 2: every
-                            // read in the same message must complete first
-                            // (read-before-edit rule) and two edits of one file
-                            // must never race each other
-                            if (res[i].name == "write" || res[i].name == "edit" || res[i].name == "todo")
+                            // Allow tools scheduled as Phase::Deferred (write/edit/
+                            // todo) run sequentially in pass 2: every read in the
+                            // same message must finish first (read-before-edit rule)
+                            // and the todo store / run_parallel trigger must never be
+                            // mutated from a worker-pool thread. Concurrent Allow
+                            // tools (read-only) run on the shared worker pool now.
+                            if (it->second->schedule() == cell::tools::Phase::Deferred)
                             {
                                 res[i].policy = "defer"; // sequential, no prompt
                                 continue;
@@ -10103,7 +10139,7 @@ int main(int argc, char const *argv[])
                     }
                     if (allow_count)
                         cell::sys::pool().wait_all();
-                    // pass 2: deferred file mutators (write/edit — no prompt) and
+                    // pass 2: Phase::Deferred tools (write/edit/todo — no prompt) and
                     // confirm-required tools (exec) run sequentially, in order
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
