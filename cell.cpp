@@ -6546,6 +6546,7 @@ static void print_help()
     cell::sys::println("  /todo update XXX:N TEXT     change todo-N text in list XXX");
     cell::sys::println("  /todo rm XXX:N              remove todo-N from list XXX");
     cell::sys::println("  /todo add XXX:N TEXT        add a todo after todo-N in list XXX");
+    cell::sys::println("  /todo add XXX TEXT          add a todo to the end of list XXX");
     cell::sys::println("  /todo sub XXX:N TEXT        make todo-N parallel and add a sub-todo in list XXX");
     cell::sys::println("  /todo rm-list XXX           remove a whole Todos list XXX");
     cell::sys::println("  /todo clear                 clear all Todos lists");
@@ -9314,8 +9315,42 @@ int main(int argc, char const *argv[])
                         cell::sys::println("updated {}", toks[2]);
                         continue;
                     }
-                    if (toks.size() >= 4 && toks[1] == "add")
+                    if (toks.size() >= 3 && toks[1] == "add")
                     {
+                        // /todo add <list-id> <what>          -> append to the end of the list
+                        // /todo add <list-id>:<todo-N> <what>  -> insert after todo-N (legacy form)
+                        const bool has_target = toks[2].find(':') != std::string::npos;
+                        if (!has_target)
+                        {
+                            // Append 'what' directly to the end of the named list.
+                            std::string list_id = toks[2];
+                            if (toks.size() < 4)
+                            {
+                                cell::sys::error("usage: /todo add <list-id> <what>");
+                                continue;
+                            }
+                            if (!resolve_list_alias(list_id))
+                            {
+                                cell::sys::error("unknown todo list: {}", toks[2]);
+                                continue;
+                            }
+                            auto lit = s->todos_state().find(list_id);
+                            if (lit == s->todos_state().end())
+                            {
+                                cell::sys::error("unknown todo list: {}", toks[2]);
+                                continue;
+                            }
+                            (*lit)[cell::todos::next_key(lit.value(), "todo-")] =
+                                cell::todos::make_leaf(todo_rest(3));
+                            log.info("todo", std::format("appended to list={}", list_id));
+                            cell::sys::println("added to {}", list_id);
+                            continue;
+                        }
+                        if (toks.size() < 4)
+                        {
+                            cell::sys::error("usage: /todo add <list-id>:<todo-N> <what>");
+                            continue;
+                        }
                         std::string list_id, todo_key, sub_id;
                         nlohmann::json *list = parse_target(toks[2], list_id, todo_key, sub_id);
                         if (!list)

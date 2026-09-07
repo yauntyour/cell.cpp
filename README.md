@@ -253,6 +253,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/todo update XXX:N TEXT` | Change the text of `todo-N` in list `XXX` |
 | `/todo rm XXX:N` | Remove `todo-N` from list `XXX` |
 | `/todo add XXX:N TEXT` | Add a new todo immediately after `todo-N` in list `XXX` |
+| `/todo add XXX TEXT` | Add a new todo directly to the end of list `XXX` |
 | `/todo sub XXX:N TEXT` | Turn `todo-N` into a parallel group (if needed) and append a sub-todo in list `XXX` |
 | `/todo rm-list XXX` | Remove the whole Todos list `XXX` |
 | `/todo clear` | Remove all Todos lists |
