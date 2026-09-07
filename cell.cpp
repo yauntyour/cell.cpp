@@ -6429,8 +6429,8 @@ static std::string harden_tool_result(std::string_view tool_name, const std::str
 
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false)
 {
-    using cell::tools::Policy;
     using cell::tools::Phase;
+    using cell::tools::Policy;
     std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> list;
     nlohmann::json defs = nlohmann::json::array();
     size_t id = 0;
@@ -6519,13 +6519,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             out = std::move(numbered);
             return true;
         });
-    add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).",
-        {{"path", str_prop("file path")}, {"content", str_prop("text content")}},
-        {"path", "content"}, Policy::Allow,
-        [](const nlohmann::json &j, std::string &out)
-        {
-            return cell::box::write_new(j.value("path", ""), j.value("content", ""), out);
-        }, Phase::Deferred);
+    add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).", {{"path", str_prop("file path")}, {"content", str_prop("text content")}}, {"path", "content"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
+        { return cell::box::write_new(j.value("path", ""), j.value("content", ""), out); }, Phase::Deferred);
     add("edit", "Modify an existing file. The 'mode' parameter selects the operation (default 'replace'):\n"
                 "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
                 "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
@@ -6533,19 +6528,10 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 "  delete  — delete the unique 'search' text; if 'search' is empty, delete the 1-based inclusive line range 'from'..'to'.\n"
                 "  query   — locate 'search' and report every match with line numbers and surrounding context; read-only, never modifies.\n"
                 "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.",
-        {{"path", str_prop("file path")},
-         {"mode", str_prop("replace | insert | append | delete | query (default replace)")},
-         {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")},
-         {"content", str_prop("replacement text (replace) or text to insert/append")},
-         {"from", num_prop("1-based line: insert-after line, or delete range start")},
-         {"to", num_prop("1-based inclusive end line for delete range")}},
-        {"path"}, Policy::Allow,
-        [](const nlohmann::json &j, std::string &out)
-        {
-            return cell::box::edit(j.value("path", ""), j.value("mode", "replace"),
-                                   j.value("search", ""), j.value("content", ""),
-                                   num_arg(j, "from", 0), num_arg(j, "to", 0), out);
-        }, Phase::Deferred);
+        {{"path", str_prop("file path")}, {"mode", str_prop("replace | insert | append | delete | query (default replace)")}, {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")}, {"content", str_prop("replacement text (replace) or text to insert/append")}, {"from", num_prop("1-based line: insert-after line, or delete range start")}, {"to", num_prop("1-based inclusive end line for delete range")}}, {"path"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
+        { return cell::box::edit(j.value("path", ""), j.value("mode", "replace"),
+                                 j.value("search", ""), j.value("content", ""),
+                                 num_arg(j, "from", 0), num_arg(j, "to", 0), out); }, Phase::Deferred);
     add("rg", "Search file contents recursively with regex support. Skips hidden files/directories and .gitignore'd paths. Returns up to max_results matches grouped by file as 'line: content'. Supports case-insensitive search, context lines, file extension filtering, and count-only mode. Prefer this when searching by content.",
         {{"pattern", str_prop("regex pattern (supports full ECMAScript regex syntax)")},
          {"path", str_prop("directory to search (default .)")},
@@ -6592,18 +6578,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    dbl_arg(j, "newer_than_hours", 0.0), (long long)num_arg(j, "larger_than_bytes", 0),
                                    std::max<size_t>(1, std::min<size_t>(num_arg(j, "max_results", 500), 500)), out);
         });
-    add("todo", "Create, inspect, edit, and run the session Todos. Actions: get, clear, create (id,todos), set (todos), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), sub (list_id, todo_id, what), run_parallel (list_id, todo_id).",
-        {{"action", str_prop("get | clear | create | set | update | add | rm | sub | run_parallel")},
-         {"id", str_prop("new Todos list id for create (todo-id)")},
-         {"todos", {{"type", "object"}, {"description", "Todos list for create/set"}}},
-         {"list_id", str_prop("existing Todos list id, e.g. my-list")},
-         {"todo_id", str_prop("existing item id, e.g. todo-0 or the numeric display position N")},
-         {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")},
-         {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")},
-         {"what", str_prop("new or updated todo text")},
-         {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}},
-        {"action"}, Policy::Allow,
-        [](const nlohmann::json &j, std::string &out)
+    add("todo", "Create, inspect, edit, and run the session Todos. Actions: get, clear, create (id,todos), set (todos), update (list_id, todo_id, what, done, sub_id), add (list_id, after_id, what), rm (list_id, todo_id), sub (list_id, todo_id, what), run_parallel (list_id, todo_id).", {{"action", str_prop("get | clear | create | set | update | add | rm | sub | run_parallel")}, {"id", str_prop("new Todos list id for create (todo-id)")}, {"todos", {{"type", "object"}, {"description", "Todos list for create/set"}}}, {"list_id", str_prop("existing Todos list id, e.g. my-list")}, {"todo_id", str_prop("existing item id, e.g. todo-0 or the numeric display position N")}, {"sub_id", str_prop("sub-todo id inside a parallel group, e.g. sub-0")}, {"after_id", str_prop("insert the new todo immediately after this id or numeric display position N")}, {"what", str_prop("new or updated todo text")}, {"done", bool_prop("completion state; defaults to false for add/sub and is optional for update")}}, {"action"}, Policy::Allow, [](const nlohmann::json &j, std::string &out)
         {
             const std::string action = j.value("action", "");
             auto get_list = [&](const std::string &id) -> nlohmann::json *
@@ -6780,8 +6755,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 return true;
             }
             out = std::format("[todo] unknown action: {}", action);
-            return false;
-        }, Phase::Deferred);
+            return false; }, Phase::Deferred);
     return {list, defs};
 }
 
