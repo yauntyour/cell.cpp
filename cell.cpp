@@ -50,6 +50,8 @@
 #include <future>
 #include <iterator>
 #include <mutex>
+#include <numeric>
+#include <shared_mutex>
 #include <atomic>
 #include <sstream>
 #include <thread>
@@ -593,6 +595,19 @@ namespace cell
         return p;
     }
     static void reset_workdir_cache() { workdir_cache().reset(); }
+    // cached lowercase-normalized workdir string (hot path: is_in_workspace)
+    static const std::string &workdir_norm()
+    {
+        static std::string cached;
+        static std::filesystem::path last_wd;
+        auto wd = workdir();
+        if (cached.empty() || wd != last_wd)
+        {
+            cached = normalize_path(wd.string());
+            last_wd = wd;
+        }
+        return cached;
+    }
     // SHA-256 of normalized cwd, hex, truncated to 16 chars.
     static std::string cwd_id()
     {
@@ -1025,8 +1040,7 @@ namespace cell
             if (path.empty())
                 return true;
             std::string ps = cell::normalize_path(path);
-            std::string ws = cell::normalize_path(workdir().string());
-            return ps.find(ws) == 0;
+            return ps.find(cell::workdir_norm()) == 0;
         }
         // check if a command/string contains path traversal attempts
         static bool has_path_traversal(std::string_view call)
@@ -1084,6 +1098,49 @@ namespace cell
             if (sandbox_mode() == SandboxMode::ReadOnly)
                 return false;
             return true;
+        }
+        // Bounded cache for compiled std::regex objects. Key: (pattern, flags).
+        // Avoids recompiling the same regex across repeated rg/find calls.
+        struct regex_cache_key {
+            std::string pattern;
+            unsigned flags;
+            bool operator==(const regex_cache_key &o) const noexcept {
+                return flags == o.flags && pattern == o.pattern;
+            }
+        };
+        struct regex_cache_key_hash {
+            size_t operator()(const regex_cache_key &k) const noexcept {
+                size_t h = std::hash<std::string>{}(k.pattern);
+                h ^= std::hash<unsigned>{}(k.flags) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+        static std::optional<std::regex> &regex_lookup(const std::string &pattern, unsigned flags)
+        {
+            static std::mutex mx;
+            static std::unordered_map<regex_cache_key, std::optional<std::regex>, regex_cache_key_hash> cache;
+            static constexpr size_t kMaxCache = 64;
+            thread_local std::vector<regex_cache_key> order; // recency order
+            regex_cache_key key{std::string(pattern), flags};
+            std::lock_guard lk(mx);
+            if (auto it = cache.find(key); it != cache.end())
+                return it->second;
+            if (cache.size() >= kMaxCache)
+            {
+                // evict oldest
+                for (auto &k : order)
+                {
+                    if (cache.erase(k))
+                    {
+                        order.erase(order.begin());
+                        break;
+                    }
+                }
+            }
+            order.push_back(key);
+            auto &entry = cache[key];
+            try { entry.emplace(pattern, static_cast<std::regex_constants::syntax_option_type>(flags)); } catch (const std::regex_error &) {}
+            return entry;
         }
         // -------- output hardening --------
         // prompt-injection neutraliser for any tool output fed back to the LLM.
@@ -1435,7 +1492,7 @@ namespace cell
                 R"(you are now (an )?(unrestricted|free|independent|jailbroken|the model|an assistant|a helpful assistant|a large language model))");
             static const std::regex re_debound(
                 R"(no longer (bound|constrained|restricted|required to obey|required to follow))");
-            auto has_fingerprint = [&](const std::string &flat) -> bool
+            auto has_fingerprint = [&](std::string_view flat) -> bool
             {
                 // cheap pre-filter before the regexes: every fingerprint and every
                 // regex family needs one of these stems. `flat` is already
@@ -1471,7 +1528,7 @@ namespace cell
                 };
                 bool hinted = false;
                 for (auto s : stems)
-                    if (flat.find(s) != std::string::npos)
+                    if (flat.find(s) != std::string_view::npos)
                     {
                         hinted = true;
                         break;
@@ -1479,40 +1536,49 @@ namespace cell
                 if (!hinted)
                     return false;
                 for (auto &fp : fingerprints)
-                    if (flat.find(fp) != std::string::npos)
+                    if (flat.find(fp) != std::string_view::npos)
                         return true;
-                if (std::regex_search(flat, re_override) || std::regex_search(flat, re_rebind) ||
-                    std::regex_search(flat, re_debound))
+                std::string flat_str(flat);
+                if (std::regex_search(flat_str, re_override) || std::regex_search(flat_str, re_rebind) ||
+                    std::regex_search(flat_str, re_debound))
                     return true;
                 return false;
             };
-            // flatten every line lazily from the buffer (no per-line copies);
-            // the flattened forms are stored because window matching needs
-            // up to 6 adjacent lines at once
-            std::vector<std::string> flats;
+            // flatten every line into a single contiguous buffer; store
+            // (offset, length) pairs instead of per-line std::string to avoid
+            // N heap allocations for N lines
+            struct flat_span { size_t off, len; };
+            std::vector<flat_span> spans;
             std::vector<bool> bad;
+            std::string flat_buf;
             {
                 std::string flat;
                 for (auto ln : text::lines(out))
                 {
                     flatten(ln, flat);
-                    flats.push_back(flat);
+                    spans.push_back({flat_buf.size(), flat.size()});
+                    flat_buf += flat;
                     bad.push_back(false);
                 }
             }
+            // helper: get flattened line i as string_view
+            auto flat_at = [&](size_t i) -> std::string_view {
+                return std::string_view(flat_buf).substr(spans[i].off, spans[i].len);
+            };
             // per-line match plus adjacent-line windows (2..6 consecutive lines
             // joined) so a fingerprint split across line breaks is still caught
-            for (size_t i = 0; i < flats.size(); i++)
+            for (size_t i = 0; i < spans.size(); i++)
             {
-                if (has_fingerprint(flats[i]))
+                if (has_fingerprint(flat_at(i)))
                     bad[i] = true;
-                size_t win = std::min<size_t>(6, flats.size() - i);
+                size_t win = std::min<size_t>(6, spans.size() - i);
                 if (win < 2)
                     continue;
+                // build window string by joining adjacent flat spans
                 std::string joined;
                 for (size_t k = 0; k < win; k++)
                 {
-                    joined += flats[i + k];
+                    joined += flat_at(i + k);
                     if (k + 1 < win)
                         joined += ' ';
                 }
@@ -1618,26 +1684,61 @@ namespace cell
         // confirmation before running: recursive/forced deletes and permission changes
         bool is_high_risk(std::string_view call)
         {
-            auto toks = tokens(to_lower(call));
-            for (size_t i = 0; i < toks.size(); i++)
+            // single-pass lowercase + token comparison without any heap allocation
+            auto is_flag = [](std::string_view tok) -> bool {
+                if (tok.size() <= 1 || (tok.front() != '-' && tok.front() != '/'))
+                    return false;
+                return tok.find('r') != std::string_view::npos ||
+                       tok.find('f') != std::string_view::npos ||
+                       tok.find('s') != std::string_view::npos;
+            };
+            size_t i = 0;
+            while (i < call.size())
             {
-                const std::string &w = toks[i];
-                if (w == "rm" || w == "del" || w == "rmdir" || w == "rd" || w == "remove")
+                // skip whitespace
+                while (i < call.size() && (call[i] == ' ' || call[i] == '\t'))
+                    i++;
+                if (i >= call.size())
+                    break;
+                size_t start = i;
+                while (i < call.size() && call[i] != ' ' && call[i] != '\t')
+                    i++;
+                std::string_view tok = call.substr(start, i - start);
+                // lowercase comparison inline
+                std::string lower_tok;
+                lower_tok.reserve(tok.size());
+                for (char c : tok)
+                    lower_tok += (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+                if (lower_tok == "rm" || lower_tok == "del" || lower_tok == "rmdir" ||
+                    lower_tok == "rd" || lower_tok == "remove")
                 {
-                    for (size_t k = i + 1; k < toks.size(); k++)
+                    // scan following tokens for -r/-f/-s flags
+                    size_t j = i;
+                    while (j < call.size())
                     {
-                        const std::string &f = toks[k];
-                        if (f.size() > 1 && (f.front() == '-' || f.front() == '/') &&
-                            (f.find('r') != std::string::npos || f.find('f') != std::string::npos || f.find('s') != std::string::npos))
+                        while (j < call.size() && (call[j] == ' ' || call[j] == '\t'))
+                            j++;
+                        if (j >= call.size())
+                            break;
+                        size_t fs = j;
+                        while (j < call.size() && call[j] != ' ' && call[j] != '\t')
+                            j++;
+                        std::string_view ftok = call.substr(fs, j - fs);
+                        if (is_flag(ftok))
                             return true;
+                        // stop if we hit a non-flag, non-option token
+                        if (!ftok.empty() && ftok.front() != '-' && ftok.front() != '/')
+                            break;
                     }
                 }
-                else if (w == "chmod" || w == "chown" || w == "sudo" || w == "cacls" || w == "icacls" || w == "takeown")
+                else if (lower_tok == "chmod" || lower_tok == "chown" || lower_tok == "sudo" ||
+                         lower_tok == "cacls" || lower_tok == "icacls" || lower_tok == "takeown")
                     return true;
-                else if (w == "commit" || w == "merge" || w == "rebase" || w == "cherry-pick" ||
-                         w == "am" || w == "apply" || w == "checkout" || w == "switch" ||
-                         w == "stash" || w == "clean" || w == "reset" || w == "restore")
-                    return true; // git operations that can trigger repo hooks
+                else if (lower_tok == "commit" || lower_tok == "merge" || lower_tok == "rebase" ||
+                         lower_tok == "cherry-pick" || lower_tok == "am" || lower_tok == "apply" ||
+                         lower_tok == "checkout" || lower_tok == "switch" || lower_tok == "stash" ||
+                         lower_tok == "clean" || lower_tok == "reset" || lower_tok == "restore")
+                    return true;
             }
             return false;
         }
@@ -1767,23 +1868,21 @@ namespace cell
         // makes no path reconstruction or allocation per comparison.
         static std::vector<std::filesystem::directory_entry> collect_entries(const std::filesystem::path &dir, std::error_code &ec)
         {
-            struct named_entry
-            {
-                std::filesystem::directory_entry e;
-                std::string name;
-            };
-            std::vector<named_entry> entries;
+            std::vector<std::filesystem::directory_entry> entries;
             for (auto it = std::filesystem::directory_iterator(dir, ec); it != std::filesystem::directory_iterator(); it.increment(ec))
                 if (!ec)
-                    entries.push_back({*it, it->path().filename().string()});
-            std::sort(entries.begin(), entries.end(),
-                      [](const named_entry &a, const named_entry &b)
-                      { return a.name < b.name; });
-            std::vector<std::filesystem::directory_entry> out;
-            out.reserve(entries.size());
-            for (auto &ne : entries)
-                out.push_back(std::move(ne.e));
-            return out;
+                    entries.push_back(*it);
+            // sort by filename using an index to avoid storing paired name strings
+            std::vector<size_t> idx(entries.size());
+            std::iota(idx.begin(), idx.end(), 0);
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return entries[a].path().filename().string() < entries[b].path().filename().string();
+            });
+            std::vector<std::filesystem::directory_entry> sorted;
+            sorted.reserve(entries.size());
+            for (size_t i : idx)
+                sorted.push_back(std::move(entries[i]));
+            return sorted;
         }
         // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
         // path, is_directory) for every non-hidden entry, one level at a time, in
@@ -1847,7 +1946,13 @@ namespace cell
             {
                 // compile the regex with optional case-insensitive flag
                 auto flags = ignore_case ? (std::regex::icase | std::regex::optimize) : std::regex::optimize;
-                std::regex re{std::string(pattern), flags};
+                auto &cached_re = regex_lookup(std::string(pattern), flags);
+                if (!cached_re)
+                {
+                    output = "rg: invalid regex pattern";
+                    return false;
+                }
+                const std::regex &re = *cached_re;
                 // literal fast path: a pattern without regex metacharacters is a
                 // plain substring search — std::string::find is an order of
                 // magnitude faster than per-line std::regex_search. for
@@ -2069,11 +2174,17 @@ namespace cell
                 // pattern is the primary glob filter (e.g. "**/*.test.ts")
                 std::optional<std::regex> pattern_rx;
                 if (!pattern.empty())
-                    pattern_rx.emplace("^" + glob_regex(pattern) + "$");
+                {
+                    auto &cached = regex_lookup("^" + glob_regex(pattern) + "$", std::regex::optimize);
+                    if (cached) pattern_rx = *cached;
+                }
                 // name is an optional secondary filename filter (plain glob)
                 std::optional<std::regex> name_rx;
                 if (!name.empty())
-                    name_rx.emplace("^" + glob_regex(name) + "$");
+                {
+                    auto &cached = regex_lookup("^" + glob_regex(name) + "$", std::regex::optimize);
+                    if (cached) name_rx = *cached;
+                }
                 auto now = std::filesystem::file_time_type::clock::now();
                 size_t count = 0;
                 bool truncated = false;
@@ -2238,9 +2349,9 @@ namespace cell
             static std::unordered_map<std::string, std::vector<read_range>> log;
             return log;
         }
-        static std::mutex &read_log_mx()
+        static std::shared_mutex &read_log_mx()
         {
-            static std::mutex mx;
+            static std::shared_mutex mx;
             return mx;
         }
         // canonical, case-insensitive (on Windows) path key for the read log;
@@ -2251,21 +2362,21 @@ namespace cell
             static std::unordered_map<std::string, std::string> c;
             return c;
         }
-        static std::mutex &canon_mx()
+        static std::shared_mutex &canon_mx()
         {
-            static std::mutex mx;
+            static std::shared_mutex mx;
             return mx;
         }
         static std::string read_log_key(std::string_view path)
         {
             {
-                std::lock_guard<std::mutex> lk(canon_mx());
+                std::shared_lock lk(canon_mx());
                 if (auto it = canon_cache().find(std::string(path)); it != canon_cache().end())
                     return it->second;
             }
             std::string s = cell::normalize_path(path);
             {
-                std::lock_guard<std::mutex> lk(canon_mx());
+                std::lock_guard lk(canon_mx());
                 canon_cache().emplace(std::string(path), s);
             }
             return s;
@@ -2274,13 +2385,13 @@ namespace cell
         // path was returned by a read tool call
         static void record_read(std::string_view path, size_t start, size_t end)
         {
-            std::lock_guard<std::mutex> lk(read_log_mx());
+            std::lock_guard lk(read_log_mx());
             read_log()[read_log_key(path)].push_back({start, end});
         }
         // forget every recorded read (session switched, cleared or compacted)
         static void reset_read_log()
         {
-            std::lock_guard<std::mutex> lk(read_log_mx());
+            std::lock_guard lk(read_log_mx());
             read_log().clear();
         }
         // true when the recorded reads of path jointly cover [start, end]
@@ -2288,7 +2399,7 @@ namespace cell
         {
             std::vector<read_range> spans;
             {
-                std::lock_guard<std::mutex> lk(read_log_mx());
+                std::shared_lock lk(read_log_mx());
                 auto it = read_log().find(read_log_key(path));
                 if (it == read_log().end())
                     return false;
@@ -2329,9 +2440,9 @@ namespace cell
             static std::unordered_map<std::string, file_cache_entry> c;
             return c;
         }
-        static std::mutex &file_cache_mx()
+        static std::shared_mutex &file_cache_mx()
         {
-            static std::mutex mx;
+            static std::shared_mutex mx;
             return mx;
         }
         // Get file status (mtime, size, exists). Returns false on error.
@@ -2346,7 +2457,7 @@ namespace cell
         }
         static void cache_invalidate(std::string_view path)
         {
-            std::lock_guard<std::mutex> lk(file_cache_mx());
+            std::lock_guard lk(file_cache_mx());
             file_cache().erase(read_log_key(path));
         }
         // -------- read / write / edit --------
@@ -2517,7 +2628,7 @@ namespace cell
             }
             std::string key = read_log_key(path);
             {
-                std::lock_guard<std::mutex> lk(file_cache_mx());
+                std::shared_lock lk(file_cache_mx());
                 auto it = file_cache().find(key);
                 if (it != file_cache().end() && it->second.mtime == mtime && it->second.size == size)
                 {
@@ -2538,7 +2649,7 @@ namespace cell
             uintmax_t size2;
             if (file_stat(path, mtime2, size2))
             {
-                std::lock_guard<std::mutex> lk(file_cache_mx());
+                std::lock_guard lk(file_cache_mx());
                 file_cache()[key] = {fresh, mtime2, size2};
             }
             content = std::move(fresh);
@@ -2553,7 +2664,7 @@ namespace cell
             uintmax_t size;
             if (file_stat(path, mtime, size))
             {
-                std::lock_guard<std::mutex> lk(file_cache_mx());
+                std::lock_guard lk(file_cache_mx());
                 file_cache()[key] = {std::move(content), mtime, size};
             }
             return true;
@@ -2603,7 +2714,7 @@ namespace cell
             auto size = std::filesystem::file_size(path, ec);
             if (!ec)
             {
-                std::lock_guard<std::mutex> lk(file_cache_mx());
+                std::lock_guard lk(file_cache_mx());
                 file_cache()[read_log_key(path)] = {std::string(input), mtime, size};
             }
             return true;
@@ -4484,20 +4595,26 @@ namespace cell
                     cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=policy_deny", name()));
                     return false;
                 }
+                // Parse input JSON once and reuse across all sandbox checks
+                nlohmann::json parsed;
+                bool parsed_ok = false;
+                try
+                {
+                    parsed = nlohmann::json::parse(input, nullptr, true);
+                    parsed_ok = true;
+                }
+                catch (const std::exception &)
+                {
+                }
                 if (policy() == Policy::Ask)
                 {
                     bool approval_bypassed = false;
                     {
                         auto approval_check = cell::tools::approval_required();
-                        try
-                        {
-                            auto j = nlohmann::json::parse(input, nullptr, false);
-                            approval_bypassed = approval_check && !approval_check(name(), j.is_discarded() ? input : j.value("operation", ""));
-                        }
-                        catch (const std::exception &)
-                        {
-                            approval_bypassed = approval_check && !approval_check(name(), input);
-                        }
+                        std::string op;
+                        if (parsed_ok && parsed.is_object())
+                            op = parsed.value("operation", "");
+                        approval_bypassed = approval_check && !approval_check(name(), op.empty() ? input : op);
                     }
                     if (approval_bypassed)
                     {
@@ -4507,18 +4624,8 @@ namespace cell
                     // autoallow mode: ask a context-free LLM safety check before
                     // running exec without user confirmation (FullAccess only)
                     std::string tool_operation;
-                    if (name() == "tw")
-                    {
-                        try
-                        {
-                            auto j = nlohmann::json::parse(input, nullptr, false);
-                            if (!j.is_discarded() && j.is_object())
-                                tool_operation = j.value("operation", "");
-                        }
-                        catch (const std::exception &)
-                        {
-                        }
-                    }
+                    if (name() == "tw" && parsed_ok && parsed.is_object())
+                        tool_operation = parsed.value("operation", "");
                     bool autoallow = box::autoallow_enabled() && box::sandbox_mode() == box::SandboxMode::FullAccess &&
                                      (name() == "exec" || (name() == "tw" && tool_operation == "run"));
                     if (!autoallow)
@@ -4538,16 +4645,7 @@ namespace cell
                     }
                     else
                     {
-                        std::string action_json;
-                        try
-                        {
-                            auto aj = nlohmann::json::parse(input, nullptr, true);
-                            action_json = aj.dump();
-                        }
-                        catch (const std::exception &)
-                        {
-                            action_json = input;
-                        }
+                        std::string action_json = parsed_ok ? parsed.dump() : input;
                         auto validator = cell::tools::autoallow_validator();
                         if (!validator || !validator(action_json))
                         {
@@ -4563,8 +4661,10 @@ namespace cell
                     if (name() == "exec")
                     {
                         // Extract the actual command string from JSON before sandbox checks
-                        std::string exec_cmd = try_parse_json_field(input, "cmd");
-                        if (exec_cmd.empty())
+                        std::string exec_cmd;
+                        if (parsed_ok && parsed.is_object() && parsed.contains("cmd") && parsed["cmd"].is_string())
+                            exec_cmd = parsed["cmd"].get<std::string>();
+                        else
                             exec_cmd = input; // fallback to raw input if not JSON
 
                         if (!box::check_exec(exec_cmd))
@@ -4576,7 +4676,9 @@ namespace cell
                             return false;
                         }
                         // also sandbox-check the working directory if provided
-                        std::string wd_val = try_parse_json_field(input, "wd");
+                        std::string wd_val;
+                        if (parsed_ok && parsed.is_object() && parsed.contains("wd") && parsed["wd"].is_string())
+                            wd_val = parsed["wd"].get<std::string>();
                         if (!wd_val.empty() && !box::check_path(wd_val))
                         {
                             blocked_.store(true, std::memory_order_relaxed);
@@ -4613,7 +4715,9 @@ namespace cell
                     {
                         // write/edit carry code content that may legally contain
                         // ">", "|" or ".." — only the path field is sandbox-checked
-                        std::string path_val = try_parse_json_field(input, "path");
+                        std::string path_val;
+                        if (parsed_ok && parsed.is_object() && parsed.contains("path") && parsed["path"].is_string())
+                            path_val = parsed["path"].get<std::string>();
                         bool blocked = path_val.empty() ? !box::check(input) : !box::check_path(path_val);
                         if (blocked)
                         {
@@ -4630,14 +4734,19 @@ namespace cell
                     // read-only tools take a "path" (or "dirpath") argument; check only the
                     // path field for traversal so regex patterns containing ".." are not rejected
                     bool blocked = false;
-                    std::string path_val = try_parse_json_field(input, "path");
-                    std::string dirpath_val = try_parse_json_field(input, "dirpath");
-                    if (!path_val.empty())
-                        blocked = !box::check_path(path_val);
-                    else if (!dirpath_val.empty())
-                        blocked = !box::check_path(dirpath_val);
-                    else
-                        blocked = !box::check_path(input);
+                    if (parsed_ok && parsed.is_object())
+                    {
+                        for (const char *key : {"path", "dirpath"})
+                        {
+                            if (parsed.contains(key) && parsed[key].is_string() && !box::check_path(parsed[key].get<std::string>()))
+                            {
+                                blocked = true;
+                                break;
+                            }
+                        }
+                    }
+                    else if (!box::check_path(input))
+                        blocked = true;
                     if (blocked)
                     {
                         blocked_.store(true, std::memory_order_relaxed);
