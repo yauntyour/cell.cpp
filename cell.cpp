@@ -1,36 +1,3 @@
-// =============================================================================
-//  cell.cpp — a single-file AI coding agent in modern C++26
-// =============================================================================
-//  Layout (single translation unit; namespace map, top to bottom):
-//
-//    [utils]   num_arg / dbl_arg       JSON argument coercion (number | string)
-//    cell::
-//      async_io  coalescing background file writer (submit / flush)
-//      plat      OS shims: spawn_cmd, is_tty, init_console, peek_key, executable_dir
-//      workdir   cwd identity helpers: workdir, cwd_id, session_path, sessions index
-//      text      zero-copy line generator, trim, BOM strip, display_safe / console_safe
-//      box       the sandbox + every tool implementation: check_path / check /
-//                check_exec, sanitize_output, wrap_tool_output, rg / find / ls /
-//                read / write / edit, gitignore matcher, read log, file cache
-//      net       curl transport: perform / CURL_post / CURL_stream_post / CURL_get
-//      sys       print/println/eprintln, structured logger, exception, scoped_exit,
-//                thread_pool, signal handlers
-//      config    provider registry, settings, load/save + legacy migration
-//      encrypt   base64, secure_string, Argon2id + AES-256-GCM vault
-//      tools     Policy (Deny/Ask/Allow), tool base class, callable_tool (gates)
-//      llm       SSE parsers, OpenAI / OpenAIResponses / Anthropic clients
-//      chat      session (per-cwd persistence) and history (in-memory session map)
-//      skills    front-matter parser, recursive scanner, metadata prompt
-//      stats     usage counters in .cell/usages.json
-//    [repl]    print_usage / print_help / build_tools (tool registry + schemas)
-//    [selftest] run_selftest
-//    [main]    argument parse, provider setup, slash commands, agent loop
-//
-//  Dependency direction (enforced by construction, not by decree): only cell::plat
-//  knows about OS APIs, only cell::net knows about curl, only cell::encrypt knows
-//  about libsodium.
-// =============================================================================
-
 #include <iostream>
 #include <fstream>
 #include <filesystem>
