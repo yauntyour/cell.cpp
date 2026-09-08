@@ -4578,9 +4578,11 @@ namespace cell
             autoallow,
         };
         // set during normal startup; while unset, autoallow is fail-closed
-        static std::function<bool(const std::string &)> &autoallow_validator()
+        // returns empty string = allow; non-empty = deny reason
+        // args: (tool_name, arguments_json)
+        static std::function<std::string(const std::string &, const std::string &)> &autoallow_validator()
         {
-            static std::function<bool(const std::string &)> v;
+            static std::function<std::string(const std::string &, const std::string &)> v;
             return v;
         }
         // Return false to run a Policy::Ask tool without prompting. This lets a
@@ -4588,6 +4590,13 @@ namespace cell
         static std::function<bool(const std::string &, const std::string &)> &approval_required()
         {
             static std::function<bool(const std::string &, const std::string &)> fn;
+            return fn;
+        }
+        // Enriches action_json before autoallow validation (e.g. tw run loads job config).
+        // Returns enriched JSON string; input is the raw tool arguments.
+        static std::function<std::string(const std::string &, const std::string &)> &action_enricher()
+        {
+            static std::function<std::string(const std::string &, const std::string &)> fn;
             return fn;
         }
         class tool
@@ -4722,13 +4731,18 @@ namespace cell
                     else
                     {
                         std::string action_json = parsed_ok ? parsed.dump() : input;
+                        // let registered enricher expand action context (e.g. tw run -> full job config)
+                        auto enricher = cell::tools::action_enricher();
+                        if (enricher)
+                            action_json = enricher(name(), action_json);
                         auto validator = cell::tools::autoallow_validator();
-                        if (!validator || !validator(action_json))
+                        std::string deny_reason = validator ? validator(name(), action_json) : "";
+                        if (!deny_reason.empty())
                         {
                             blocked_.store(true, std::memory_order_relaxed);
                             rejected_for_.store(rejection_reason::autoallow, std::memory_order_relaxed);
                             cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=autoallow_rejected args={}", name(), input));
-                            output = std::format("[{}] rejected by autoallow safety check", name());
+                            output = std::format("[{}] autoallow rejected: {}", name(), deny_reason);
                             return false;
                         }
                         cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={}", name(), cell::text::display_safe(input)));
@@ -6387,15 +6401,13 @@ namespace cell
                 err = "config must be a JSON object";
                 return false;
             }
-            auto cfg_it = input.find("config");
             auto list_it = input.find("list");
-            if (cfg_it == input.end() || !cfg_it->is_object() ||
-                list_it == input.end() || !list_it->is_array())
+            if (list_it == input.end() || !list_it->is_array())
             {
-                err = "both config and list are required";
+                err = "list is required";
                 return false;
             }
-            std::string work_type = cfg_it->value("work-type", cfg_it->value("work_type", "serial"));
+            std::string work_type = input.value("work-type", input.value("work_type", "serial"));
             if (work_type != "serial" && work_type != "parallel")
             {
                 err = "work-type must be serial or parallel";
@@ -6682,6 +6694,7 @@ namespace cell
                 return false;
             }
             size_t erased = 0;
+            size_t worker_index = 0;
             for (auto it = list_it->begin(); it != list_it->end(); ++it)
             {
                 if (it->is_object() && it->value("name", "") == worker)
@@ -6690,6 +6703,7 @@ namespace cell
                     erased = 1;
                     break;
                 }
+                worker_index++;
             }
             if (!erased)
             {
@@ -6698,18 +6712,9 @@ namespace cell
             }
             if (status == "completed")
             {
-                std::filesystem::path dir = job_directory(job_id);
+                std::filesystem::path worker_file = job_directory(job_id) / (std::format("worker_{}.json", worker_index));
                 std::error_code ec;
-                if (std::filesystem::is_directory(dir, ec))
-                {
-                    for (auto &entry : std::filesystem::directory_iterator(dir, ec))
-                    {
-                        if (ec)
-                            break;
-                        if (entry.is_regular_file(ec) && entry.path().stem().string().ends_with("-" + worker))
-                            std::filesystem::remove(entry.path(), ec);
-                    }
-                }
+                std::filesystem::remove(worker_file, ec);
                 auto reports = job->find("summary_reports");
                 if (reports != job->end() && reports->is_object())
                     reports->erase(worker);
@@ -6759,7 +6764,7 @@ namespace cell
         }
 
         static worker_report run_worker(const nlohmann::json &job, const nlohmann::json &worker,
-                                        runtime_context &rt)
+                                        size_t worker_index, runtime_context &rt)
         {
             worker_report result;
             result.name = worker.value("name", "worker");
@@ -6814,7 +6819,7 @@ namespace cell
             }
 
             std::filesystem::path session_dir = job_directory(job.value("id", ""));
-            std::filesystem::path session_file = session_dir / (creation_stamp(job.value("created_at", 0LL)) + "-" + worker_id + ".json");
+            std::filesystem::path session_file = session_dir / (std::format("worker_{}.json", worker_index));
             auto persist = [&]()
             {
                 std::error_code ec;
@@ -6877,9 +6882,13 @@ namespace cell
                         else if (!tool_it->second->execute(args, output) && output.empty())
                             output = "[tool failed]";
                     }
-                    messages.push_back({{"role", "tool"},
-                                        {"tool_call_id", call.value("id", "")},
-                                        {"content", child_tool_output(name, output)}});
+                    std::string wrapped = child_tool_output(name, output);
+                    if (provider->api_style == "anthropic")
+                        messages.push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", call.value("id", "")}, {"content", wrapped}}})}});
+                    else if (provider->api_style == "openai-responses")
+                        messages.push_back({{"type", "function_call_output"}, {"call_id", call.value("id", "")}, {"output", wrapped}});
+                    else
+                        messages.push_back({{"role", "tool"}, {"tool_call_id", call.value("id", "")}, {"content", wrapped}});
                 }
                 persist();
             }
@@ -6924,16 +6933,21 @@ namespace cell
             if (parallel)
             {
                 std::vector<std::future<worker_report>> futures;
+                size_t wi = 0;
                 for (auto &worker : (*job)["list"])
-                    futures.push_back(std::async(std::launch::async, [&job, worker, &rt]()
-                                                 { return run_worker(*job, worker, rt); }));
+                    futures.push_back(std::async(std::launch::async, [&job, worker, wi, &rt]()
+                                                 { return run_worker(*job, worker, wi, rt); }));
                 for (auto &future : futures)
                     reports.push_back(future.get());
             }
             else
             {
+                size_t wi = 0;
                 for (auto &worker : (*job)["list"])
-                    reports.push_back(run_worker(*job, worker, rt));
+                {
+                    reports.push_back(run_worker(*job, worker, wi, rt));
+                    wi++;
+                }
             }
             nlohmann::json summary_reports = nlohmann::json::object();
             std::string consolidated;
@@ -7224,25 +7238,29 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     {
         nlohmann::json props = {
             {"operation", str_prop("new | run | edit | remove")},
-            {"config", {{"type", "object"}, {"description", "Job configuration: {config: {work-type: serial|parallel}, list: [{background: none|prolegomena, works: task description}]}"}}},
+            {"work-type", str_prop("serial | parallel (default serial)")},
+            {"list", {{"type", "array"}, {"description", "Workers: [{background: none|prolegomena, works: task description}]"}}},
             {"id", str_prop("Job ID (required for run/edit/remove, format: tw-TIMESTAMP-N)")}};
-        add("tw", "Manage Teamwork child-agent jobs.\nnew: Create a job with child agents. config.config sets work-type (serial|parallel), config.list defines workers [{background, works}].\nrun: Execute a job by id. Optional config updates the job before running.\nedit: Update an uncompleted job's config.\nremove: Delete a pending/failed job.", props, {"operation"}, Policy::Ask, [](const nlohmann::json &j, std::string &out)
+        add("tw", "Manage Teamwork child-agent jobs.\nnew: Create a job with child agents. work-type sets serial|parallel mode, list defines workers [{background, works}].\nrun: Execute a job by id. Optional work-type/list updates the job before running.\nedit: Update an uncompleted job's config.\nremove: Delete a pending/failed job.", props, {"operation"}, Policy::Ask, [](const nlohmann::json &j, std::string &out)
             {
                 std::string operation = j.value("operation", "");
                 std::string job_id = j.value("id", "");
-                const nlohmann::json *config = nullptr;
-                if (j.contains("config") && j["config"].is_object())
-                    config = &j["config"];
+                nlohmann::json config = nlohmann::json::object();
+                if (j.contains("work-type"))
+                    config["work-type"] = j["work-type"];
+                if (j.contains("list"))
+                    config["list"] = j["list"];
+                bool has_config = !config.empty();
                 cell::config::settings cfg = cell::config::load().value_or(cell::config::settings{});
                 size_t max_children = cell::teamwork::max_children(cfg);
                 if (operation == "new")
                 {
-                    if (!config)
+                    if (!has_config)
                     {
-                        out = "new requires config: {config: {work-type: serial|parallel}, list: [{background: none|prolegomena, works: task description}]}";
+                        out = "new requires work-type (serial|parallel) and list: [{background: none|prolegomena, works: task description}]";
                         return false;
                     }
-                    if (!cell::teamwork::new_job(*config, max_children, out))
+                    if (!cell::teamwork::new_job(config, max_children, out))
                         return false;
                     nlohmann::json store = cell::teamwork::load_store();
                     nlohmann::json *job = cell::teamwork::find_job(store, out);
@@ -7261,12 +7279,12 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                         out = "edit requires the id parameter";
                         return false;
                     }
-                    if (!config)
+                    if (!has_config)
                     {
-                        out = "edit requires the config parameter with the new configuration";
+                        out = "edit requires work-type or list parameter with the new configuration";
                         return false;
                     }
-                    return cell::teamwork::edit_job(job_id, *config, max_children, out);
+                    return cell::teamwork::edit_job(job_id, config, max_children, out);
                 }
                 if (operation == "remove")
                 {
@@ -7284,9 +7302,9 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                         out = "run requires the id parameter (format: tw-TIMESTAMP-N)";
                         return false;
                     }
-                    if (config)
+                    if (has_config)
                     {
-                        if (!cell::teamwork::edit_job(job_id, *config, max_children, out))
+                        if (!cell::teamwork::edit_job(job_id, config, max_children, out))
                             return false;
                     }
                     return cell::teamwork::run_job(job_id, out);
@@ -8695,17 +8713,17 @@ int main(int argc, char const *argv[])
 
     // autoallow asks the model to evaluate only this action, not the session,
     // prior tool output, or the user's system prompt. The check is fail-closed.
-    auto autoallow_check = [&do_chat, &cfg, &resolve_key, &total_llm_requests, &reply_text](const std::string &action) -> bool
+    auto autoallow_check = [&do_chat, &cfg, &resolve_key, &total_llm_requests, &reply_text](const std::string &tool_name, const std::string &action) -> std::string
     {
         const cell::config::provider_entry *p = cfg.current_provider_entry();
         if (!p || cfg.current_model.empty())
-            return false;
+            return "internal error: no provider";
         cell::encrypt::secure_string key = resolve_key(*p);
         if (key.empty())
-            return false;
+            return "internal error: no API key";
         const nlohmann::json messages = nlohmann::json::array({
-            {{"role", "system"}, {"content", "You are an action safety gate. Determine only whether this tool action is safe and legal to execute. Answer with exactly ALLOW or DENY. No explanation."}},
-            {{"role", "user"}, {"content", std::format("Tool action JSON:\n{}\n\nIs this action safe and legal to execute? Answer with exactly ALLOW or DENY.", action)}},
+            {{"role", "system"}, {"content", "You are an action safety gate. Determine whether this tool action is safe and legal to execute. If ALLOW, reply with exactly one word: ALLOW. If DENY, reply with a short explanation of why this action is unsafe (1-2 sentences)."}},
+            {{"role", "user"}, {"content", std::format("Tool: {}\nArguments JSON:\n{}\n\nIs this action safe and legal to execute? ALLOW or explain why DENY.", tool_name, action)}},
         });
         nlohmann::json reply, tc, usage;
         std::string err;
@@ -8714,16 +8732,46 @@ int main(int argc, char const *argv[])
                      reply, tc, usage, err, false, cfg.think_level))
         {
             cell::sys::logger::instance().warn("autoallow", std::format("request_failed err={}", err.empty() ? "n/a" : err));
-            return false;
+            return "autoallow request failed";
         }
         std::string answer = cell::text::trim(reply_text(reply));
         cell::lower_ascii(answer);
-        return answer == "allow";
+        if (answer == "allow")
+            return "";
+        return answer;
     };
     cell::tools::autoallow_validator() = autoallow_check;
     cell::tools::approval_required() = [](const std::string &tool, const std::string &operation) -> bool
     {
         return !(tool == "tw" && operation != "run");
+    };
+    cell::tools::action_enricher() = [](const std::string &tool_name, const std::string &action_json) -> std::string
+    {
+        if (tool_name != "tw")
+            return action_json;
+        try
+        {
+            auto parsed = nlohmann::json::parse(action_json);
+            if (!parsed.is_object() || parsed.value("operation", "") != "run")
+                return action_json;
+            std::string job_id = parsed.value("id", "");
+            if (job_id.empty())
+                return action_json;
+            auto store = cell::teamwork::load_store();
+            auto *job = cell::teamwork::find_job(store, job_id);
+            if (!job)
+                return action_json;
+            nlohmann::json enriched = parsed;
+            if (job->contains("work_type"))
+                enriched["work_type"] = (*job)["work_type"];
+            if (job->contains("list"))
+                enriched["list"] = (*job)["list"];
+            return enriched.dump();
+        }
+        catch (const std::exception &)
+        {
+            return action_json;
+        }
     };
 
     // Teamwork needs the same provider/request machinery as the main agent,
@@ -9379,6 +9427,17 @@ int main(int argc, char const *argv[])
                     long long before = (long long)s->msg().size();
                     s->msg().clear();
                     cell::box::reset_read_log(); // context gone: recorded reads no longer apply
+                    // clear teamwork: remove all job directories and the store file
+                    {
+                        nlohmann::json store = cell::teamwork::load_store();
+                        auto jobs = store.find("jobs");
+                        if (jobs != store.end() && jobs->is_object())
+                        {
+                            for (auto &[jid, _] : jobs->items())
+                                std::filesystem::remove_all(cell::teamwork::job_directory(jid));
+                        }
+                        cell::teamwork::save_store(nlohmann::json::object());
+                    }
                     ensure_prompt(s);
                     s->unload();
                     cell::async_io::flush();
@@ -10211,7 +10270,7 @@ int main(int argc, char const *argv[])
                     { return toks.size() > 1 ? toks[1] : ""; };
                     if (arg0() == "new")
                     {
-                        nlohmann::json config = {{"config", {{"work-type", "serial"}}}, {"list", nlohmann::json::array()}};
+                        nlohmann::json config = {{"work-type", "serial"}, {"list", nlohmann::json::array()}};
                         std::string id;
                         if (cell::teamwork::new_job(config, cell::teamwork::max_children(cfg), id))
                         {
@@ -10744,11 +10803,11 @@ int main(int argc, char const *argv[])
                             s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
                     }
                     // sandbox security refusals are normal feedback; only approval
-                    // refusals end the run (user decline or autoallow safety deny)
+                    // refusals end the run (user decline only, autoallow reject
+                    // returns error message and continues)
                     bool approval_refused = false;
                     for (size_t i = 0; i < tool_calls.size(); i++)
-                        if (res[i].blocked && (res[i].rejected_for == cell::tools::rejection_reason::user ||
-                                               res[i].rejected_for == cell::tools::rejection_reason::autoallow))
+                        if (res[i].blocked && res[i].rejected_for == cell::tools::rejection_reason::user)
                         {
                             approval_refused = true;
                             cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
