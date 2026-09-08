@@ -555,6 +555,23 @@ namespace cell
                 c = char(c - 'A' + 'a');
     }
 
+    // Normalize a path: absolute → weakly_canonical → lexically_normal → generic_string → lower_ascii (Windows).
+    static std::string normalize_path(std::string_view path)
+    {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
+        if (ec)
+            return std::string(path);
+        std::filesystem::path canon = std::filesystem::weakly_canonical(p, ec);
+        if (!ec)
+            p = canon;
+        std::string s = p.lexically_normal().generic_string();
+#ifdef _WIN32
+        lower_ascii(s);
+#endif
+        return s;
+    }
+
     std::filesystem::path root = plat::executable_dir() / ".cell";
 
     static std::optional<std::filesystem::path> &workdir_cache()
@@ -883,22 +900,12 @@ namespace cell
                 std::lock_guard<std::mutex> lk(rc_mx);
                 if (rc_root != cell::root)
                 {
-                    std::error_code ec;
-                    rc_root = std::filesystem::absolute(cell::root, ec);
-                    rc_root_s = to_lower(rc_root.lexically_normal().generic_string());
+                    rc_root = cell::root;
+                    rc_root_s = cell::normalize_path(cell::root.string());
                 }
                 root_s = rc_root_s;
             }
-            std::error_code ec;
-            std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
-            if (ec)
-                return false;
-            // Resolve symlinks to prevent bypass via symlink to sensitive target.
-            std::filesystem::path canon = std::filesystem::weakly_canonical(p, ec);
-            if (!ec)
-                p = canon;
-            std::string s = p.lexically_normal().generic_string();
-            lower_ascii(s);
+            std::string s = cell::normalize_path(path);
             if (root_s.empty())
                 return false;
             const std::string skills_prefix = root_s + "/skills";
@@ -1017,27 +1024,21 @@ namespace cell
         {
             if (path.empty())
                 return true;
-            std::error_code ec;
-            std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
-            if (ec)
-                return false;
-            std::filesystem::path canon = std::filesystem::weakly_canonical(p, ec);
-            if (!ec)
-                p = canon;
-            std::string ws = workdir().generic_string();
-            std::string ps = p.lexically_normal().generic_string();
-#ifdef _WIN32
-            lower_ascii(ws);
-            lower_ascii(ps);
-#endif
+            std::string ps = cell::normalize_path(path);
+            std::string ws = cell::normalize_path(workdir().string());
             return ps.find(ws) == 0;
+        }
+        // check if a command/string contains path traversal attempts
+        static bool has_path_traversal(std::string_view call)
+        {
+            return call.find("..") != std::string_view::npos;
         }
 
         // check path-only tools (grep, read, exist): reject path traversal and
         // sensitive-path access (credential vault, key files)
         bool check_path(std::string_view call)
         {
-            if (call.find("..") != std::string_view::npos)
+            if (has_path_traversal(call))
                 return false;
             if (is_sensitive_path(call))
                 return false;
@@ -1052,7 +1053,7 @@ namespace cell
         // check command/write tools (exec, write, remove, mkdir, edit): path restrictions only
         bool check(std::string_view call)
         {
-            if (call.find("..") != std::string_view::npos)
+            if (has_path_traversal(call))
                 return false;
             // Check if the command references sensitive paths
             std::string lower = to_lower(call);
@@ -1073,7 +1074,7 @@ namespace cell
         static bool check_exec(std::string_view call)
         {
             // Check for path traversal
-            if (call.find("..") != std::string_view::npos)
+            if (has_path_traversal(call))
                 return false;
             // Check if the command references sensitive paths
             std::string lower = to_lower(call);
@@ -2197,12 +2198,9 @@ namespace cell
             std::string actual_cmd(cmd);
             if (!wd.empty())
             {
-                std::error_code ec;
-                auto abs_wd = std::filesystem::absolute(std::filesystem::path(wd), ec);
-                if (!ec)
+                std::string wd_s = cell::normalize_path(wd);
+                if (!wd_s.empty())
                 {
-                    auto canon_wd = std::filesystem::weakly_canonical(abs_wd, ec);
-                    std::string wd_s = canon_wd.lexically_normal().generic_string();
 #ifdef _WIN32
                     actual_cmd = std::format("cd /d \"{}\" && {}", wd_s, cmd);
 #else
@@ -2265,12 +2263,7 @@ namespace cell
                 if (auto it = canon_cache().find(std::string(path)); it != canon_cache().end())
                     return it->second;
             }
-            std::error_code ec;
-            std::filesystem::path p = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
-            std::string s = p.lexically_normal().generic_string();
-#ifdef _WIN32
-            lower_ascii(s);
-#endif
+            std::string s = cell::normalize_path(path);
             {
                 std::lock_guard<std::mutex> lk(canon_mx());
                 canon_cache().emplace(std::string(path), s);
@@ -2340,6 +2333,16 @@ namespace cell
         {
             static std::mutex mx;
             return mx;
+        }
+        // Get file status (mtime, size, exists). Returns false on error.
+        static bool file_stat(std::string_view path, std::filesystem::file_time_type &mtime, uintmax_t &size)
+        {
+            std::error_code ec;
+            mtime = std::filesystem::last_write_time(path, ec);
+            if (ec)
+                return false;
+            size = std::filesystem::file_size(path, ec);
+            return !ec;
         }
         static void cache_invalidate(std::string_view path)
         {
@@ -2501,11 +2504,11 @@ namespace cell
         // size+mtime are unchanged; false on I/O error (err carries the reason)
         static bool load_file(std::string_view path, std::string &content, std::string &err)
         {
-            std::error_code ec;
-            auto mtime = std::filesystem::last_write_time(path, ec);
-            auto size = std::filesystem::file_size(path, ec);
-            if (ec)
+            std::filesystem::file_time_type mtime;
+            uintmax_t size;
+            if (!file_stat(path, mtime, size))
             {
+                std::error_code ec;
                 if (std::filesystem::is_directory(path, ec))
                     err = std::format("{} is a directory, not a file.", std::string(path));
                 else
@@ -2531,12 +2534,12 @@ namespace cell
             }
             // re-stat after reading so a writer that raced us cannot seed a
             // stale cache entry; a failed stat just leaves the cache cold
-            auto mtime2 = std::filesystem::last_write_time(path, ec);
-            auto size2 = std::filesystem::file_size(path, ec);
+            std::filesystem::file_time_type mtime2;
+            uintmax_t size2;
+            if (file_stat(path, mtime2, size2))
             {
                 std::lock_guard<std::mutex> lk(file_cache_mx());
-                if (!ec)
-                    file_cache()[key] = {fresh, mtime2, size2};
+                file_cache()[key] = {fresh, mtime2, size2};
             }
             content = std::move(fresh);
             return true;
@@ -2546,10 +2549,9 @@ namespace cell
         {
             if (!write(path, content))
                 return false;
-            std::error_code ec;
-            auto mtime = std::filesystem::last_write_time(path, ec);
-            auto size = std::filesystem::file_size(path, ec);
-            if (!ec)
+            std::filesystem::file_time_type mtime;
+            uintmax_t size;
+            if (file_stat(path, mtime, size))
             {
                 std::lock_guard<std::mutex> lk(file_cache_mx());
                 file_cache()[key] = {std::move(content), mtime, size};
@@ -4431,6 +4433,21 @@ namespace cell
             { f(input, output) } -> std::convertible_to<bool>;
         };
 
+        // Try to parse input as JSON and extract a string field. Returns empty string on failure.
+        static std::string try_parse_json_field(const std::string &input, const char *field)
+        {
+            try
+            {
+                auto j = nlohmann::json::parse(input, nullptr, false);
+                if (j.is_object() && j.contains(field) && j[field].is_string())
+                    return j[field].get<std::string>();
+            }
+            catch (const std::exception &)
+            {
+            }
+            return "";
+        }
+
         class callable_tool : public tool
         {
         private:
@@ -4546,19 +4563,9 @@ namespace cell
                     if (name() == "exec")
                     {
                         // Extract the actual command string from JSON before sandbox checks
-                        std::string exec_cmd;
-                        try
-                        {
-                            auto j = nlohmann::json::parse(input, nullptr, false);
-                            if (j.is_object() && j.contains("cmd") && j["cmd"].is_string())
-                                exec_cmd = j["cmd"].get<std::string>();
-                            else
-                                exec_cmd = input; // fallback to raw input if not JSON
-                        }
-                        catch (const std::exception &)
-                        {
-                            exec_cmd = input; // fallback to raw input if parse fails
-                        }
+                        std::string exec_cmd = try_parse_json_field(input, "cmd");
+                        if (exec_cmd.empty())
+                            exec_cmd = input; // fallback to raw input if not JSON
 
                         if (!box::check_exec(exec_cmd))
                         {
@@ -4569,24 +4576,14 @@ namespace cell
                             return false;
                         }
                         // also sandbox-check the working directory if provided
-                        try
+                        std::string wd_val = try_parse_json_field(input, "wd");
+                        if (!wd_val.empty() && !box::check_path(wd_val))
                         {
-                            auto j = nlohmann::json::parse(input, nullptr, false);
-                            if (j.is_object() && j.contains("wd") && j["wd"].is_string())
-                            {
-                                std::string wd_val = j["wd"].get<std::string>();
-                                if (!wd_val.empty() && !box::check_path(wd_val))
-                                {
-                                    blocked_.store(true, std::memory_order_relaxed);
-                                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                                    output = std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val);
-                                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=wd_sandbox wd={} args={}", name(), wd_val, input));
-                                    return false;
-                                }
-                            }
-                        }
-                        catch (const std::exception &)
-                        {
+                            blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
+                            output = std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val);
+                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=wd_sandbox wd={} args={}", name(), wd_val, input));
+                            return false;
                         }
                         if (box::is_high_risk(exec_cmd))
                         {
@@ -4616,19 +4613,8 @@ namespace cell
                     {
                         // write/edit carry code content that may legally contain
                         // ">", "|" or ".." — only the path field is sandbox-checked
-                        bool blocked = false;
-                        try
-                        {
-                            auto j = nlohmann::json::parse(input, nullptr, false);
-                            if (j.is_object() && j.contains("path") && j["path"].is_string())
-                                blocked = !box::check_path(j["path"].get<std::string>());
-                            else
-                                blocked = !box::check(input);
-                        }
-                        catch (const std::exception &)
-                        {
-                            blocked = !box::check(input);
-                        }
+                        std::string path_val = try_parse_json_field(input, "path");
+                        bool blocked = path_val.empty() ? !box::check(input) : !box::check_path(path_val);
                         if (blocked)
                         {
                             blocked_.store(true, std::memory_order_relaxed);
@@ -4644,28 +4630,14 @@ namespace cell
                     // read-only tools take a "path" (or "dirpath") argument; check only the
                     // path field for traversal so regex patterns containing ".." are not rejected
                     bool blocked = false;
-                    try
-                    {
-                        auto j = nlohmann::json::parse(input, nullptr, false);
-                        if (j.is_object())
-                        {
-                            for (const char *key : {"path", "dirpath"})
-                            {
-                                if (j.contains(key) && j[key].is_string() && !box::check_path(j[key].get<std::string>()))
-                                {
-                                    blocked = true;
-                                    break;
-                                }
-                            }
-                        }
-                        else if (!box::check_path(input))
-                            blocked = true;
-                    }
-                    catch (const std::exception &)
-                    {
-                        if (!box::check_path(input))
-                            blocked = true;
-                    }
+                    std::string path_val = try_parse_json_field(input, "path");
+                    std::string dirpath_val = try_parse_json_field(input, "dirpath");
+                    if (!path_val.empty())
+                        blocked = !box::check_path(path_val);
+                    else if (!dirpath_val.empty())
+                        blocked = !box::check_path(dirpath_val);
+                    else
+                        blocked = !box::check_path(input);
                     if (blocked)
                     {
                         blocked_.store(true, std::memory_order_relaxed);
