@@ -80,9 +80,7 @@
 #include <termios.h>
 #endif
 
-// JSON tool/config argument that may arrive as a JSON number or a quoted
-// numeric string (models frequently quote integers, and hand-edited config
-// files often do too); returns the parsed value or fallback. Never throws.
+// Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
 static size_t num_arg(const nlohmann::json &j, const char *key, size_t fallback)
 {
     auto it = j.find(key);
@@ -131,10 +129,7 @@ static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
 
 namespace cell
 {
-    // Platform-specific newline conversion helper for file output
-    // (LF -> CRLF on Windows, LF unchanged elsewhere). Defined once at cell
-    // scope so nested namespaces (async_io writer, box::write) can call it via
-    // ordinary enclosing-scope lookup.
+    // LF -> CRLF on Windows, LF unchanged elsewhere.
     static std::string to_platform_newline(std::string_view content)
     {
 #ifdef _WIN32
@@ -153,11 +148,7 @@ namespace cell
     }
 
     // =========================================================================
-    //  async_io — offloads file writes off the hot path: submits are coalesced
-    //  per path (latest content wins), a single background thread performs the
-    //  disk I/O. flush() drains synchronously and is required before any disk
-    //  read of a recently-submitted path (commands like /sessions, /session,
-    //  /save, exit).
+    //  async_io — coalescing background file writer (submit / flush)
     // =========================================================================
     namespace async_io
     {
@@ -183,7 +174,6 @@ namespace cell
                 std::ofstream f(j.path, std::ios::binary | std::ios::trunc);
                 if (f.is_open())
                 {
-                    // Platform-specific newline conversion: LF -> CRLF on Windows
                     std::string content = to_platform_newline(j.content);
                     f.write(content.data(), (std::streamsize)content.size());
                     f.flush();
@@ -237,7 +227,6 @@ namespace cell
                 }
                 cv.notify_one();
             }
-            // drain everything synchronously (including any in-flight write)
             void flush()
             {
                 std::unique_lock lk(mx);
@@ -275,15 +264,11 @@ namespace cell
         }
     } // namespace async_io
     // =========================================================================
-    //  plat — platform layer: the only place in this file that knows about
-    //  OS-specific APIs. everything else in the code base calls these portable
-    //  shims and is free of #ifdef.
+    //  plat — OS shims: the only place that knows about platform APIs.
     // =========================================================================
     namespace plat
     {
-        // spawn a command with a hard timeout; captures stdout into output and
-        // stderr into stderr_output; returns the exit code in exit_code (124 when
-        // killed by the timeout). the child process tree is terminated on timeout.
+        // Spawn a command with timeout; captures stdout/stderr; exit_code=124 on timeout.
         inline bool spawn_cmd(const std::string &cmd, double timeout_s, std::string &output, int &exit_code, std::string &stderr_output)
         {
 #ifdef _WIN32
@@ -456,7 +441,6 @@ namespace cell
 #endif
         }
 
-        // is this stream attached to a terminal?
         inline bool is_tty(FILE *f)
         {
 #ifdef _WIN32
@@ -466,8 +450,6 @@ namespace cell
 #endif
         }
 
-        // human-readable exception type name: plain type_info::name() is the one
-        // API that works on every compiler without extra machinery
         inline const char *exception_name(const std::type_info &ti) { return ti.name(); }
 
 #ifndef _WIN32
@@ -475,9 +457,7 @@ namespace cell
         inline bool termios_saved = false;
 #endif
 
-        // enable ANSI color output (and UTF-8 codepage on Windows); on POSIX also
-        // remembers the terminal state for raw key peeking. returns whether
-        // colors are usable on the console.
+        // Enable ANSI color output; on POSIX also saves terminal state for raw key peeking.
         inline bool init_console(bool force)
         {
 #ifdef _WIN32
@@ -507,9 +487,7 @@ namespace cell
 #endif
         }
 
-        // non-blocking key peek: drains pending input and returns 27 (Esc) if an
-        // Esc key is among it, otherwise 0. used to let the user cancel a
-        // streaming reply. POSIX side temporarily switches stdin to raw mode.
+        // Non-blocking key peek: returns 27 (Esc) if found, 0 otherwise.
         inline int peek_key()
         {
 #ifdef _WIN32
@@ -536,8 +514,8 @@ namespace cell
             return key;
 #endif
         }
-        // absolute directory containing the cell executable: the anchor of the
-        // .cell data dir, independent of the cwd cell happens to run in
+
+        // Directory containing the cell executable.
         inline std::filesystem::path executable_dir()
         {
 #ifdef _WIN32
@@ -567,12 +545,9 @@ namespace cell
     } // namespace plat
 
     // =========================================================================
-    //  workdir — cwd identity: the normalized working directory, its stable
-    //  hash key, session file paths and the cwd hash -> path index that lets
-    //  every session group be resolved back to a real directory.
+    //  workdir — cwd identity helpers
     // =========================================================================
 
-    // ASCII-only lowercase, in place (case-insensitive matching; Windows paths)
     static void lower_ascii(std::string &s)
     {
         for (auto &c : s)
@@ -582,7 +557,6 @@ namespace cell
 
     std::filesystem::path root = plat::executable_dir() / ".cell";
 
-    // normalized absolute working directory: the identity of "the cwd cell runs in"
     static std::optional<std::filesystem::path> &workdir_cache()
     {
         static std::optional<std::filesystem::path> c;
@@ -601,11 +575,8 @@ namespace cell
         workdir_cache() = p;
         return p;
     }
-    // call after every chdir so the cached workdir / cwd_id stay correct
     static void reset_workdir_cache() { workdir_cache().reset(); }
-    // stable per-cwd key: SHA-256 of the normalized cwd path, hex, truncated to
-    // 16 chars. windows paths are case-insensitive, so the input is lowercased
-    // before hashing.
+    // SHA-256 of normalized cwd, hex, truncated to 16 chars.
     static std::string cwd_id()
     {
         static std::string cached_wd, cached_id;
@@ -630,18 +601,15 @@ namespace cell
         cached_id = out;
         return out;
     }
-    // every session id embeds its cwd key before the first '-'
     static std::string session_prefix(const std::string &session_id)
     {
         size_t d = session_id.find('-');
         return d == std::string::npos ? session_id : session_id.substr(0, d);
     }
-    // on-disk session file: <root>/sessions/<cwd key>/<id>.json
     static std::filesystem::path session_path(const std::string &session_id)
     {
         return root / "sessions" / session_prefix(session_id) / (session_id + ".json");
     }
-    // canonical, case-insensitive (on Windows) path equality
     static bool same_path(const std::string &a, const std::string &b)
     {
         std::error_code ec;
@@ -654,13 +622,10 @@ namespace cell
 #endif
         return sa == sb;
     }
-    // index of cwd hash -> cwd path, kept at <root>/sessions/sessions.json so every
-    // hash can be resolved back to the directory it stands for
     static std::filesystem::path sessions_index_path()
     {
         return root / "sessions" / "sessions.json";
     }
-    // cached parse of the sessions index; invalidated by root changes (selftest) or writes
     static std::optional<nlohmann::json> &index_cache()
     {
         static std::optional<nlohmann::json> c;
@@ -671,9 +636,7 @@ namespace cell
         static std::filesystem::path r;
         return r;
     }
-    // cached parse of the sessions index; invalidated by root changes (selftest) or writes.
-    // returns a const reference into the cache — callers must not hold it across
-    // remember_cwd(), which mutates the cache.
+    // Cached sessions index; invalidated by root changes.
     static const nlohmann::json &sessions_index()
     {
         if (index_cache() && index_cache_root() == root)
@@ -694,7 +657,7 @@ namespace cell
         }
         index_cache() = std::move(j);
         index_cache_root() = root;
-        return *index_cache(); // reference into the cache, not the local
+        return *index_cache();
     }
     static std::string cwd_for_key(const std::string &key)
     {
@@ -710,21 +673,23 @@ namespace cell
             return;
         std::error_code ec;
         std::filesystem::create_directories(root / "sessions", ec);
-        if (sessions_index().value(key, "") == path)
+        // Ensure cache is loaded
+        sessions_index();
+        if (index_cache() && index_cache()->value(key, "") == path)
             return;
-        // mutate the cache in place (the returned reference stays authoritative)
-        nlohmann::json &j = const_cast<nlohmann::json &>(sessions_index());
-        j[key] = path;
-        async_io::submit(sessions_index_path(), j.dump(2));
+        // Mutate the cache directly (avoiding const_cast)
+        if (!index_cache())
+            index_cache() = nlohmann::json::object();
+        (*index_cache())[key] = path;
+        index_cache_root() = root;
+        async_io::submit(sessions_index_path(), index_cache()->dump(2));
     }
     // =========================================================================
-    //  text — display hardening and text utilities: ANSI-stripping sanitizers,
-    //  a zero-copy line generator, UTF-8 validation/repair.
+    //  text — display hardening and text utilities
     // =========================================================================
     namespace text
     {
-        // lazy line views over a text buffer (zero-copy): strips a trailing '\r'
-        // from each line, yields string_views into the source. never copies bytes.
+        // Zero-copy line generator: yields string_views, strips trailing '\r'.
         static std::generator<std::string_view> lines(std::string_view text)
         {
             size_t start = 0;
@@ -741,7 +706,6 @@ namespace cell
                 start = nl + 1;
             }
         }
-        // trim ASCII whitespace from both ends (copies only on demand)
         static std::string trim(std::string_view s)
         {
             size_t b = 0, e = s.size();
@@ -751,20 +715,13 @@ namespace cell
                 e--;
             return std::string(s.substr(b, e - b));
         }
-        // strip a UTF-8 BOM in place and return the remaining view
         static std::string_view strip_bom(std::string &s)
         {
             if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
                 s.erase(0, 3);
             return s;
         }
-        // sanitize a string for terminal display: strip ANSI escape sequences and
-        // control characters, and collapse newlines to spaces, so untrusted
-        // tool-call JSON cannot manipulate the console (erase the confirmation
-        // prompt, fake an approval, or hide a dangerous command).
-        // advance i past one ANSI escape sequence (CSI / OSC / lone ESC with
-        // following control bytes); returns the index of the sequence's final
-        // byte, so the caller's loop increment lands on the byte after it
+        // Skip past one ANSI escape sequence (CSI/OSC/lone ESC).
         static size_t skip_escape(std::string_view s, size_t i)
         {
             if (i + 1 < s.size() && s[i + 1] == '[')
@@ -806,6 +763,7 @@ namespace cell
             }
             return i;
         }
+        // Strip ANSI/control chars, collapse whitespace to single spaces.
         static std::string display_safe(const std::string &s)
         {
             std::string out;
@@ -825,15 +783,12 @@ namespace cell
                     continue;
                 }
                 if (c < 0x20)
-                    continue; // remaining C0 controls (backspace, bell, ...)
+                    continue;
                 out += (char)c;
             }
             return out;
         }
-        // strip ANSI escape sequences and control characters for safe console
-        // display, preserving line structure — display_safe collapses whitespace
-        // for the one-line confirmation prompts, this keeps multi-line tool
-        // output intact (tool results are echoed back to the terminal in color)
+        // Strip ANSI/control chars, preserving line structure.
         static std::string console_safe(const std::string &s)
         {
             std::string out;
@@ -852,15 +807,13 @@ namespace cell
                     continue;
                 }
                 if (c < 0x20)
-                    continue; // remaining C0 controls
+                    continue;
                 out += (char)c;
             }
             return out;
         }
 
-        // return valid UTF-8 for JSON/API transport: valid sequences pass
-        // through unchanged, invalid bytes become U+FFFD, and when max_bytes is
-        // set the result is cut on a code-point boundary (never inside one).
+        // Valid UTF-8 for JSON/API; invalid bytes become U+FFFD.
         static std::string utf8_safe(std::string_view s, size_t max_bytes = std::string_view::npos)
         {
             std::string out;
@@ -908,14 +861,10 @@ namespace cell
         }
     } // namespace text
     // =========================================================================
-    //  box — the sandbox and every tool implementation. Tools are admitted by
-    //  sandbox mode (SandboxMode), gated on paths (check_path / check /
-    //  check_exec) and their output is hardened (sanitize_output /
-    //  wrap_tool_output / truncate_output) before it reaches the model.
+    //  box — sandbox and tool implementations
     // =========================================================================
     namespace box
     {
-        // convert a string to lowercase (ASCII only, for case-insensitive matching)
         static std::string to_lower(std::string_view sv)
         {
             std::string out(sv);
@@ -923,14 +872,9 @@ namespace cell
             return out;
         }
 
-        // paths that tools must never touch: the runtime credential vault
-        // (.cell/.crypt, .key, config.json, sessions, logs) and common credential
-        // files anywhere on disk. The skills directory is exempt because the skill
-        // system legitimately reads .cell/skills/*.md.
+        // Check if path is sensitive (vault, credentials, etc.).
         bool is_sensitive_path(std::string_view path)
         {
-            // the canonical root prefix is computed once per root value (hot
-            // path: every tool call sandbox-check canonicalizes it)
             static std::mutex rc_mx;
             static std::filesystem::path rc_root;
             static std::string rc_root_s;
@@ -949,23 +893,19 @@ namespace cell
             std::filesystem::path p = std::filesystem::absolute(std::filesystem::path(path), ec);
             if (ec)
                 return false;
-            // resolve symlinks/junctions so a link inside the repo that points at
-            // a credential file cannot slip past the check under its literal name
+            // Resolve symlinks to prevent bypass via symlink to sensitive target.
             std::filesystem::path canon = std::filesystem::weakly_canonical(p, ec);
             if (!ec)
                 p = canon;
-            // canonicalize and lowercase in one pass: lexically_normal on the
-            // path first, then fold case in place on the string, avoiding a
-            // second full-path copy on this hot path (every tool call)
             std::string s = p.lexically_normal().generic_string();
             lower_ascii(s);
             if (root_s.empty())
                 return false;
             const std::string skills_prefix = root_s + "/skills";
             if (s.rfind(skills_prefix, 0) == 0)
-                return false; // skills are allowed
+                return false;
             if (s.rfind(root_s, 0) == 0)
-                return true; // everything else under the runtime dir (vault, keys, config, sessions, logs)
+                return true;
             static constexpr std::string_view cred_files[] = {
                 "/.ssh/id_rsa",
                 "/.ssh/id_ed25519",
@@ -987,6 +927,29 @@ namespace cell
             };
             for (auto &f : cred_files)
                 if (s.find(f) != std::string::npos)
+                    return true;
+            return false;
+        }
+
+        // Sensitive path substrings for exec command checking.
+        // These are checked against the lowercased command string to prevent
+        // data exfiltration via exec (e.g., "cat .key", "cat .crypt").
+        static bool exec_references_sensitive_path(std::string_view lower_cmd)
+        {
+            static constexpr std::string_view sensitive_terms[] = {
+                "/.crypt",
+                "\\.crypt",
+                "/.key",
+                "\\.key",
+                "/config.json",
+                "\\config.json",
+                "/sessions/",
+                "\\sessions\\",
+                "/logs/",
+                "\\logs\\",
+            };
+            for (auto &term : sensitive_terms)
+                if (lower_cmd.find(term) != std::string_view::npos)
                     return true;
             return false;
         }
@@ -1112,26 +1075,10 @@ namespace cell
             // Check for path traversal
             if (call.find("..") != std::string_view::npos)
                 return false;
-            // Check if the command references sensitive paths (substring check on the command string)
+            // Check if the command references sensitive paths
             std::string lower = to_lower(call);
-            // Vault and runtime directory files
-            static constexpr std::string_view sensitive_terms[] = {
-                "/.crypt",
-                "\\.crypt",
-                "/.key",
-                "\\.key",
-                "/config.json",
-                "\\config.json",
-                "/sessions/",
-                "\\sessions\\",
-                "/logs/",
-                "\\logs\\",
-            };
-            for (auto &term : sensitive_terms)
-            {
-                if (lower.find(term) != std::string::npos)
-                    return false;
-            }
+            if (exec_references_sensitive_path(lower))
+                return false;
             // In read-only mode, exec is blocked entirely
             if (sandbox_mode() == SandboxMode::ReadOnly)
                 return false;
@@ -1203,7 +1150,7 @@ namespace cell
                 "read the instructions in this file",
                 "there are instructions in this file",
             };
-            // decode one UTF-8 codepoint at ln[i]; advances i past it and returns
+            // Decode one UTF-8 codepoint at ln[i]; advances i past it and returns
             // the codepoint, or 0 (advancing one byte) on invalid input.
             auto decode = [](std::string_view ln, size_t &i) -> unsigned
             {
@@ -1213,7 +1160,7 @@ namespace cell
                     i++;
                     return c;
                 }
-                size_t n = 0;
+                size_t n = 0; // number of continuation bytes (1-3)
                 unsigned cp = 0;
                 if (c >= 0xC2 && c <= 0xDF)
                 {
@@ -1233,12 +1180,13 @@ namespace cell
                 else
                 {
                     i++;
-                    return 0;
+                    return 0; // invalid lead byte
                 }
-                if (i + n >= ln.size())
+                // Need n continuation bytes: ln[i+1] through ln[i+n] must exist
+                if (i + n + 1 > ln.size())
                 {
                     i++;
-                    return 0;
+                    return 0; // truncated sequence
                 }
                 for (size_t k = 1; k <= n; k++)
                 {
@@ -1246,7 +1194,7 @@ namespace cell
                     if ((cc & 0xC0) != 0x80)
                     {
                         i++;
-                        return 0;
+                        return 0; // invalid continuation byte
                     }
                     cp = (cp << 6) | (cc & 0x3F);
                 }
@@ -6858,7 +6806,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --key KEY                    api key (saved to the encrypted vault)");
     cell::sys::println("  --session ID                 resume an existing session (switches to its working directory)");
     cell::sys::println("  --system TEXT                system prompt");
-    cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | workspace-write | full-access (default) | outer-full");
+    cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | edit-only | full-access (default)");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
     cell::sys::println("  --selftest                   run internal self tests");
