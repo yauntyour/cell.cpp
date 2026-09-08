@@ -1792,9 +1792,13 @@ namespace cell
             {
                 if (tok.size() <= 1 || (tok.front() != '-' && tok.front() != '/'))
                     return false;
-                return tok.find('r') != std::string_view::npos ||
-                       tok.find('f') != std::string_view::npos ||
-                       tok.find('s') != std::string_view::npos;
+                for (char c : tok)
+                {
+                    char lc = (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+                    if (lc == 'r' || lc == 'f' || lc == 's')
+                        return true;
+                }
+                return false;
             };
             size_t i = 0;
             while (i < call.size())
@@ -4650,7 +4654,7 @@ namespace cell
         };
 
         // Try to parse input as JSON and extract a string field. Returns empty string on failure.
-        static std::string try_parse_json_field(const std::string &input, const char *field)
+        [[maybe_unused]] static std::string try_parse_json_field(const std::string &input, const char *field)
         {
             try
             {
@@ -7443,7 +7447,8 @@ namespace selftest
             cell::root = ".cell-selftest";
             std::error_code ec;
             std::filesystem::remove_all(cell::root, ec);
-            sodium_init();
+            if (sodium_init() < 0)
+                throw std::runtime_error("sodium_init() failed");
         }
         ~SandboxGuard()
         {
