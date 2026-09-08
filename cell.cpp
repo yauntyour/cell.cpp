@@ -6277,6 +6277,11 @@ namespace cell
                                const nlohmann::json *, nlohmann::json &, nlohmann::json &,
                                nlohmann::json &, std::string &)>
                 chat;
+            std::function<bool(const config::provider_entry &, const encrypt::secure_string &,
+                               const std::string &, const nlohmann::json &, bool, bool,
+                               const nlohmann::json *, nlohmann::json &, nlohmann::json &,
+                               nlohmann::json &, std::string &)>
+                create_chat; // factory: creates a new chat function with its own LLM client
             std::function<encrypt::secure_string(const config::provider_entry &)> resolve_key;
             std::function<std::string()> foreground_context;
         };
@@ -6394,6 +6399,11 @@ namespace cell
             if (work_type != "serial" && work_type != "parallel")
             {
                 err = "work-type must be serial or parallel";
+                return false;
+            }
+            if (list_it->empty())
+            {
+                err = "list must contain at least one child agent";
                 return false;
             }
             if (list_it->size() > max_children)
@@ -6754,7 +6764,7 @@ namespace cell
             worker_report result;
             result.name = worker.value("name", "worker");
             const config::provider_entry *provider = rt.settings ? rt.settings->current_provider_entry() : nullptr;
-            if (!provider || rt.settings->current_model.empty() || !rt.chat || !rt.resolve_key || !rt.tool_list)
+            if (!provider || rt.settings->current_model.empty() || !rt.create_chat || !rt.resolve_key || !rt.tool_list)
             {
                 result.summary = "Teamwork runtime is not configured.";
                 return result;
@@ -6779,6 +6789,9 @@ namespace cell
             }
             bool parallel_job = job.value("work_type", "serial") == "parallel";
             nlohmann::json tool_defs = child_tools(*defs_source, parallel_job);
+
+            // Create a dedicated chat function for this worker (own LLM client)
+            auto worker_chat = rt.create_chat;
 
             std::string worker_id = result.name;
             nlohmann::json messages = nlohmann::json::array();
@@ -6822,7 +6835,7 @@ namespace cell
                 result.rounds = round + 1;
                 nlohmann::json reply, tool_calls, usage;
                 std::string err;
-                if (!rt.chat(*provider, key, rt.settings->current_model, messages, true, true,
+                if (!worker_chat(*provider, key, rt.settings->current_model, messages, true, true,
                              &tool_defs, reply, tool_calls, usage, err))
                 {
                     result.summary = std::format("LLM request failed: {}", err.empty() ? "unknown error" : err);
@@ -6901,7 +6914,7 @@ namespace cell
             }
             if (job->value("list", nlohmann::json::array()).empty())
             {
-                out = "teamwork has no child agents";
+                out = std::format("teamwork {} has no child agents", job_id);
                 return false;
             }
             (*job)["status"] = "running";
@@ -7210,10 +7223,10 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         });
     {
         nlohmann::json props = {
-            {"operation", str_prop("new | run | edit | remove; run requires approval")},
-            {"config", {{"type", "object"}, {"description", "Teamwork configuration: config and list"}}},
-            {"id", str_prop("target Teamwork ID (required for run/edit/remove)")}};
-        add("tw", "Manage supervised child-agent jobs. operation=new creates a job and returns its ID; run executes an approved job and injects its consolidated report; edit/remove replace or delete an uncompleted job with the full config. Submitted list entries may omit name; names are assigned as worker_N and supplied names are overwritten.", props, {"operation"}, Policy::Ask, [](const nlohmann::json &j, std::string &out)
+            {"operation", str_prop("new | run | edit | remove")},
+            {"config", {{"type", "object"}, {"description", "Job configuration: {config: {work-type: serial|parallel}, list: [{background: none|prolegomena, works: task description}]}"}}},
+            {"id", str_prop("Job ID (required for run/edit/remove, format: tw-TIMESTAMP-N)")}};
+        add("tw", "Manage Teamwork child-agent jobs.\nnew: Create a job with child agents. config.config sets work-type (serial|parallel), config.list defines workers [{background, works}].\nrun: Execute a job by id. Optional config updates the job before running.\nedit: Update an uncompleted job's config.\nremove: Delete a pending/failed job.", props, {"operation"}, Policy::Ask, [](const nlohmann::json &j, std::string &out)
             {
                 std::string operation = j.value("operation", "");
                 std::string job_id = j.value("id", "");
@@ -7226,7 +7239,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 {
                     if (!config)
                     {
-                        out = "new requires the config parameter";
+                        out = "new requires config: {config: {work-type: serial|parallel}, list: [{background: none|prolegomena, works: task description}]}";
                         return false;
                     }
                     if (!cell::teamwork::new_job(*config, max_children, out))
@@ -7235,7 +7248,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     nlohmann::json *job = cell::teamwork::find_job(store, out);
                     if (job)
                     {
-                        out = std::format("{}\n{}", job->value("id", ""), cell::teamwork::job_display(*job));
+                        out = cell::teamwork::job_display(*job);
                         return true;
                     }
                     out = "teamwork created but its record could not be reloaded";
@@ -7243,9 +7256,14 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 }
                 if (operation == "edit")
                 {
-                    if (!config || job_id.empty())
+                    if (job_id.empty())
                     {
-                        out = "edit requires the config and id parameters";
+                        out = "edit requires the id parameter";
+                        return false;
+                    }
+                    if (!config)
+                    {
+                        out = "edit requires the config parameter with the new configuration";
                         return false;
                     }
                     return cell::teamwork::edit_job(job_id, *config, max_children, out);
@@ -7254,20 +7272,23 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 {
                     if (job_id.empty())
                     {
-                        out = "remove requires the id parameter";
+                        out = "remove requires the id parameter (format: tw-TIMESTAMP-N)";
                         return false;
                     }
                     return cell::teamwork::remove_job(job_id, true, out);
                 }
                 if (operation == "run")
                 {
-                    if (!config || job_id.empty())
+                    if (job_id.empty())
                     {
-                        out = "run requires the updated config and id parameters";
+                        out = "run requires the id parameter (format: tw-TIMESTAMP-N)";
                         return false;
                     }
-                    if (!cell::teamwork::edit_job(job_id, *config, max_children, out))
-                        return false;
+                    if (config)
+                    {
+                        if (!cell::teamwork::edit_job(job_id, *config, max_children, out))
+                            return false;
+                    }
                     return cell::teamwork::run_job(job_id, out);
                 }
                 out = "operation must be new, run, edit, or remove";
@@ -8535,6 +8556,20 @@ int main(int argc, char const *argv[])
         }
     } cache;
 
+    // Factory functions: create independent LLM clients for parallel workers
+    auto create_openai_client = [&cache](const std::string &base) -> std::unique_ptr<cell::llm::OpenAI>
+    {
+        return std::make_unique<cell::llm::OpenAI>(base);
+    };
+    auto create_openai_responses_client = [&cache](const std::string &base) -> std::unique_ptr<cell::llm::OpenAIResponses>
+    {
+        return std::make_unique<cell::llm::OpenAIResponses>(base);
+    };
+    auto create_anthropic_client = [&cache](const std::string &base) -> std::unique_ptr<cell::llm::Anthropic>
+    {
+        return std::make_unique<cell::llm::Anthropic>(base);
+    };
+
     auto resolve_key = [&](const cell::config::provider_entry &p) -> cell::encrypt::secure_string
     {
         if (!p.key_id.empty())
@@ -8710,6 +8745,32 @@ int main(int argc, char const *argv[])
     {
         return do_chat(p, key, model, msgs, false, nullptr, nullptr, tools,
                        reply, tc, usage, err, true, cfg.think_level);
+    };
+    // Factory: creates a new chat function with its own LLM client for parallel workers
+    team_rt.create_chat = [&create_openai_client, &create_openai_responses_client, &create_anthropic_client, &cfg]
+        (const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
+         const std::string &model, const nlohmann::json &msgs,
+         bool, bool, const nlohmann::json *tools,
+         nlohmann::json &reply, nlohmann::json &tc,
+         nlohmann::json &usage, std::string &err) -> bool
+    {
+        // Create independent client based on provider style
+        if (p.api_style == "anthropic")
+        {
+            auto client = create_anthropic_client(p.base);
+            client->set_proxy(p.proxy);
+            return client->chat(key, model, msgs, tools ? *tools : nlohmann::json::array(), reply, tc, usage, err, cfg.think_level);
+        }
+        if (p.api_style == "openai-responses")
+        {
+            auto client = create_openai_responses_client(p.base);
+            client->set_proxy(p.proxy);
+            return client->chat(key, model, msgs, tools ? *tools : nlohmann::json::array(), reply, tc, usage, err);
+        }
+        // default: openai-chat
+        auto client = create_openai_client(p.base);
+        client->set_proxy(p.proxy);
+        return client->chat(key, model, msgs, tools ? *tools : nlohmann::json::array(), reply, tc, usage, err);
     };
     team_rt.resolve_key = resolve_key;
     team_rt.foreground_context = []() -> std::string
