@@ -5511,7 +5511,17 @@ namespace cell
                     {
                         std::string t = m.value("type", "");
                         if (t == "function_call_output" || t == "function_call")
-                            input.push_back(m);
+                        {
+                            // Normalize: llama.cpp requires output as input_text content blocks
+                            if (t == "function_call_output" && m.contains("output") && m["output"].is_string())
+                            {
+                                nlohmann::json normalized = m;
+                                normalized["output"] = nlohmann::json::array({{{"type", "input_text"}, {"text", m["output"]}}});
+                                input.push_back(std::move(normalized));
+                            }
+                            else
+                                input.push_back(m);
+                        }
                         continue;
                     }
                     std::string role = m.value("role", "");
@@ -5542,7 +5552,7 @@ namespace cell
                                 nlohmann::json output;
                                 output["type"] = "function_call_output";
                                 output["call_id"] = b.value("tool_use_id", "");
-                                output["output"] = string_content(b.contains("content") ? b["content"] : nlohmann::json());
+                                output["output"] = nlohmann::json::array({{{"type", "input_text"}, {"text", string_content(b.contains("content") ? b["content"] : nlohmann::json())}}});
                                 input.push_back(std::move(output));
                             }
                         }
@@ -5606,7 +5616,7 @@ namespace cell
                         nlohmann::json output;
                         output["type"] = "function_call_output";
                         output["call_id"] = m.value("tool_call_id", "");
-                        output["output"] = string_content(m.contains("content") ? m["content"] : nlohmann::json());
+                        output["output"] = nlohmann::json::array({{{"type", "input_text"}, {"text", string_content(m.contains("content") ? m["content"] : nlohmann::json())}}});
                         input.push_back(std::move(output));
                     }
                 }
@@ -7250,7 +7260,7 @@ namespace cell
                     if (provider->api_style == "anthropic")
                         messages.push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", call.value("id", "")}, {"content", wrapped}}})}});
                     else if (provider->api_style == "openai-responses")
-                        messages.push_back({{"type", "function_call_output"}, {"call_id", call.value("id", "")}, {"output", wrapped}});
+                        messages.push_back({{"type", "function_call_output"}, {"call_id", call.value("id", "")}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", wrapped}}})}});
                     else
                         messages.push_back({{"role", "tool"}, {"tool_call_id", call.value("id", "")}, {"content", wrapped}});
                 }
@@ -11381,7 +11391,18 @@ int main(int argc, char const *argv[])
                                     }
                                 }
                                 if (p->api_style == "openai-responses")
-                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", content_array}});
+                                {
+                                    nlohmann::json resp_output = nlohmann::json::array();
+                                    resp_output.push_back({{"type", "input_text"}, {"text", wrapped}});
+                                    for (const auto &block : res[i].multimodal_blocks)
+                                    {
+                                        if (block.type == cell::ContentBlock::Type::InputImage)
+                                            resp_output.push_back({{"type", "input_image"}, {"image_url", "data:" + block.media_type + ";base64," + block.data}});
+                                        else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                            resp_output.push_back({{"type", "input_audio"}, {"data", block.data}, {"format", cell::box::get_audio_format(block.media_type)}});
+                                    }
+                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", resp_output}});
+                                }
                                 else
                                     s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", content_array}});
                             }
@@ -11389,7 +11410,7 @@ int main(int argc, char const *argv[])
                             {
                                 // Text-only output
                                 if (p->api_style == "openai-responses")
-                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", wrapped}});
+                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", wrapped}}})}});
                                 else
                                     s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
                             }
