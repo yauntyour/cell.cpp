@@ -7971,6 +7971,140 @@ static int run_selftest()
     R.expect(cell::box::read("box_test.txt", out, 5, 9) && out.empty(), "box::read range beyond EOF");
     R.expect(cell::box::read("box_test.txt", out, 0, 0, false, 1, 1) && out == "world\n", "box::read offset/limit");
     R.expect(cell::box::read("box_test.txt", out, 0, 0, false, 1, 0) && out == "world\n", "box::read offset to EOF");
+
+    // multimodal read: detect_file_type + get_media_type + read_multimodal
+    {
+        R.expect(cell::box::detect_file_type("test.txt") == cell::box::FileType::Text, "detect_file_type .txt -> Text");
+        R.expect(cell::box::detect_file_type("test.cpp") == cell::box::FileType::Text, "detect_file_type .cpp -> Text");
+        R.expect(cell::box::detect_file_type("test.png") == cell::box::FileType::Image, "detect_file_type .png -> Image");
+        R.expect(cell::box::detect_file_type("test.jpg") == cell::box::FileType::Image, "detect_file_type .jpg -> Image");
+        R.expect(cell::box::detect_file_type("test.mp3") == cell::box::FileType::Audio, "detect_file_type .mp3 -> Audio");
+        R.expect(cell::box::detect_file_type("test.wav") == cell::box::FileType::Audio, "detect_file_type .wav -> Audio");
+        R.expect(cell::box::detect_file_type("test.mp4") == cell::box::FileType::Video, "detect_file_type .mp4 -> Video");
+        R.expect(cell::box::detect_file_type("test.pdf") == cell::box::FileType::Document, "detect_file_type .pdf -> Document");
+        R.expect(cell::box::detect_file_type("test.bin") == cell::box::FileType::Binary, "detect_file_type .bin -> Binary");
+        R.expect(cell::box::detect_file_type("test.xyz") == cell::box::FileType::Binary, "detect_file_type unknown -> Binary");
+
+        R.expect(cell::box::get_media_type("test.png") == "image/png", "get_media_type .png -> image/png");
+        R.expect(cell::box::get_media_type("test.jpg") == "image/jpeg", "get_media_type .jpg -> image/jpeg");
+        R.expect(cell::box::get_media_type("test.mp3") == "audio/mpeg", "get_media_type .mp3 -> audio/mpeg");
+        R.expect(cell::box::get_media_type("test.wav") == "audio/wav", "get_media_type .wav -> audio/wav");
+        R.expect(cell::box::get_media_type("test.mp4") == "video/mp4", "get_media_type .mp4 -> video/mp4");
+        R.expect(cell::box::get_media_type("test.pdf") == "application/pdf", "get_media_type .pdf -> application/pdf");
+        R.expect(cell::box::get_media_type("test.xyz") == "application/octet-stream", "get_media_type unknown -> application/octet-stream");
+
+        // Create a minimal valid PNG (1x1 pixel, RGBA)
+        // PNG signature
+        std::vector<uint8_t> png;
+        auto push_be32 = [&](uint32_t v)
+        {
+            png.push_back((v >> 24) & 0xff);
+            png.push_back((v >> 16) & 0xff);
+            png.push_back((v >> 8) & 0xff);
+            png.push_back(v & 0xff);
+        };
+        auto push_chunk = [&](const char type[4], const std::vector<uint8_t> &data)
+        {
+            push_be32((uint32_t)data.size());
+            png.insert(png.end(), type, type + 4);
+            png.insert(png.end(), data.begin(), data.end());
+            // CRC over type + data
+            uint32_t crc = 0;
+            auto crc_byte = [&](uint8_t b)
+            {
+                crc ^= b;
+                for (int k = 0; k < 8; k++)
+                    crc = (crc >> 1) ^ (0xEDB88320 & (-(int)(crc & 1)));
+            };
+            for (int k = 0; k < 4; k++)
+                crc_byte(type[k]);
+            for (auto b : data)
+                crc_byte(b);
+            push_be32(crc);
+        };
+        // PNG signature: 8 bytes
+        uint8_t sig[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+        png.insert(png.end(), sig, sig + 8);
+        // IHDR: width=1, height=1, bit_depth=8, color_type=6 (RGBA), compression=0, filter=0, interlace=0
+        std::vector<uint8_t> ihdr = {0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0};
+        push_chunk("IHDR", ihdr);
+        // IDAT: zlib-compressed scanline (filter byte 0 + 4 bytes RGBA pixel)
+        // Raw: [0, 0, 0, 0, 0, 0, 0, 0] (filter=None + R=0 G=0 B=0 A=0)
+        // Zlib minimal: no compression, stored block
+        std::vector<uint8_t> idat = {0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB4};
+        push_chunk("IDAT", idat);
+        // IEND
+        std::vector<uint8_t> iend;
+        push_chunk("IEND", iend);
+
+        // Helper: write raw binary (box::write does CRLF conversion which corrupts binary data)
+        auto write_bin = [](const std::string &path, const std::vector<uint8_t> &data)
+        {
+            std::ofstream f(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char *>(data.data()), (std::streamsize)data.size());
+            return f.good();
+        };
+
+        R.expect(write_bin("test.png", png), "multimodal fixture: write test.png");
+        cell::ToolResult mm_result;
+        std::string mm_err;
+        R.expect(cell::box::read_multimodal("test.png", mm_result, 0, 0, true, &mm_err), "read_multimodal test.png succeeds");
+        R.expect(mm_err.empty(), "read_multimodal no error");
+        R.expect(mm_result.text_output.find("Type: Image") != std::string::npos, "read_multimodal reports Type: Image");
+        R.expect(mm_result.text_output.find("Media-Type: image/png") != std::string::npos, "read_multimodal reports Media-Type: image/png");
+        R.expect(mm_result.multimodal_blocks.size() == 1, "read_multimodal produces 1 multimodal block");
+        R.expect(mm_result.multimodal_blocks[0].type == cell::ContentBlock::Type::InputImage, "multimodal block type is InputImage");
+        R.expect(mm_result.multimodal_blocks[0].media_type == "image/png", "multimodal block media_type is image/png");
+        R.expect(!mm_result.multimodal_blocks[0].data.empty(), "multimodal block has base64 data");
+        R.expect(mm_result.multimodal_blocks[0].detail == "low", "multimodal block detail is low");
+        // Verify base64 roundtrip
+        auto decoded = base64_decode(mm_result.multimodal_blocks[0].data);
+        R.expect(decoded == png, "read_multimodal base64 roundtrip matches original PNG");
+
+        // Audio multimodal read
+        std::vector<uint8_t> wav = {'R','I','F','F', 0,0,0,0, 'W','A','V','E', 'f','m','t',' ',
+                                     0x10,0,0,0, 1,0,1,0, 0x44,0xAC,0,0, 0x88,0x58,1,0, 2,0,16,0, 'd','a','t','a',
+                                     0,0,0,0, 0,0};
+        R.expect(write_bin("test.wav", wav), "multimodal fixture: write test.wav");
+        cell::ToolResult audio_result;
+        R.expect(cell::box::read_multimodal("test.wav", audio_result, 0, 0, true, &mm_err), "read_multimodal test.wav succeeds");
+        R.expect(audio_result.text_output.find("Type: Audio") != std::string::npos, "read_multimodal reports Type: Audio");
+        R.expect(audio_result.text_output.find("Media-Type: audio/wav") != std::string::npos, "read_multimodal reports Media-Type: audio/wav");
+        R.expect(audio_result.multimodal_blocks.size() == 1, "read_multimodal produces 1 audio block");
+        R.expect(audio_result.multimodal_blocks[0].type == cell::ContentBlock::Type::InputAudio, "audio block type is InputAudio");
+
+        // Video returns metadata only (no base64)
+        std::vector<uint8_t> fake_video = {0,0,0,0x1C, 'f','t','y','p','i','s','o','m', 0,0,0,1, 'i','s','o','m'};
+        R.expect(write_bin("test.mp4", fake_video), "multimodal fixture: write test.mp4");
+        cell::ToolResult video_result;
+        R.expect(cell::box::read_multimodal("test.mp4", video_result, 0, 0, true, &mm_err), "read_multimodal test.mp4 succeeds");
+        R.expect(video_result.text_output.find("Type: Video") != std::string::npos, "read_multimodal reports Type: Video");
+        R.expect(video_result.multimodal_blocks.empty(), "read_multimodal video returns no multimodal blocks");
+
+        // Document returns metadata only (no base64)
+        std::vector<uint8_t> fake_pdf = {'%','P','D','F','-','1','.','4'};
+        R.expect(write_bin("test.pdf", fake_pdf), "multimodal fixture: write test.pdf");
+        cell::ToolResult doc_result;
+        R.expect(cell::box::read_multimodal("test.pdf", doc_result, 0, 0, true, &mm_err), "read_multimodal test.pdf succeeds");
+        R.expect(doc_result.text_output.find("Type: Document") != std::string::npos, "read_multimodal reports Type: Document");
+        R.expect(doc_result.multimodal_blocks.empty(), "read_multimodal document returns no multimodal blocks");
+
+        // Text file via read_multimodal delegates to box::read
+        cell::ToolResult text_result;
+        R.expect(cell::box::read_multimodal("box_test.txt", text_result, 0, 0, false, &mm_err), "read_multimodal text file delegates");
+        R.expect(text_result.text_output.find("hello") != std::string::npos, "read_multimodal text returns content");
+        R.expect(text_result.multimodal_blocks.empty(), "read_multimodal text has no multimodal blocks");
+
+        // Error cases
+        R.expect(!cell::box::read_multimodal("nonexistent.png", mm_result, 0, 0, false, &mm_err), "read_multimodal rejects nonexistent file");
+        R.expect(!mm_err.empty(), "read_multimodal reports error for nonexistent file");
+
+        R.expect(cell::box::remove("test.png"), "multimodal cleanup test.png");
+        R.expect(cell::box::remove("test.wav"), "multimodal cleanup test.wav");
+        R.expect(cell::box::remove("test.mp4"), "multimodal cleanup test.mp4");
+        R.expect(cell::box::remove("test.pdf"), "multimodal cleanup test.pdf");
+    }
+
     R.expect(!cell::box::write_new("box_test.txt", "x", out) && out.find("already exists") != std::string::npos, "write_new refuses overwrite");
     R.expect(!cell::box::write_new("no_such_dir/a.txt", "x", out) && out.find("parent directory") != std::string::npos, "write_new checks parent dir");
     R.expect(cell::box::mkdir("box_dir/sub"), "box::mkdir");
@@ -10962,6 +11096,7 @@ int main(int argc, char const *argv[])
                         double sec = 0;
                         bool blocked = false;
                         cell::tools::rejection_reason rejected_for = cell::tools::rejection_reason::none;
+                        std::vector<cell::ContentBlock> multimodal_blocks;
                     };
                     std::vector<tresult> res(tool_calls.size());
                     total_tool_calls += tool_calls.size();
@@ -11013,6 +11148,13 @@ int main(int argc, char const *argv[])
                                     o = std::format("[tool error: {}]", e.what());
                                     res[i].status = "exception";
                                 }
+                                // Capture multimodal blocks from thread-local storage (set by tool on worker thread)
+                                cell::ToolResult *tl = cell::get_thread_local_tool_result();
+                                if (tl && tl->is_multimodal())
+                                {
+                                    res[i].multimodal_blocks = std::move(tl->multimodal_blocks);
+                                }
+                                cell::set_thread_local_tool_result(nullptr);
                                 if (ok)
                                 {
                                     res[i].output = std::move(o);
@@ -11058,6 +11200,13 @@ int main(int argc, char const *argv[])
                             o = std::format("[tool error: {}]", e.what());
                             res[i].status = "exception";
                         }
+                        // Capture multimodal blocks from thread-local storage
+                        cell::ToolResult *tl = cell::get_thread_local_tool_result();
+                        if (tl && tl->is_multimodal())
+                        {
+                            res[i].multimodal_blocks = std::move(tl->multimodal_blocks);
+                        }
+                        cell::set_thread_local_tool_result(nullptr);
                         if (ok)
                         {
                             res[i].output = o;
@@ -11117,13 +11266,12 @@ int main(int argc, char const *argv[])
                         if (p->api_style != "anthropic")
                         {
                             // Check for multimodal content
-                            cell::ToolResult *tl_result = cell::get_thread_local_tool_result();
-                            if (tl_result && tl_result->is_multimodal())
+                            if (!res[i].multimodal_blocks.empty())
                             {
                                 // Build multimodal content for OpenAI APIs
                                 nlohmann::json content_array = nlohmann::json::array();
                                 content_array.push_back({{"type", "text"}, {"text", wrapped}});
-                                for (const auto &block : tl_result->multimodal_blocks)
+                                for (const auto &block : res[i].multimodal_blocks)
                                 {
                                     if (block.type == cell::ContentBlock::Type::InputImage)
                                     {
@@ -11180,12 +11328,11 @@ int main(int argc, char const *argv[])
                         else
                         {
                             // Anthropic API
-                            cell::ToolResult *tl_result = cell::get_thread_local_tool_result();
-                            if (tl_result && tl_result->is_multimodal())
+                            if (!res[i].multimodal_blocks.empty())
                             {
                                 nlohmann::json content_array = nlohmann::json::array();
                                 content_array.push_back({{"type", "text"}, {"text", wrapped}});
-                                for (const auto &block : tl_result->multimodal_blocks)
+                                for (const auto &block : res[i].multimodal_blocks)
                                 {
                                     if (block.type == cell::ContentBlock::Type::InputImage)
                                     {
@@ -11217,7 +11364,6 @@ int main(int argc, char const *argv[])
                                 s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
                             }
                         }
-            cell::set_thread_local_tool_result(nullptr);
                     }
                     // sandbox security refusals are normal feedback; only approval
                     // refusals end the run (user decline only, autoallow reject
