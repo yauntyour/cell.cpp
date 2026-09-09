@@ -948,6 +948,47 @@ namespace cell
             return out;
         }
     } // namespace text
+
+    // =====================================================================
+    //  Multimodal content types — shared between box and tools namespaces
+    // =====================================================================
+    struct ContentBlock
+    {
+        enum class Type
+        {
+            Text,
+            Image,
+            InputText,
+            InputImage,
+        };
+        Type type = Type::Text;
+        std::string text;
+        std::string data;       // base64 data
+        std::string media_type; // MIME type
+        std::string detail;     // "low", "high", "auto"
+    };
+
+    struct ToolResult
+    {
+        std::string text_output;
+        std::vector<ContentBlock> multimodal_blocks;
+
+        bool is_multimodal() const { return !multimodal_blocks.empty(); }
+    };
+
+    // Thread-local storage for multimodal tool results
+    inline thread_local ToolResult *tl_tool_result_ptr = nullptr;
+
+    inline void set_thread_local_tool_result(ToolResult *ptr)
+    {
+        tl_tool_result_ptr = ptr;
+    }
+
+    inline ToolResult *get_thread_local_tool_result()
+    {
+        return tl_tool_result_ptr;
+    }
+
     // =========================================================================
     //  box — sandbox and tool implementations
     // =========================================================================
@@ -959,6 +1000,151 @@ namespace cell
             lower_ascii(out);
             return out;
         }
+
+        // =====================================================================
+        //  multimodal — file type detection and media type mapping
+        // =====================================================================
+        enum class FileType
+        {
+            Text,
+            Image,
+            Audio,
+            Video,
+            Document,
+            Binary
+        };
+
+        static std::string file_type_to_string(FileType type)
+        {
+            switch (type)
+            {
+            case FileType::Text:     return "Text";
+            case FileType::Image:    return "Image";
+            case FileType::Audio:    return "Audio";
+            case FileType::Video:    return "Video";
+            case FileType::Document: return "Document";
+            case FileType::Binary:   return "Binary";
+            }
+            return "Binary";
+        }
+
+        static FileType detect_file_type(std::string_view path)
+        {
+            std::string ext = to_lower(std::filesystem::path(path).extension().string());
+            static const std::unordered_set<std::string> text_exts = {
+                ".txt", ".cpp", ".h", ".hpp", ".c", ".cc", ".cxx",
+                ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cs",
+                ".json", ".xml", ".yaml", ".yml", ".toml", ".ini",
+                ".md", ".rst", ".html", ".css", ".scss",
+                ".sh", ".bat", ".cmd", ".ps1",
+                ".sql", ".r", ".lua", ".rb", ".go", ".rs",
+                ".swift", ".kt", ".scala", ".dart", ".vue", ".svelte",
+                ".csv", ".tsv", ".log", ".conf", ".config",
+                ".gitignore", ".dockerignore", ".editorconfig",
+                ".graphql", ".proto", ".sol", ".cairo",
+                ".cmake", ".mk", ".makefile",
+                ".nim", ".zig", ".d", ".ex", ".exs", ".hs", ".ml",
+                ".pas", ".cob", ".f", ".f90", ".for", ".bas",
+                ".adb", ".ads", ".e", ".cl", ".lisp", ".el",
+                ".tex", ".bib", ".cls", ".sty",
+                ".adoc", ".textile",
+                ".ipynb", ".jsonl", ".ndjson",
+                ".wkt", ".fix", ".feature", ".robot",
+                ".gherkin", ".bdd", ".spec", ".test",
+                ".todo", ".fixme", ".hack",
+                ".license", ".readme", ".changelog",
+            };
+            if (text_exts.count(ext))
+                return FileType::Text;
+
+            static const std::unordered_set<std::string> image_exts = {
+                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                ".tiff", ".tif", ".svg", ".ico", ".cur",
+                ".tga", ".pbm", ".pgm", ".ppm", ".hdr",
+                ".psd", ".psb", ".xcf", ".heic", ".heif",
+                ".avif", ".jxl", ".flif", ".apng", ".mng",
+                ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng",
+                ".orf", ".rw2", ".pef", ".srw",
+            };
+            if (image_exts.count(ext))
+                return FileType::Image;
+
+            static const std::unordered_set<std::string> audio_exts = {
+                ".mp3", ".wav", ".ogg", ".flac", ".aac",
+                ".m4a", ".wma", ".opus", ".aiff", ".ape",
+                ".alac", ".wv", ".mid", ".midi",
+            };
+            if (audio_exts.count(ext))
+                return FileType::Audio;
+
+            static const std::unordered_set<std::string> video_exts = {
+                ".mp4", ".avi", ".mkv", ".mov", ".wmv",
+                ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
+                ".3gp", ".ogv", ".ts", ".vob",
+            };
+            if (video_exts.count(ext))
+                return FileType::Video;
+
+            static const std::unordered_set<std::string> doc_exts = {
+                ".pdf", ".docx", ".xlsx", ".pptx",
+                ".epub", ".mobi", ".djvu",
+            };
+            if (doc_exts.count(ext))
+                return FileType::Document;
+
+            return FileType::Binary;
+        }
+
+        static FileType detect_file_type_by_content(const std::string &content)
+        {
+            if (content.size() < 4)
+                return FileType::Binary;
+            if (content.compare(0, 4, "\x89PNG") == 0) return FileType::Image;
+            if (content.compare(0, 3, "\xFF\xD8\xFF") == 0) return FileType::Image;
+            if (content.compare(0, 4, "GIF8") == 0) return FileType::Image;
+            if (content.compare(0, 4, "%PDF") == 0) return FileType::Document;
+            if (content.compare(0, 4, "RIFF") == 0 && content.size() >= 12 && content.compare(8, 4, "WAVE") == 0) return FileType::Audio;
+            if (content.compare(0, 3, "ID3") == 0) return FileType::Audio;
+            if (content.compare(0, 2, "\xFF\xFB") == 0 || content.compare(0, 2, "\xFF\xF3") == 0) return FileType::Audio;
+            if (content.compare(0, 4, "\x1A\x45\xDF\xA3") == 0) return FileType::Video;
+            if (content.find('\0') == std::string::npos) return FileType::Text;
+            return FileType::Binary;
+        }
+
+        static std::string get_media_type(std::string_view path)
+        {
+            std::string ext = to_lower(std::filesystem::path(path).extension().string());
+            static const std::unordered_map<std::string, std::string> media_types = {
+                {".png", "image/png"}, {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},
+                {".gif", "image/gif"}, {".bmp", "image/bmp"}, {".webp", "image/webp"},
+                {".tiff", "image/tiff"}, {".tif", "image/tiff"}, {".svg", "image/svg+xml"},
+                {".ico", "image/x-icon"}, {".psd", "image/vnd.adobe.photoshop"},
+                {".heic", "image/heic"}, {".heif", "image/heif"}, {".avif", "image/avif"},
+                {".jxl", "image/jxl"}, {".tga", "image/x-targa"},
+                {".raw", "image/x-raw"}, {".cr2", "image/x-canon-cr2"},
+                {".nef", "image/x-nikon-nef"}, {".arw", "image/x-sony-arw"},
+                {".dng", "image/x-adobe-dng"},
+                {".mp3", "audio/mpeg"}, {".wav", "audio/wav"}, {".ogg", "audio/ogg"},
+                {".flac", "audio/flac"}, {".aac", "audio/aac"}, {".m4a", "audio/mp4"},
+                {".wma", "audio/x-ms-wma"}, {".opus", "audio/opus"},
+                {".aiff", "audio/aiff"}, {".mid", "audio/midi"}, {".midi", "audio/midi"},
+                {".mp4", "video/mp4"}, {".avi", "video/x-msvideo"}, {".mkv", "video/x-matroska"},
+                {".mov", "video/quicktime"}, {".wmv", "video/x-ms-wmv"},
+                {".flv", "video/x-flv"}, {".webm", "video/webm"}, {".m4v", "video/x-m4v"},
+                {".mpg", "video/mpeg"}, {".mpeg", "video/mpeg"}, {".3gp", "video/3gpp"},
+                {".ts", "video/mp2t"}, {".vob", "video/mpeg"},
+                {".pdf", "application/pdf"}, {".epub", "application/epub+zip"},
+                {".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+                {".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                {".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+            };
+            auto it = media_types.find(ext);
+            return it != media_types.end() ? it->second : "application/octet-stream";
+        }
+
+        // =====================================================================
+        //  multimodal — file type detection and media type mapping (end)
+        // =====================================================================
 
         // Check if path is sensitive (vault, credentials, etc.).
         bool is_sensitive_path(std::string_view path)
@@ -2677,6 +2863,76 @@ namespace cell
             output = std::move(out);
             return true;
         }
+
+        // Read a file and populate a ToolResult with multimodal content blocks.
+        // For text files, returns line-numbered text in text_output (same as read()).
+        // For binary files (image/audio/video/document), returns metadata in text_output
+        // and base64-encoded content in multimodal_blocks.
+        bool read_multimodal(std::string_view path, cell::ToolResult &result,
+                             size_t offset = 0, size_t limit = 0,
+                             bool track = false, std::string *reason = nullptr)
+        {
+            auto fail = [&](std::string msg) -> bool
+            {
+                if (reason)
+                    *reason = std::move(msg);
+                return false;
+            };
+            std::error_code isdir_ec;
+            if (std::filesystem::is_directory(path, isdir_ec))
+                return fail(std::format("{} is a directory, not a file.", std::string(path)));
+            std::ifstream file(std::filesystem::path(path), std::ios::binary);
+            if (!file.is_open())
+            {
+                std::error_code ec;
+                if (!std::filesystem::exists(path, ec))
+                    return fail(std::format("{} does not exist.", std::string(path)));
+                return fail(std::format("{} could not be opened.", std::string(path)));
+            }
+            FileType file_type = detect_file_type(path);
+            if (file_type == FileType::Text)
+            {
+                file.close();
+                std::string err;
+                if (!read(path, result.text_output, 0, 0, track, offset, limit, &err))
+                    return fail(err);
+                return true;
+            }
+            // Binary file: read entire content as base64
+            constexpr size_t kMaxBinarySize = (size_t)128 * 1024 * 1024;
+            std::string content;
+            char buf[1 << 15];
+            size_t total = 0;
+            while (file.read(buf, sizeof buf) || file.gcount() > 0)
+            {
+                size_t n = (size_t)file.gcount();
+                total += n;
+                if (total > kMaxBinarySize)
+                    return fail(std::format("{} is too large ({} bytes, max {} bytes for multimodal read).",
+                                            std::string(path), total, kMaxBinarySize));
+                content.append(buf, n);
+            }
+            if (!file.eof())
+                return fail(std::format("{} could not be read (I/O error).", std::string(path)));
+            // Build metadata text
+            auto file_size = std::filesystem::file_size(path);
+            std::string media_type = get_media_type(path);
+            result.text_output = std::format("File: {}\nType: {}\nSize: {} bytes\nMedia-Type: {}",
+                                             std::string(path), file_type_to_string(file_type), file_size, media_type);
+            // Encode to base64
+            std::vector<uint8_t> data(content.begin(), content.end());
+            std::string b64 = base64_encode(data);
+            cell::ContentBlock block;
+            block.type = cell::ContentBlock::Type::InputImage;
+            block.data = std::move(b64);
+            block.media_type = std::move(media_type);
+            block.detail = "low";
+            result.multimodal_blocks.push_back(std::move(block));
+            if (track)
+                record_read(path, 1, (size_t)-1);
+            return true;
+        }
+
         bool write(std::string_view path, std::string_view input)
         {
             std::ofstream file(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
@@ -7142,17 +7398,39 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return cell::box::list_dir(j.value("path", "."), num_arg(j, "page", 1),
                                        std::max<size_t>(1, std::min<size_t>(num_arg(j, "page_size", 500), 500)), out);
         });
-    add("read", "Read a text file (capped at 128M characters per call) and return its contents. Use offset (0-based line offset) and limit (max lines to read) to read large files in segments. Credential/key files and the .cell runtime directory are blocked by the sandbox.",
+    add("read", "Read a file and return its contents. Text files return line-numbered content. Binary files (images, audio, video, documents) return base64-encoded content for LLM multimodal processing. Use offset (0-based line offset) and limit (max lines) for text files.",
         {{"path", str_prop("file path")},
          {"offset", num_prop("number of lines to skip from the start (0-based, optional)")},
          {"limit", num_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
         {"path"}, Policy::Allow,
         [](const nlohmann::json &j, std::string &out)
         {
-            std::string err;
-            if (!cell::box::read(j.value("path", ""), out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0), &err))
+            std::string path = j.value("path", "");
+            // Check if this is a multimodal file
+            cell::box::FileType ft = cell::box::detect_file_type(path);
+            if (ft != cell::box::FileType::Text)
             {
-                out = err.empty() ? std::format("read failed: {} could not be read.", j.value("path", ""))
+                // Multimodal file: read and store blocks in thread-local
+                static thread_local cell::ToolResult tl_result;
+                tl_result = cell::ToolResult{};
+                std::string err;
+                if (!cell::box::read_multimodal(path, tl_result, num_arg(j, "offset", 0), num_arg(j, "limit", 0), true, &err))
+                {
+                    out = err.empty() ? std::format("read failed: {} could not be read.", path)
+                                      : std::format("read failed: {}", err);
+                    return false;
+                }
+                // Store pointer for the tool output builder to pick up
+                cell::set_thread_local_tool_result(&tl_result);
+                out = tl_result.text_output;
+                return true;
+            }
+            // Text file: existing behavior
+                        cell::set_thread_local_tool_result(nullptr);
+            std::string err;
+            if (!cell::box::read(path, out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0), &err))
+            {
+                out = err.empty() ? std::format("read failed: {} could not be read.", path)
                                   : std::format("read failed: {}", err);
                 return false;
             }
@@ -10798,9 +11076,79 @@ int main(int argc, char const *argv[])
                                 cell::sys::println("{}", shown);
                         }
                         if (p->api_style != "anthropic")
-                            s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
+                        {
+                            // Check for multimodal content
+                            cell::ToolResult *tl_result = cell::get_thread_local_tool_result();
+                            if (tl_result && tl_result->is_multimodal())
+                            {
+                                // Build multimodal content for OpenAI APIs
+                                nlohmann::json content_array = nlohmann::json::array();
+                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
+                                for (const auto &block : tl_result->multimodal_blocks)
+                                {
+                                    if (block.type == cell::ContentBlock::Type::InputImage)
+                                    {
+                                        if (p->api_style == "openai-responses")
+                                        {
+                                            content_array.push_back({
+                                                {"type", "input_image"},
+                                                {"image_url", "data:" + block.media_type + ";base64," + block.data},
+                                                {"detail", block.detail.empty() ? "low" : block.detail}
+                                            });
+                                        }
+                                        else
+                                        {
+                                            content_array.push_back({
+                                                {"type", "image_url"},
+                                                {"image_url", {{"url", "data:" + block.media_type + ";base64," + block.data}}}
+                                            });
+                                        }
+                                    }
+                                }
+                                if (p->api_style == "openai-responses")
+                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", content_array}});
+                                else
+                                    s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", content_array}});
+                            }
+                            else
+                            {
+                                // Text-only output
+                                if (p->api_style == "openai-responses")
+                                    s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", wrapped}});
+                                else
+                                    s->msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
+                            }
+                        }
                         else
-                            s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
+                        {
+                            // Anthropic API
+                            cell::ToolResult *tl_result = cell::get_thread_local_tool_result();
+                            if (tl_result && tl_result->is_multimodal())
+                            {
+                                nlohmann::json content_array = nlohmann::json::array();
+                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
+                                for (const auto &block : tl_result->multimodal_blocks)
+                                {
+                                    if (block.type == cell::ContentBlock::Type::InputImage)
+                                    {
+                                        content_array.push_back({
+                                            {"type", "image"},
+                                            {"source", {
+                                                {"type", "base64"},
+                                                {"media_type", block.media_type},
+                                                {"data", block.data}
+                                            }}
+                                        });
+                                    }
+                                }
+                                s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", content_array}}})}});
+                            }
+                            else
+                            {
+                                s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
+                            }
+                        }
+            cell::set_thread_local_tool_result(nullptr);
                     }
                     // sandbox security refusals are normal feedback; only approval
                     // refusals end the run (user decline only, autoallow reject
