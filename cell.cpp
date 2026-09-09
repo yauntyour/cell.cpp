@@ -5503,6 +5503,17 @@ namespace cell
                 std::string instructions;
                 for (auto &m : messages)
                 {
+                    // pass through raw Responses API input items (function_call_output,
+                    // etc.) that were pushed directly into the message array without
+                    // a "role" field.  Without this, tool results are silently dropped
+                    // and the model never sees them, causing infinite tool-call loops.
+                    if (m.contains("type") && !m.contains("role"))
+                    {
+                        std::string t = m.value("type", "");
+                        if (t == "function_call_output" || t == "function_call")
+                            input.push_back(m);
+                        continue;
+                    }
                     std::string role = m.value("role", "");
                     if (role == "system")
                     {
@@ -5647,6 +5658,20 @@ namespace cell
                             }
                         }
                     }
+                    else if (type == "reasoning")
+                    {
+                        // Responses API reasoning items: extract summary text blocks
+                        // and store as reasoning content for session persistence.
+                        if (item.contains("summary") && item["summary"].is_array())
+                        {
+                            for (auto &s : item["summary"])
+                            {
+                                std::string st = s.value("type", "");
+                                if (st == "summary_text" && s.contains("text") && s["text"].is_string())
+                                    content.push_back({{"type", "reasoning"}, {"reasoning", s["text"]}});
+                            }
+                        }
+                    }
                     else if (type == "function_call")
                     {
                         nlohmann::json tc;
@@ -5659,6 +5684,8 @@ namespace cell
                 }
                 if (content.size() == 1 && content[0].value("type", "") == "text")
                     reply["content"] = content[0]["text"];
+                else if (content.size() == 1 && content[0].value("type", "") == "reasoning")
+                    reply["content"] = std::move(content);
                 else if (!content.empty())
                     reply["content"] = std::move(content);
                 else
@@ -5703,6 +5730,7 @@ namespace cell
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string text;
+                std::string reasoning; // accumulated reasoning summary text
                 std::string sse_buf;
                 size_t sse_base = 0;
                 // track function_call deltas by item_id (OpenAI Responses streaming
@@ -5739,6 +5767,19 @@ namespace cell
                                                 func_call_callids[iid] = cid;
                                         }
                                     }
+                                    // extract reasoning from the final response if not
+                                    // already captured via streaming deltas
+                                    else if (item.value("type", "") == "reasoning" && reasoning.empty())
+                                    {
+                                        if (item.contains("summary") && item["summary"].is_array())
+                                        {
+                                            for (auto &s : item["summary"])
+                                            {
+                                                if (s.value("type", "") == "summary_text" && s.contains("text") && s["text"].is_string())
+                                                    reasoning += s["text"].get_ref<const std::string &>();
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -5767,6 +5808,14 @@ namespace cell
                                 const std::string &t = ev["delta"].get_ref<const std::string &>();
                                 text.append(t);
                                 on_token(std::span<const char>(t));
+                            }
+                        }
+                        else if (type == "response.reasoning_summary_text.delta")
+                        {
+                            if (ev.contains("delta") && ev["delta"].is_string())
+                            {
+                                const std::string &t = ev["delta"].get_ref<const std::string &>();
+                                reasoning.append(t);
                             }
                         }
                         else if (type == "response.function_call_arguments.delta")
@@ -5805,11 +5854,31 @@ namespace cell
                 // when the model produced tool calls, content must be null (per the
                 // Chat Completions contract) even if no text was streamed
                 if (!func_call_args.empty())
-                    reply["content"] = nullptr;
+                {
+                    if (!reasoning.empty())
+                    {
+                        nlohmann::json arr = nlohmann::json::array();
+                        arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
+                        reply["content"] = std::move(arr);
+                    }
+                    else
+                        reply["content"] = nullptr;
+                }
+                else if (!reasoning.empty())
+                {
+                    // store reasoning_content in reply for session persistence
+                    nlohmann::json arr = nlohmann::json::array();
+                    arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
+                    if (!text.empty())
+                        arr.push_back({{"type", "text"}, {"text", text}});
+                    reply["content"] = std::move(arr);
+                }
                 else if (text.empty())
                     reply["content"] = nullptr;
                 else
                     reply["content"] = text;
+                if (!reasoning.empty())
+                    cell::sys::logger::instance().debug("llm", std::format("responses_reasoning_chars={}", reasoning.size()));
                 // assemble tool_calls from accumulated deltas. func_call_args is keyed
                 // by item_id; resolve the function name and the call_id (used by the
                 // tool_result's function_call_output) through the mappings built above.
