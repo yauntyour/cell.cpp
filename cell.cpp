@@ -960,6 +960,9 @@ namespace cell
             Image,
             InputText,
             InputImage,
+            InputAudio,
+            InputVideo,
+            InputDocument,
         };
         Type type = Type::Text;
         std::string text;
@@ -1095,22 +1098,6 @@ namespace cell
             return FileType::Binary;
         }
 
-        static FileType detect_file_type_by_content(const std::string &content)
-        {
-            if (content.size() < 4)
-                return FileType::Binary;
-            if (content.compare(0, 4, "\x89PNG") == 0) return FileType::Image;
-            if (content.compare(0, 3, "\xFF\xD8\xFF") == 0) return FileType::Image;
-            if (content.compare(0, 4, "GIF8") == 0) return FileType::Image;
-            if (content.compare(0, 4, "%PDF") == 0) return FileType::Document;
-            if (content.compare(0, 4, "RIFF") == 0 && content.size() >= 12 && content.compare(8, 4, "WAVE") == 0) return FileType::Audio;
-            if (content.compare(0, 3, "ID3") == 0) return FileType::Audio;
-            if (content.compare(0, 2, "\xFF\xFB") == 0 || content.compare(0, 2, "\xFF\xF3") == 0) return FileType::Audio;
-            if (content.compare(0, 4, "\x1A\x45\xDF\xA3") == 0) return FileType::Video;
-            if (content.find('\0') == std::string::npos) return FileType::Text;
-            return FileType::Binary;
-        }
-
         static std::string get_media_type(std::string_view path)
         {
             std::string ext = to_lower(std::filesystem::path(path).extension().string());
@@ -1140,6 +1127,21 @@ namespace cell
             };
             auto it = media_types.find(ext);
             return it != media_types.end() ? it->second : "application/octet-stream";
+        }
+
+        static std::string get_audio_format(const std::string &media_type)
+        {
+            if (media_type == "audio/mpeg")  return "mp3";
+            if (media_type == "audio/wav")   return "wav";
+            if (media_type == "audio/ogg")   return "ogg";
+            if (media_type == "audio/flac")  return "flac";
+            if (media_type == "audio/aac")   return "aac";
+            if (media_type == "audio/mp4")   return "m4a";
+            if (media_type == "audio/x-ms-wma") return "wma";
+            if (media_type == "audio/opus")  return "opus";
+            if (media_type == "audio/aiff")  return "aiff";
+            if (media_type == "audio/midi")  return "midi";
+            return "mp3";
         }
 
         // =====================================================================
@@ -2919,11 +2921,24 @@ namespace cell
             std::string media_type = get_media_type(path);
             result.text_output = std::format("File: {}\nType: {}\nSize: {} bytes\nMedia-Type: {}",
                                              std::string(path), file_type_to_string(file_type), file_size, media_type);
+            // Video and Document have no provider-native multimodal support;
+            // return metadata only without base64 data.
+            if (file_type == FileType::Video || file_type == FileType::Document)
+            {
+                if (track)
+                    record_read(path, 1, (size_t)-1);
+                return true;
+            }
             // Encode to base64
             std::vector<uint8_t> data(content.begin(), content.end());
             std::string b64 = base64_encode(data);
             cell::ContentBlock block;
-            block.type = cell::ContentBlock::Type::InputImage;
+            switch (file_type)
+            {
+            case FileType::Image:  block.type = cell::ContentBlock::Type::InputImage;  break;
+            case FileType::Audio:  block.type = cell::ContentBlock::Type::InputAudio;  break;
+            default:               block.type = cell::ContentBlock::Type::InputImage;  break;
+            }
             block.data = std::move(b64);
             block.media_type = std::move(media_type);
             block.detail = "low";
@@ -5209,6 +5224,25 @@ namespace cell
                 }
             }
         }
+        // Returns true if the content array contains multimodal blocks
+        // (image_url, input_image, input_audio, audio, etc.) that must not be
+        // flattened to text by sanitize_messages.
+        static bool has_multimodal_content(const nlohmann::json &content)
+        {
+            if (!content.is_array())
+                return false;
+            for (auto &part : content)
+            {
+                if (part.is_object())
+                {
+                    std::string type = part.value("type", "");
+                    if (type == "image_url" || type == "input_image" ||
+                        type == "input_audio" || type == "audio")
+                        return true;
+                }
+            }
+            return false;
+        }
         static std::string string_content(const nlohmann::json &content)
         {
             std::string text;
@@ -5277,9 +5311,14 @@ namespace cell
                                           !item["tool_calls"].empty();
                     if (item.contains("content") && item["content"].is_array())
                     {
-                        std::string text;
-                        append_content_text(item["content"], text);
-                        item["content"] = text.empty() ? nlohmann::json(nullptr) : nlohmann::json(std::move(text));
+                        // Preserve multimodal content arrays (image_url, input_audio, etc.)
+                        // — they must not be flattened to text.
+                        if (!has_multimodal_content(item["content"]))
+                        {
+                            std::string text;
+                            append_content_text(item["content"], text);
+                            item["content"] = text.empty() ? nlohmann::json(nullptr) : nlohmann::json(std::move(text));
+                        }
                     }
                     if (role == "tool")
                     {
@@ -5287,7 +5326,7 @@ namespace cell
                             item["tool_call_id"] = "";
                         if (!item.contains("content") || item["content"].is_null())
                             item["content"] = "";
-                        else if (!item["content"].is_string())
+                        else if (!item["content"].is_string() && !item["content"].is_array())
                             item["content"] = string_content(item["content"]);
                     }
                     else if (role == "assistant" && item["content"].is_null() && !has_tool_calls)
@@ -11104,6 +11143,25 @@ int main(int argc, char const *argv[])
                                             });
                                         }
                                     }
+                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                    {
+                                        std::string format = cell::box::get_audio_format(block.media_type);
+                                        if (p->api_style == "openai-responses")
+                                        {
+                                            content_array.push_back({
+                                                {"type", "input_audio"},
+                                                {"data", block.data},
+                                                {"format", format}
+                                            });
+                                        }
+                                        else
+                                        {
+                                            content_array.push_back({
+                                                {"type", "input_audio"},
+                                                {"input_audio", {{"data", block.data}, {"format", format}}}
+                                            });
+                                        }
+                                    }
                                 }
                                 if (p->api_style == "openai-responses")
                                     s->msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", content_array}});
@@ -11133,6 +11191,17 @@ int main(int argc, char const *argv[])
                                     {
                                         content_array.push_back({
                                             {"type", "image"},
+                                            {"source", {
+                                                {"type", "base64"},
+                                                {"media_type", block.media_type},
+                                                {"data", block.data}
+                                            }}
+                                        });
+                                    }
+                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                    {
+                                        content_array.push_back({
+                                            {"type", "audio"},
                                             {"source", {
                                                 {"type", "base64"},
                                                 {"media_type", block.media_type},
