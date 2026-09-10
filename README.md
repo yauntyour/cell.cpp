@@ -87,6 +87,8 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 - [Command-line options](#command-line-options)
 - [Slash commands](#slash-commands)
 - [Tools](#tools)
+- [Teamwork](#teamwork)
+- [Notices](#notices)
 - [Security model](#security-model)
 - [Sessions and the working-directory model](#sessions-and-the-working-directory-model)
 - [Configuration file](#configuration-file)
@@ -104,8 +106,9 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 | --- | --- | --- |
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
-| 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw` | `cell::box`, `cell::tools` |
-| 👥 | **Teamwork** — supervised child agents (`tw` tool + `/teamworks`): serial or parallel jobs, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), and queryable history & reports | `cell::teamwork` |
+| 🔧 | **9 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw`, `notice` | `cell::box`, `cell::tools` |
+| 👥 | **Teamwork** — supervised child agents with configurable workflows (`tw` tool + `/teamworks`): named stages with per-stage dispatch mode, supervisor gates, same-job reuse, background runs with cooperative stops, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), and queryable history & reports | `cell::teamwork` |
+| 📣 | **Notices** — a token-free message bus between agent sessions: Teamwork children report progress, the supervisor idles in `/notices wait` and is woken instantly, all without a single LLM round-trip | `cell::notice` |
 | 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
@@ -256,13 +259,23 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/teamworks` | List Teamwork jobs of the current session (see [Teamwork](#teamwork)) |
 | `/teamworks all` | List Teamwork jobs of every session in this working directory |
 | `/teamworks new` | Create an empty Teamwork job and print its id |
-| `/teamworks id:ID bg:none\|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]` | Append a child task to a pending job |
-| `/teamworks run ID` | Run a job and print its consolidated report |
+| `/teamworks id:ID bg:none\|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]` | Append a child task to a pending job (workflow jobs file it into the last stage) |
+| `/teamworks workflow [FILE]` | Load a workflow/job config from a JSON file in the working directory (default `teamwork.workflow.json`; a bare `{stages:[…]}` is accepted) and create the job |
+| `/teamworks run ID` | Run a job and print its consolidated report; a gated stage pauses the job — run again to resume |
+| `/teamworks run_bg ID` | Run a job in the background on the dedicated runner thread; progress arrives as notices |
+| `/teamworks resume ID` | Continue a gated/stopped workflow job from its saved stage |
+| `/teamworks stop ID` | Request a cooperative stop (pauses at the next worker round or stage boundary) |
+| `/teamworks status ID` | Show one job with its stage plan, gates and progress |
 | `/teamworks max [N]` | Show or set the child-agent limit (1–100, persisted) |
 | `/teamworks rm ID` / `/teamworks rm ID:worker_N` | Delete a job, or one child task and its report |
 | `/teamworks history [JOB] [worker:W] [n:N] [all]` | List past child-agent tasks with status/model/rounds |
 | `/teamworks reports [JOB] [worker:W] [n:N] [full] [all]` | Print several child reports (newest first) |
 | `/teamworks report JOB:worker` | Print one child's report |
+| `/notices` | Peek pending notices of the current session (see [Notices](#notices)) |
+| `/notices wait [SEC] [from:X] [topic:Y]` | Block token-free until a matching notice arrives, then deliver pending notices into the conversation (default 60s, max 3600s) |
+| `/notices send [SESSION] TEXT` | Deliver a notice to a session (the token after `send` is the target only when it resolves to a session id — exact match or unique prefix; otherwise the text goes to the current session) |
+| `/notices drain` | Consume pending notices into the conversation (also happens automatically before every LLM turn) |
+| `/notices clear` | Drop pending notices (archived to `seen.jsonl`) |
 | `/save` | Persist the current session now (flushes the async writer) |
 | `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
 | `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
@@ -322,7 +335,7 @@ toward usage.
 
 ## Tools
 
-Eight tools are registered — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` and `tw` — with
+Nine tools are registered — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw` and `notice` — with
 schemas emitted for the active API style
 (`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic, and
 `{"type":"function","name":…,"parameters":…}` for the Responses API).
@@ -336,7 +349,8 @@ schemas emitted for the active API style
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; follows a symlink only when it resolves inside the walk root; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines (overlapping context is printed once), file extension filtering, and count-only mode; 8M-line scan budget; exponential-backtracking shapes (`(a+)+`, `(a|b){3}`, `a{2}{3}`) and patterns over 200 chars are rejected |
 | `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata (a symlink is followed only when it resolves inside `path`; `name` is case-insensitive on Windows; a future `mtime` is never "recent"). When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Returns `path  size bytes  mtime (UTC)` per match |
-| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs — see [Teamwork](#teamwork) |
+| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
+| `notice` | Allow | `operation` (send/list/drain/wait/clear), `session`, `from`, `topic`, `body`, `timeout`, `from_filter`, `topic_filter` | Cross-session message bus — see [Notices](#notices) |
 
 The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
 `larger_than_bytes` metadata filters.
@@ -360,9 +374,11 @@ consecutive edits of one file skip the disk while an external writer is always p
 ## Teamwork
 
 Teamwork runs **supervised child agents**. The main agent creates a *job* holding a list of child
-tasks, runs them serially or in parallel, and gets back a consolidated report. Every child gets an
-independent message history; children are restricted to read-only tools in a parallel job and can
-never call `tw` themselves, so the hierarchy stays a tree of depth 1.
+tasks — optionally arranged as a **workflow of named stages** — runs them serially or in parallel,
+and gets back a consolidated report. Every child gets an independent message history; children are
+restricted to read-only tools in a parallel stage and can never call `tw` themselves, so the
+hierarchy stays a tree of depth 1. Children *can* call `notice`, which is how they report progress
+to the supervising session mid-run.
 
 Jobs live with the session: `<root>/sessions/<cwd-key>/<session-id>/teamworks.json`, with one
 `<session-id>/<job-id>/<worker>.json` transcript per child. Job ids are UTC wall-clock stamps —
@@ -383,7 +399,22 @@ memory and mirrored to disk through the async writer, so listing/querying jobs c
       "name": "net-audit" },
     { "works": "then write regression tests", "reuse": "tw-1788623888-0/net-audit" }
   ] }
+
+// tw operation:"new" with a workflow — stages run in order, each with its own
+// agents, dispatch mode, optional stage-level provider/model/think defaults,
+// and an optional supervisor gate after the stage
+{ "workflow": { "name": "ship-it",
+  "stages": [
+    { "name": "research", "mode": "parallel",
+      "agents": [ { "works": "scan the docs" }, { "works": "scan the code" } ] },
+    { "name": "implement", "gate": true, "think": "low",
+      "agents": [ { "works": "patch it", "reuse": "worker_0" } ] }   // bare name = same-job reuse
+  ] } }
 ```
+
+A workflow can also be loaded from a file: `tw operation:"new" path:"teamwork.workflow.json"`
+(relative to the working directory; the file may hold a full job config or a bare `{stages:[…]}`),
+or `/teamworks workflow [FILE]` from the REPL.
 
 | Field (per child) | Meaning |
 | --- | --- |
@@ -391,22 +422,43 @@ memory and mirrored to disk through the async writer, so listing/querying jobs c
 | `background` | `none` (default) or `prolegomena` (inject the main conversation as context) |
 | `provider` / `model` | run **this child** on a specific provider/model |
 | `think` | chain-of-thought level for this child |
-| `reuse` | `tw-ID/worker_N` — inherit a previously executed child (task config, and by default its transcript) |
+| `reuse` | `tw-ID/worker_N` for a past job, or a bare `worker_N` for an earlier-stage worker of the same job — inherits the task config and, by default, the transcript |
 | `reuse_context` | `true` (default): replay the earlier conversation; `false`: config only |
 | `name` | explicit child name (sanitized for use as a file name) |
 
-Model resolution order for a child: its own field → the reused child's field → the job default → the
-reused job's default → the active provider/model. A `provider` that does not exist is an error, never
-a silent fallback. Each child builds its own LLM client and reuses it across all its rounds, so
-parallel children never share a curl handle.
+Stage fields: `name` (default `stage_N`), `mode` (`serial` default \| `parallel`), `gate` (pause for
+the supervisor after this stage), `provider`/`model`/`think` (stage defaults), `agents` (required,
+non-empty). A bare `reuse` must name a worker from an **earlier** stage — this is validated when the
+job is created.
+
+Model resolution order for a child: its own field → the reused child's field → the stage default →
+the job default → the reused job's default → the active provider/model. A `provider` that does not
+exist is an error, never a silent fallback. Each child builds its own LLM client and reuses it
+across all its rounds, so parallel children never share a curl handle.
+
+### Workflow execution, gates and supervision
+
+- Stages run in order; workers within a stage run serially or in parallel (pool-bounded). After
+  every stage the progress so far is persisted (`next_stage`), so a gate pause, a stop or a crash
+  never loses completed-stage reports.
+- **Gates**: a stage with `gate: true` pauses the job before the next stage (`status=waiting`) and
+  posts a notice. The supervisor reviews the stage report and resumes with `tw run`, `/teamworks
+  run ID` / `resume ID`, or re-plans with `edit`.
+- **Background runs**: `/teamworks run_bg ID` (or `tw run` with `background:true`) executes the
+  remaining workflow on a dedicated runner thread while the REPL stays interactive. The supervisor
+  can idle in `/notices wait` — zero tokens — and is woken by every stage/worker transition.
+- **Stops**: `/teamworks stop ID` requests a cooperative stop; the job pauses at the next worker
+  round or stage boundary (`status=waiting`, the interrupted stage re-runs on resume).
+- **Boot recovery**: a process exit while a job was running leaves it `running`; the next start
+  marks such jobs `failed` so they can be re-run or removed.
 
 ### `tw` operations
 
 | Operation | Arguments | Result |
 | --- | --- | --- |
-| `new` | `work-type`, `list`, optional `provider`/`model`/`think` | creates a job and prints it |
-| `run` | `id` (+ optional config override) | runs the job, returns the consolidated report |
-| `edit` | `id` + new `work-type`/`list` | replaces the config of an uncompleted job |
+| `new` | `work-type` + `list`, or `workflow` (with `stages`), or `path` (config file), optional `provider`/`model`/`think` | creates a job and prints it |
+| `run` | `id` (+ optional config override, `background` for a background run) | runs the job / resumes a waiting one, returns the consolidated report |
+| `edit` | `id` + new `work-type`/`list`/`workflow` | replaces the config of an uncompleted job (progress resets) |
 | `remove` | `id` | deletes a job (agents may not delete completed jobs) |
 | `reuse` | `from:"tw-ID/worker_N"`, optional `works`/`provider`/`model`/`think`/`name` | creates a new job seeded from a past child |
 | `list` | `all` | lists jobs of this session (or of every session in this working directory) |
@@ -430,9 +482,14 @@ text, so results stay recoverable.
 /teamworks                                        list jobs of this session
 /teamworks all                                    list jobs of every session in this directory
 /teamworks new                                    create an empty job (append children next)
+/teamworks workflow [FILE]                        load a workflow config file as a new job
 /teamworks id:ID works:... [bg:none|prolegomena] [provider:P] [model:M] [think:L]
                                    [reuse:JOB/worker] [name:NAME]
-/teamworks run ID                                 run a job and print its report
+/teamworks run ID                                 run a job (resumes a gated one) and print its report
+/teamworks run_bg ID                              run in the background; progress via notices
+/teamworks resume ID                              continue a gated/stopped job from its saved stage
+/teamworks stop ID                                request a cooperative stop
+/teamworks status ID                              show one job with its stage plan
 /teamworks max [N]                                show / set the child limit (1..100)
 /teamworks rm ID | /teamworks rm ID:worker_N      delete a job / one child
 /teamworks history [JOB] [worker:W] [n:N] [all]   past child tasks
@@ -444,12 +501,38 @@ text, so results stay recoverable.
 
 - **serial** jobs run children one after another on the calling thread; **parallel** jobs are
   dispatched through the shared worker pool, so concurrency is bounded by `thread_pool_size`
-  (default 16) instead of spawning one thread per child.
-- A child that throws is captured and reported as `failed`; a job never gets stuck in `running`.
-  Jobs also carry `ok / incomplete / failed` per child, where `incomplete` means the child hit the
+  (default 16) instead of spawning one thread per child. Workflow stages inherit the same rule per
+  stage; background runs execute on their own dedicated runner thread (never on the pool) so a
+  pool-hosted run can never deadlock, and are joined at exit.
+- A child that throws is captured and reported as `failed`; a job never gets stuck in `running`
+  across restarts (boot recovery marks interrupted runs `failed`). Jobs also carry
+  `ok / incomplete / failed / stopped` per child, where `incomplete` means the child hit the
   8-round limit without producing a final answer.
 - Child runs count toward usage statistics with their real token counts, keyed
   `<job-id>-<child-name>`.
+
+## Notices
+
+The `notice` system is a **message bus for agent sessions**. Any writer — the user from the REPL,
+a Teamwork child inside this process, or a second cell process sharing the runtime root — drops a
+JSON file into the target session's `notices/pending/` folder (atomic write, sanitized on read:
+UTF-8 only, control/ANSI bytes stripped, 16 KB body cap, 500 pending-files cap). Delivered notices
+are archived to `notices/seen.jsonl`.
+
+**Waiting is token-free.** `/notices wait` (and the `notice` tool's `wait` operation) block on a
+condition variable with a periodic folder re-scan (~0.7 s) — no LLM request is made while idle.
+In-process sends wake the waiter instantly; cross-process sends arrive within ~1 s. Pending
+notices are also drained automatically before every LLM turn, so a supervisor never has to poll.
+
+- **Send**: `/notices send [SESSION] TEXT`, or the `notice` tool (`from`/`topic` fields give the
+  receiver routing hints). Teamwork children report progress this way — `notice` is the one tool
+  available to them beyond their sandbox, in every job mode.
+- **Automatic progress**: every Teamwork job posts notices for job start/completion/failure, stage
+  start/finish, gate pauses, stops, and each worker start/finish (with status and a summary
+  snippet), all `from=teamwork/<job-id>[/<worker>]`.
+- **Consume**: `/notices drain` (or `notice drain`) delivers pending notices into the conversation
+  as context; `wait` delivers what it woke for; `clear` drops them. Delivered = exactly once per
+  draining session, thanks to file removal under a drain lock.
 
 ## Security model
 
@@ -649,6 +732,9 @@ where you launch it from.
             ├── teamworks.json    # Teamwork store (jobs of this session)
             ├── tw-20260910-124236/          # one transcript dir per job
             │   └── worker_0.json
+            ├── notices/
+            │   ├── pending/      # undelivered notice files (nt-*.json)
+            │   └── seen.jsonl    # audit trail of delivered/dropped notices
             └── saved/
                 └── msg-20260910-124500.jsonl  # full transcript archived by /compact
 ```
