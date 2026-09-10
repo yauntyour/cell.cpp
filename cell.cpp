@@ -5501,6 +5501,18 @@ namespace cell
             {
                 nlohmann::json input = nlohmann::json::array();
                 std::string instructions;
+                nlohmann::json pending_tool_images = nlohmann::json::array();
+                auto flush_tool_images = [&]()
+                {
+                    if (pending_tool_images.empty())
+                        return;
+                    // Some OpenAI-compatible Responses implementations (notably
+                    // llama.cpp) only accept input_text inside function_call_output.
+                    // Keep the text tool result there and attach images in the next
+                    // user item, which is valid Responses input and broadly supported.
+                    input.push_back({{"role", "user"}, {"content", std::move(pending_tool_images)}});
+                    pending_tool_images = nlohmann::json::array();
+                };
                 for (auto &m : messages)
                 {
                     // pass through raw Responses API input items (function_call_output,
@@ -5510,20 +5522,39 @@ namespace cell
                     if (m.contains("type") && !m.contains("role"))
                     {
                         std::string t = m.value("type", "");
-                        if (t == "function_call_output" || t == "function_call")
+                        if (t == "function_call_output")
                         {
                             // Normalize: llama.cpp requires output as input_text content blocks
-                            if (t == "function_call_output" && m.contains("output") && m["output"].is_string())
+                            nlohmann::json normalized = m;
+                            if (normalized.contains("output") && normalized["output"].is_string())
                             {
-                                nlohmann::json normalized = m;
-                                normalized["output"] = nlohmann::json::array({{{"type", "input_text"}, {"text", m["output"]}}});
-                                input.push_back(std::move(normalized));
+                                normalized["output"] = nlohmann::json::array({{{"type", "input_text"}, {"text", normalized["output"]}}});
                             }
-                            else
-                                input.push_back(m);
+                            else if (normalized.contains("output") && normalized["output"].is_array())
+                            {
+                                nlohmann::json output = nlohmann::json::array();
+                                for (auto &part : normalized["output"])
+                                {
+                                    if (part.is_object() && part.value("type", "") == "input_image")
+                                        pending_tool_images.push_back(part);
+                                    else
+                                        output.push_back(part);
+                                }
+                                // A function_call_output must still contain a text item
+                                // for compatibility with older Responses servers.
+                                if (output.empty())
+                                    output.push_back({{"type", "input_text"}, {"text", ""}});
+                                normalized["output"] = std::move(output);
+                            }
+                            input.push_back(std::move(normalized));
+                            continue;
                         }
+                        flush_tool_images();
+                        if (t == "function_call")
+                            input.push_back(m);
                         continue;
                     }
+                    flush_tool_images();
                     std::string role = m.value("role", "");
                     if (role == "system")
                     {
@@ -5620,6 +5651,7 @@ namespace cell
                         input.push_back(std::move(output));
                     }
                 }
+                flush_tool_images();
                 return {std::move(input), instructions};
             }
 
@@ -8630,10 +8662,39 @@ static int run_selftest()
                  "responses emits top-level function_call_output");
         bool legacy_responses_output = false;
         for (auto &item : responses_input)
-            legacy_responses_output |= item.value("type", "") == "function_call_output" &&
-                                       item.value("call_id", "") == "legacy_call" &&
-                                       item.value("output", "") == "legacy output";
+            if (item.value("type", "") == "function_call_output" &&
+                item.value("call_id", "") == "legacy_call")
+            {
+                auto &output = item["output"];
+                legacy_responses_output = output.is_array() && output.size() == 1 &&
+                                          output[0].value("type", "") == "input_text" &&
+                                          output[0].value("text", "") == "legacy output";
+            }
         R.expect(legacy_responses_output, "responses converts Anthropic tool_result blocks");
+
+        nlohmann::json image_messages = nlohmann::json::array({
+            {{"type", "function_call_output"},
+             {"call_id", "call_image"},
+             {"output", nlohmann::json::array({
+                            {{"type", "input_text"}, {"text", "image metadata"}},
+                            {{"type", "input_image"},
+                             {"image_url", "data:image/png;base64,AA=="},
+                             {"detail", "low"}},
+                        })}},
+        });
+        auto image_responses = cell::llm::OpenAIResponses::body("m", image_messages, nlohmann::json::array(), false);
+        auto &image_input = image_responses["input"];
+        R.expect(image_input.size() == 2, "responses splits tool images into a user item");
+        R.expect(image_input[0].value("type", "") == "function_call_output" &&
+                     image_input[0]["output"].size() == 1 &&
+                     image_input[0]["output"][0].value("type", "") == "input_text" &&
+                     image_input[0]["output"][0].value("text", "") == "image metadata",
+                 "responses keeps only text in multimodal function_call_output");
+        R.expect(image_input[1].value("role", "") == "user" &&
+                     image_input[1]["content"].size() == 1 &&
+                     image_input[1]["content"][0].value("type", "") == "input_image" &&
+                     image_input[1]["content"][0].value("image_url", "") == "data:image/png;base64,AA==",
+                 "responses emits tool images as user input_image content");
     }
 
     // log rotation: trim_log keeps only the tail of an over-cap log file
