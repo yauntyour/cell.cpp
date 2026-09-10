@@ -104,7 +104,8 @@ I can also just chat and answer questions generally. Let me write a nice introdu
 | --- | --- | --- |
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
-| 🔧 | **7 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` | `cell::box`, `cell::tools` |
+| 🔧 | **8 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw` | `cell::box`, `cell::tools` |
+| 👥 | **Teamwork** — supervised child agents (`tw` tool + `/teamworks`): serial or parallel jobs, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), and queryable history & reports | `cell::teamwork` |
 | 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
@@ -181,7 +182,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
   --key KEY                   api key (saved to the encrypted vault)
   --session ID                resume an existing session (switches to its working directory)
   --system TEXT               system prompt
-  --sandbox MODE              exec sandbox mode: read-only | workspace-write | full-access (default) | outer-full
+  --sandbox MODE              exec sandbox mode: read-only | edit-only | full-access (default)
   --no-color                  disable colored log output
   --verbose                   enable DEBUG-level log output on console
   --selftest                  run internal self tests
@@ -196,7 +197,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 | `--key` | secret | Encrypted into `.cell/.crypt` under the id `provider:<name>` and bound to the current provider; the plaintext copy is zeroed (`sodium_memzero`) immediately. |
 | `--session` | id | Stored as `cfg.session_id`. See [Implementation notes](#implementation-notes): startup always opens a fresh session, so resume with `/session ID`. |
 | `--system` | text | Replaces the system prompt entirely. |
-| `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. Note: `print_usage` also advertises `workspace-write` / `outer-full` aliases, but only the three modes above are implemented (see [Implementation notes](#implementation-notes)). |
+| `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. |
 | `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
 | `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
 | `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
@@ -247,6 +248,16 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
 | `/skills` | List available skills |
 | `/skill NAME` | Inject a skill body into the current session as a system message |
+| `/teamworks` | List Teamwork jobs of the current session (see [Teamwork](#teamwork)) |
+| `/teamworks all` | List Teamwork jobs of every session in this working directory |
+| `/teamworks new` | Create an empty Teamwork job and print its id |
+| `/teamworks id:ID bg:none\|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]` | Append a child task to a pending job |
+| `/teamworks run ID` | Run a job and print its consolidated report |
+| `/teamworks max [N]` | Show or set the child-agent limit (1–100, persisted) |
+| `/teamworks rm ID` / `/teamworks rm ID:worker_N` | Delete a job, or one child task and its report |
+| `/teamworks history [JOB] [worker:W] [n:N] [all]` | List past child-agent tasks with status/model/rounds |
+| `/teamworks reports [JOB] [worker:W] [n:N] [full] [all]` | Print several child reports (newest first) |
+| `/teamworks report JOB:worker` | Print one child's report |
 | `/save` | Persist the current session now (flushes the async writer) |
 | `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
 | `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
@@ -306,7 +317,8 @@ toward usage.
 
 ## Tools
 
-Seven tools are registered, with schemas emitted for the active API style
+Eight tools are registered — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find` and `tw` — with
+schemas emitted for the active API style
 (`{"type":"function","function":{…}}` for OpenAI, `{"name":…,"input_schema":…}` for Anthropic, and
 `{"type":"function","name":…,"parameters":…}` for the Responses API).
 
@@ -315,10 +327,11 @@ Seven tools are registered, with schemas emitted for the active API style
 | `ls` | Allow | `path`, `page`, `page_size` (≤500) | One level, non-recursive; directories first, then case-insensitive name order; each entry is printed as `[dir ] NAME` or `[file] NAME  N bytes`, and the header reports `total`, the page window and the path |
 | `read` | Allow | `path` (required), `offset` (0-based lines), `limit` | Whole-file mode is capped at 128M characters and streamed; range mode stops reading as soon as the last requested line is consumed; every returned line is prefixed with a right-aligned 6-column line number (`{:>6}: content`); records the returned line range for the read-before-edit rule |
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
-| `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op |
-| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines, file extension filtering, and count-only mode; 8M-line scan budget; nested/alternation-quantifier regexes and patterns over 200 chars are rejected |
+| `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op; a `search` that ends with a newline the file does not have is retried without it (and the replacement drops its own trailing newline) |
+| `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; follows a symlink only when it resolves inside the walk root; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines (overlapping context is printed once), file extension filtering, and count-only mode; 8M-line scan budget; exponential-backtracking shapes (`(a+)+`, `(a|b){3}`, `a{2}{3}`) and patterns over 200 chars are rejected |
 | `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
-| `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata. When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Combine with metadata filters to narrow results. Returns `path  size bytes  mtime (UTC)` per match |
+| `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata (a symlink is followed only when it resolves inside `path`; `name` is case-insensitive on Windows; a future `mtime` is never "recent"). When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Returns `path  size bytes  mtime (UTC)` per match |
+| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs — see [Teamwork](#teamwork) |
 
 The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
 `larger_than_bytes` metadata filters.
@@ -327,7 +340,8 @@ The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `nam
 (`ls`/`read`/`rg`/`find`) are dispatched **concurrently** on the shared worker pool; `write`
 and `edit` are deliberately deferred to a second, **sequential** pass so that same-message reads
 always complete first (read-before-edit) and two edits of one file never race; `exec` runs
-sequentially after an interactive confirmation. Results are appended to the transcript in the
+sequentially after an interactive confirmation, and `tw` (Teamwork) also runs in that sequential
+pass because it blocks on child agents. Results are appended to the transcript in the
 original `tool_call` order.
 
 **Read-before-edit rule.** Paths are canonicalized (`weakly_canonical`, lowercased on Windows) and
@@ -337,6 +351,99 @@ previously read range, and the log is cleared whenever the visible context chang
 
 **File cache.** `edit` reads through a `(size, mtime)`-validated cache keyed by canonical path, so
 consecutive edits of one file skip the disk while an external writer is always picked up.
+
+## Teamwork
+
+Teamwork runs **supervised child agents**. The main agent creates a *job* holding a list of child
+tasks, runs them serially or in parallel, and gets back a consolidated report. Every child gets an
+independent message history; children are restricted to read-only tools in a parallel job and can
+never call `tw` themselves, so the hierarchy stays a tree of depth 1.
+
+Jobs live with the session: `<root>/sessions/<cwd-key>/<session-id>-teamworks.json`, with one
+`<job-id>/<worker>.json` transcript per child. The store is kept in memory and mirrored to disk
+through the async writer, so listing/querying jobs costs no disk I/O.
+
+### Shapes
+
+```jsonc
+// tw operation:"new"
+{ "work-type": "serial",                  // serial | parallel (parallel = read-only children)
+  "provider": "zai",                      // optional job-level defaults, inherited by every child
+  "model": "glm-5.3-flash",
+  "list": [
+    { "works": "audit the net layer", "provider": "claude", "model": "claude-sonnet-4",
+      "think": "high",                    // off|low|med|high|max or 0..4
+      "background": "prolegomena",        // inject the main conversation as background context
+      "name": "net-audit" },
+    { "works": "then write regression tests", "reuse": "tw-1788623888-0/net-audit" }
+  ] }
+```
+
+| Field (per child) | Meaning |
+| --- | --- |
+| `works` | task text — required unless `reuse` is given |
+| `background` | `none` (default) or `prolegomena` (inject the main conversation as context) |
+| `provider` / `model` | run **this child** on a specific provider/model |
+| `think` | chain-of-thought level for this child |
+| `reuse` | `tw-ID/worker_N` — inherit a previously executed child (task config, and by default its transcript) |
+| `reuse_context` | `true` (default): replay the earlier conversation; `false`: config only |
+| `name` | explicit child name (sanitized for use as a file name) |
+
+Model resolution order for a child: its own field → the reused child's field → the job default → the
+reused job's default → the active provider/model. A `provider` that does not exist is an error, never
+a silent fallback. Each child builds its own LLM client and reuses it across all its rounds, so
+parallel children never share a curl handle.
+
+### `tw` operations
+
+| Operation | Arguments | Result |
+| --- | --- | --- |
+| `new` | `work-type`, `list`, optional `provider`/`model`/`think` | creates a job and prints it |
+| `run` | `id` (+ optional config override) | runs the job, returns the consolidated report |
+| `edit` | `id` + new `work-type`/`list` | replaces the config of an uncompleted job |
+| `remove` | `id` | deletes a job (agents may not delete completed jobs) |
+| `reuse` | `from:"tw-ID/worker_N"`, optional `works`/`provider`/`model`/`think`/`name` | creates a new job seeded from a past child |
+| `list` | `all` | lists jobs of this session (or of every session in this working directory) |
+| `history` | `id`, `worker`, `limit`, `all` | lists past child tasks: status, provider, model, rounds, tool calls, created |
+| `report` | `id` + `worker` | prints one child's report |
+| `reports` | `id`, `worker`, `limit`, `full`, `all` | prints many child reports, newest first |
+
+`run` is the only `tw` operation that needs confirmation (`/autoallow` can waive it); the read-only
+queries are auto-approved.
+
+### Reports
+
+A finished job records per-child `{status, summary, rounds, tool_calls, provider, model, reused}` in
+`summary_reports`. When a report is missing — for instance a child interrupted mid-run — `tw
+operation:"report"` falls back to the child's persisted transcript and returns its last assistant
+text, so results stay recoverable.
+
+### From the REPL
+
+```
+/teamworks                                        list jobs of this session
+/teamworks all                                    list jobs of every session in this directory
+/teamworks new                                    create an empty job (append children next)
+/teamworks id:ID works:... [bg:none|prolegomena] [provider:P] [model:M] [think:L]
+                                   [reuse:JOB/worker] [name:NAME]
+/teamworks run ID                                 run a job and print its report
+/teamworks max [N]                                show / set the child limit (1..100)
+/teamworks rm ID | /teamworks rm ID:worker_N      delete a job / one child
+/teamworks history [JOB] [worker:W] [n:N] [all]   past child tasks
+/teamworks reports [JOB] [worker:W] [n:N] [full] [all]
+/teamworks report JOB:worker                      one child's report
+```
+
+### Scheduling and failure handling
+
+- **serial** jobs run children one after another on the calling thread; **parallel** jobs are
+  dispatched through the shared worker pool, so concurrency is bounded by `thread_pool_size`
+  (default 16) instead of spawning one thread per child.
+- A child that throws is captured and reported as `failed`; a job never gets stuck in `running`.
+  Jobs also carry `ok / incomplete / failed` per child, where `incomplete` means the child hit the
+  8-round limit without producing a final answer.
+- Child runs count toward usage statistics with their real token counts, keyed
+  `<job-id>-<child-name>`.
 
 ## Security model
 
@@ -436,7 +543,7 @@ never appears in the vault file — the self-test asserts this.
 
 ## Sessions and the working-directory model
 
-- Each session id is `<cwd-key>-<unix-seconds>`; the cwd key is the first 16 hex characters of the
+- Each session id is `<cwd-key>-<unix-millis>-<8 random hex>`; the cwd key is the first 16 hex characters of the
   SHA-256 of the normalized absolute working directory (lowercased on Windows).
 - Files live at `.cell/sessions/<cwd-key>/<id>.json` and record `id`, `cwd` and the full message
   array. `.cell/sessions/sessions.json` is the hash → path index that lets every group be resolved
@@ -451,7 +558,9 @@ never appears in the vault file — the self-test asserts this.
 - Legacy flat `.cell/sessions/<id>.json` files are migrated once at startup into the current cwd
   group with a rewritten id and `cwd` field.
 - Session, config and index writes go through `cell::async_io::file_writer` (coalesced per path, one
-  background thread). Commands that read those files back (`/save`, `/sessions`, `/session`,
+  background thread). Every write is an **atomic replace**: the content is written to a sibling
+  `<name>.tmp`, flushed to the storage device, then renamed over the target, so a crash can never
+  leave a truncated file that the next start silently reads as empty. Commands that read those files back (`/save`, `/sessions`, `/session`,
   `/compact`, exit) call `flush()` first as a durability barrier; the signal handler and the RAII
   exit guard do the same.
 
@@ -494,6 +603,7 @@ never appears in the vault file — the self-test asserts this.
 | `autoallow` | `false` | LLM decides whether exec commands run (only effective in full-access) |
 | `compact_auto` | `true` | Automatically compact the context after long tool-heavy turns (`/compact auto`) |
 | `compact_provider` / `compact_model` | *(empty)* | Provider/model used for compaction summaries; empty means inherit the session model (`/compact model provider:model`, reset with `inherit`) |
+| `teamwork_max_children` | `5` (clamped 1–100) | Maximum number of child agents per Teamwork job (`/teamworks max`) |
 | `system` | short assistant prompt | System prompt |
 | `log_max_lines` | `1000` (min 10) | `logs/cell.log` is trimmed to its tail on every startup |
 | `thread_pool_size` | `16` (clamped 1–16) | Max concurrent read-only tool workers; the pool spawns lazily and idles with zero workers |
@@ -556,6 +666,8 @@ cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResp
 cell::chat       session (per-cwd persistence) and history (in-memory session map)
 cell::skills     front-matter parser, recursive scanner, metadata prompt
 cell::stats      usage counters in .cell/usages.json
+cell::teamwork   Teamwork job store (cached in memory), child-agent scheduler (serial / pooled
+                 parallel), reuse + history/report queries
 ```
 
 ## The agent loop
@@ -587,8 +699,11 @@ once and retried immediately instead of burning a retry attempt (see
   `~N tok` counter is refreshed on line boundaries.
 - **Esc** during a stream cancels it: the partial reply is kept in the transcript and `[cancelled]`
   is printed. (Implemented by `cell::plat::peek_key`, which temporarily puts stdin in raw mode.)
-- **Ctrl+C** (and `SIGABRT`/`SIGFPE`/`SIGILL`/`SIGSEGV`) runs the persistence hook — save session,
-  save config, flush async writes — restores the terminal and exits with the signal number.
+- **Ctrl+C** (and `SIGTERM`/`SIGHUP`/`SIGABRT` on Windows) runs the persistence hook — repair the tool
+  transcript, save session, save config, flush async writes — restores the terminal and exits with the
+  signal number. The terminating signals are taken from a dedicated `sigwait` thread, so the
+  persistence code never runs inside an asynchronous signal handler. `SIGSEGV`/`SIGFPE`/`SIGILL`
+  deliberately do **not** try to serialize state: they restore the default action and terminate.
 - Non-interactive mode (stdin is not a tty) reads all of stdin as one message, requires a configured
   provider, runs the agent loop once and exits.
 
@@ -623,7 +738,9 @@ sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-ac
 punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
 read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
 `rg`/`find`/`ls` semantics and guards, exec timeouts and exit codes, quoted numeric arguments,
-the tool registry and its policies, 16-way concurrent read-only tool calls, incremental SSE parsing
+the tool registry and its policies, 16-way concurrent read-only tool calls, **Teamwork job
+normalization (per-child provider/model/think, reuse references, name sanitizing, limits),
+store round-trips, child append/remove, history and report queries**, incremental SSE parsing
 and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
 semantics, the cwd index, load-time re-sanitization of exec results, skill discovery (including
@@ -634,16 +751,6 @@ directory-style) and usage statistics. Prints `selftest OK` / `selftest FAILED`.
 A few places where the code and its own help text/comments differ, or where behaviour is
 intentionally simpler than it looks:
 
-- `print_usage` and `print_help` still advertise `workspace-write` / `outer-full` sandbox aliases; the
-  values actually implemented are `read-only` / `edit-only` / `full-access` (plus the `readonly` /
-  `edit` / `full` aliases). An unknown value warns and rewrites the stored value to `full-access`.
-  A stale `sandbox_mode` value left by an older build (`"workspace-write"`) also falls back to
-  `full-access` on load with a warning, because `config::load` defaults the field to
-  `"workspace-write"` before parsing.
-- Tool descriptions sent to the model overstate the gate: the `exec` description claims
-  network-egress commands are denied in every mode, and `print_usage` / the `/sandbox` banner repeat
-  that claim, but `check_exec` implements path-only checks — only `..` and sensitive-path substrings
-  are rejected.
 - The sandbox is **path-only**: `box::check_exec` / `box::check` do **not** parse command names,
   decode encoded payloads, or block network egress by binary name — they only reject path traversal
   and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
