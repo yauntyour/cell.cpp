@@ -7407,11 +7407,11 @@ static void print_help()
     cell::sys::println("commands:");
     cell::sys::println("  /provides                   list configured providers");
     cell::sys::println("  /provide NAME               select a provider (persistent across sessions)");
-    cell::sys::println("  /provide add openai:URL [api_style:openai-chat|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]   add a provider");
-    cell::sys::println("  /provide update NAME [base:URL] [api_style:openai-chat|openai-responses|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]   update a provider");
+    cell::sys::println("  /provide add API_STYLE:URL [key:KEY] [proxy:URL] [name:ALIAS]   add a provider (API_STYLE = openai-chat|openai-responses|anthropic, `openai` = openai-chat)");
+    cell::sys::println("  /provide update NAME [base:[API_STYLE:]URL] [key:KEY] [proxy:URL] [name:NEW_NAME]   update a provider (the api style is set together with its base url)");
     cell::sys::println("  /provide rm NAME            delete a provider (removes its stored key too)");
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
-    cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 api_style:openai-responses key:sk-xxx");
+    cell::sys::println("      e.g. /provide add openai-responses:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("  /models                     fetch the model list from the current provider");
     cell::sys::println("  /model NAME [api_style:STYLE]  switch model; optionally pick the API style (openai-chat|openai-responses|anthropic)");
     cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
@@ -10113,21 +10113,24 @@ int main(int argc, char const *argv[])
                     {
                         if (toks.size() < 3)
                         {
-                            cell::sys::error("usage: /provide add openai:URL [api_style:openai-chat|openai-responses] [key:KEY] [proxy:URL] [name:ALIAS]");
+                            cell::sys::error("usage: /provide add API_STYLE:URL [key:KEY] [proxy:URL] [name:ALIAS]   (API_STYLE = openai-chat | openai-responses | anthropic)");
                             continue;
                         }
-                        std::string style, base;
-                        std::string name_arg, new_key, new_proxy, new_api_style;
+                        std::string style, base, prefix_api_style;
+                        std::string name_arg, new_key, new_proxy;
                         size_t ti = 2;
-                        // parse "style:URL" (tolerant spaced form "style: URL" also accepted)
+                        // parse "API_STYLE:URL" (tolerant spaced form "API_STYLE: URL" also accepted);
+                        // the style prefix is the api style of that url
                         std::string t = toks[ti];
                         size_t colon = t.find(':');
                         if (colon != std::string::npos && colon > 0)
                         {
                             std::string s = t.substr(0, colon);
-                            if (s == "openai" || s == "anthropic" || s == "openai-responses")
+                            std::string canonical = cell::config::provider_entry::parse_api_style(s);
+                            if (!canonical.empty())
                             {
                                 style = s;
+                                prefix_api_style = canonical;
                                 if (colon + 1 < t.size())
                                     base = t.substr(colon + 1);
                                 else if (ti + 1 < toks.size())
@@ -10137,7 +10140,7 @@ int main(int argc, char const *argv[])
                         }
                         if (style.empty())
                         {
-                            cell::sys::error("usage: /provide add openai:URL | anthropic:URL | openai-responses:URL (the prefix selects the API style)");
+                            cell::sys::error("usage: /provide add API_STYLE:URL | e.g. openai-chat:https://api.openai.com/v1, anthropic:https://api.anthropic.com (the prefix selects the API style)");
                             continue;
                         }
                         for (; ti < toks.size(); ti++)
@@ -10150,7 +10153,7 @@ int main(int argc, char const *argv[])
                             else if (tt.rfind("name:", 0) == 0)
                                 name_arg = tt.size() > 5 ? tt.substr(5) : (ti + 1 < toks.size() ? toks[++ti] : "");
                             else if (tt.rfind("api_style:", 0) == 0)
-                                new_api_style = tt.size() > 10 ? tt.substr(10) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                                cell::sys::error("api_style is no longer a separate option: put the style in front of the url instead, e.g. openai-responses:{}", base.empty() ? "URL" : base);
                             else
                                 cell::sys::warn("ignoring token: {}", tt);
                         }
@@ -10168,16 +10171,8 @@ int main(int argc, char const *argv[])
                         name = cell::config::unique_name(cfg, name);
                         cell::config::provider_entry ne;
                         ne.name = name;
-                        ne.style = style;
-                        // derive api_style from prefix or explicit parameter
-                        if (!new_api_style.empty())
-                            ne.api_style = new_api_style;
-                        else if (style == "anthropic")
-                            ne.api_style = "anthropic";
-                        else if (style == "openai-responses")
-                            ne.api_style = "openai-responses";
-                        else
-                            ne.api_style = "openai-chat";
+                        // the api style is carried by the url prefix (e.g. anthropic:https://...)
+                        ne.set_api_style(prefix_api_style);
                         ne.base = base;
                         ne.proxy = new_proxy;
                         if (!new_key.empty())
@@ -10215,7 +10210,7 @@ int main(int argc, char const *argv[])
                     {
                         if (toks.size() < 3)
                         {
-                            cell::sys::error("usage: /provide update NAME [base:URL] [style:openai|anthropic|openai-responses] [api_style:openai-chat|openai-responses|anthropic] [key:KEY] [proxy:URL] [name:NEW_NAME]");
+                            cell::sys::error("usage: /provide update NAME [base:[API_STYLE:]URL] [key:KEY] [proxy:URL] [name:NEW_NAME]   (API_STYLE = openai-chat | openai-responses | anthropic)");
                             continue;
                         }
 
@@ -10227,9 +10222,11 @@ int main(int argc, char const *argv[])
                             continue;
                         }
 
-                        std::string new_base, new_key, new_proxy, new_name, new_style, new_api_style;
+                        std::string new_base, new_key, new_proxy, new_name;
+                        std::string base_api_style; // api style carried by the base url prefix
                         bool has_base = false, has_key = false, has_proxy = false;
-                        bool has_name = false, has_style = false, has_api_style = false;
+                        bool has_name = false, has_base_api_style = false;
+                        bool bad_base = false;
                         auto read_value = [&](size_t &ti, size_t prefix_len) -> std::string
                         {
                             std::string v = toks[ti].substr(prefix_len);
@@ -10243,6 +10240,26 @@ int main(int argc, char const *argv[])
                             if (tt.rfind("base:", 0) == 0)
                             {
                                 new_base = read_value(ti, 5);
+                                // the api style is set together with the base url it applies to:
+                                // base:anthropic:https://api.anthropic.com
+                                size_t sep = new_base.find(':');
+                                if (sep != std::string::npos)
+                                {
+                                    std::string head = new_base.substr(0, sep);
+                                    std::string tail = new_base.substr(sep + 1);
+                                    std::string canonical = cell::config::provider_entry::parse_api_style(head);
+                                    if (!canonical.empty())
+                                    {
+                                        base_api_style = canonical;
+                                        has_base_api_style = true;
+                                        new_base = cell::text::trim(tail);
+                                    }
+                                    else if (head.find('/') == std::string::npos && tail.find("://") != std::string::npos)
+                                    {
+                                        cell::sys::error("invalid api_style in base url: {} (use openai-chat, openai-responses, or anthropic)", head);
+                                        bad_base = true;
+                                    }
+                                }
                                 has_base = true;
                             }
                             else if (tt.rfind("key:", 0) == 0)
@@ -10260,45 +10277,28 @@ int main(int argc, char const *argv[])
                                 new_name = read_value(ti, 5);
                                 has_name = true;
                             }
-                            else if (tt.rfind("style:", 0) == 0)
-                            {
-                                new_style = read_value(ti, 6);
-                                has_style = true;
-                            }
                             else if (tt.rfind("api_style:", 0) == 0)
                             {
-                                new_api_style = read_value(ti, 10);
-                                has_api_style = true;
+                                cell::sys::error("api_style is no longer a separate option: set it together with the base url, e.g. base:anthropic:https://api.anthropic.com");
+                                bad_base = true;
                             }
                             else
                                 cell::sys::warn("ignoring token: {}", tt);
                         }
+                        if (bad_base)
+                            continue;
 
                         std::string final_name = has_name ? new_name : target;
                         if (has_name && !final_name.empty() && final_name != target)
                             final_name = cell::config::unique_name(cfg, final_name);
-                        if (has_api_style)
-                        {
-                            std::string canonical = cell::config::provider_entry::parse_api_style(new_api_style);
-                            if (canonical.empty())
-                            {
-                                cell::sys::error("invalid api_style: {} (use openai-chat, openai-responses, or anthropic)", new_api_style);
-                                continue;
-                            }
-                            new_api_style = canonical;
-                        }
-                        if (has_style)
-                        {
-                            cell::lower_ascii(new_style);
-                            if (new_style != "openai" && new_style != "anthropic" && new_style != "openai-responses")
-                            {
-                                cell::sys::error("invalid style: {} (use openai, anthropic, or openai-responses)", new_style);
-                                continue;
-                            }
-                        }
-                        if (!has_base && !has_key && !has_proxy && !has_name && !has_style && !has_api_style)
+                        if (!has_base && !has_key && !has_proxy && !has_name)
                         {
                             cell::sys::error("no provider changes requested: /provide update {} base:URL key:KEY", target);
+                            continue;
+                        }
+                        if (has_base && new_base.empty())
+                        {
+                            cell::sys::error("base url cannot be empty: /provide update {} base:[API_STYLE:]URL", target);
                             continue;
                         }
 
@@ -10307,21 +10307,9 @@ int main(int argc, char const *argv[])
                         std::string old_key_id = p.key_id;
                         if (has_base)
                             p.base = new_base;
-                        if (has_style)
-                        {
-                            p.style = new_style;
-                            if (!has_api_style)
-                            {
-                                if (new_style == "anthropic")
-                                    p.api_style = "anthropic";
-                                else if (new_style == "openai-responses")
-                                    p.api_style = "openai-responses";
-                                else
-                                    p.api_style = "openai-chat";
-                            }
-                        }
-                        if (has_api_style)
-                            p.set_api_style(new_api_style);
+                        // the api style always travels with its base url
+                        if (has_base_api_style)
+                            p.set_api_style(base_api_style);
                         p.name = final_name;
 
                         std::string key_id = "provider:" + p.name;
