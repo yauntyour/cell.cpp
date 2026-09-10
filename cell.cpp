@@ -6883,6 +6883,357 @@ namespace cell
             return true;
         }
 
+        // -------- /export: transcript → self-contained HTML --------
+        // Everything the renderer emits is entity-escaped, so transcript content
+        // can never inject markup; the only raw HTML is the scaffold produced here.
+
+        // minimal XML/HTML entity escape for element bodies and attribute values
+        // (& first, so the other replacements cannot be re-escaped)
+        static std::string html_escape(std::string_view s)
+        {
+            std::string out;
+            out.reserve(s.size() + s.size() / 8);
+            for (char c : s)
+            {
+                switch (c)
+                {
+                case '&': out += "&amp;"; break;
+                case '<': out += "&lt;"; break;
+                case '>': out += "&gt;"; break;
+                case '"': out += "&quot;"; break;
+                case '\'': out += "&#39;"; break;
+                default: out += c;
+                }
+            }
+            return out;
+        }
+
+        // render transcript text as HTML: ``` fences become <pre> blocks,
+        // everything else is escaped pre-formatted prose — no other markup is
+        // interpreted. An unterminated fence is flushed as a code block.
+        static std::string html_render_text(std::string_view text)
+        {
+            std::string out, prose, code;
+            auto flush_prose = [&]
+            {
+                if (prose.empty())
+                    return;
+                out += "<div class=\"prose\">";
+                out += html_escape(prose);
+                out += "</div>";
+                prose.clear();
+            };
+            auto flush_code = [&]
+            {
+                if (code.empty())
+                    return;
+                out += "<pre class=\"code\">";
+                out += html_escape(code);
+                out += "</pre>";
+                code.clear();
+            };
+            bool in_fence = false;
+            size_t start = 0;
+            while (start <= text.size())
+            {
+                size_t nl = text.find('\n', start);
+                std::string_view line = text.substr(start, nl == std::string_view::npos ? text.size() - start : nl - start);
+                if (line.rfind("```", 0) == 0)
+                {
+                    if (in_fence)
+                    {
+                        flush_code();
+                        in_fence = false;
+                    }
+                    else
+                    {
+                        flush_prose();
+                        in_fence = true;
+                    }
+                }
+                else if (in_fence)
+                {
+                    code.append(line);
+                    code.push_back('\n');
+                }
+                else
+                {
+                    prose.append(line);
+                    prose.push_back('\n');
+                }
+                if (nl == std::string_view::npos)
+                    break;
+                start = nl + 1;
+            }
+            flush_prose();
+            flush_code();
+            return out;
+        }
+
+        // collapse one content block (string, array of blocks, or anything else)
+        // to plain text for display inside a tool result card
+        static std::string block_content_text(const nlohmann::json &content)
+        {
+            if (content.is_string())
+                return content.get<std::string>();
+            if (content.is_array())
+            {
+                std::string out;
+                for (const auto &b : content)
+                {
+                    if (b.is_string())
+                        out += b.get<std::string>();
+                    else if (b.is_object() && b.value("type", "") == "text" &&
+                             b.contains("text") && b["text"].is_string())
+                        out += b["text"].get<std::string>();
+                    else if (!b.is_null())
+                        out += b.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                    out.push_back('\n');
+                }
+                return out;
+            }
+            if (!content.is_null())
+                return content.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+            return "";
+        }
+
+        // split a wrapped tool result into attributes and body. The wrapper is
+        // produced by box::wrap_tool_output ("<tool_output tool=\"n\" path=\"p\">"
+        // "\nbody\n</tool_output>"); input that does not match the wrapper comes
+        // back unchanged as the body with empty attributes.
+        static void split_tool_output(const std::string &content, std::string &tool,
+                                      std::string &path, std::string &body)
+        {
+            tool.clear();
+            path.clear();
+            body = content;
+            if (content.rfind("<tool_output", 0) != 0)
+                return;
+            size_t tag_end = content.find('>');
+            if (tag_end == std::string::npos)
+                return;
+            size_t close = content.rfind("</tool_output>");
+            if (close == std::string::npos || close < tag_end)
+                return;
+            std::string attrs = content.substr(0, tag_end);
+            auto attr_value = [&](std::string_view key) -> std::string
+            {
+                std::string pat(key);
+                pat += "=\"";
+                size_t p = attrs.find(pat);
+                if (p == std::string::npos)
+                    return "";
+                size_t vs = p + pat.size();
+                size_t ve = attrs.find('"', vs);
+                return ve == std::string::npos ? "" : attrs.substr(vs, ve - vs);
+            };
+            tool = attr_value("tool");
+            path = attr_value("path");
+            body = content.substr(tag_end + 1, close - (tag_end + 1));
+            // the wrapper writes one newline right after the tag and before the close
+            if (body.rfind("\n", 0) == 0)
+                body.erase(0, 1);
+            if (!body.empty() && body.back() == '\n')
+                body.pop_back();
+        }
+
+        // one collapsed card for a tool result; the summary carries the tool
+        // name / path marker so the flow stays readable with everything folded
+        static std::string tool_result_card(const std::string &tool, const std::string &path,
+                                            const std::string &body, const std::string &call_id)
+        {
+            std::string summary = "tool result";
+            if (!tool.empty())
+                summary += ": " + tool;
+            if (!path.empty())
+                summary += " | " + path;
+            if (!call_id.empty())
+                summary += " [" + call_id + "]";
+            std::string out = "<details class=\"toolresult\"><summary>";
+            out += html_escape(summary);
+            out += "</summary><pre class=\"code\">";
+            out += html_escape(body);
+            out += "</pre></details>";
+            return out;
+        }
+
+        // render one transcript message to HTML: assistant tool_calls become
+        // collapsed cards, reasoning/thinking blocks become collapsed thinking
+        // sections, tool results (legacy role:"tool" and Anthropic tool_result
+        // blocks) become collapsed result cards; all content is entity-escaped
+        static std::string message_export_html(const nlohmann::json &m)
+        {
+            std::string role = m.value("role", "");
+            std::string out;
+            if (role == "assistant")
+            {
+                auto tc = m.find("tool_calls");
+                if (tc != m.end() && tc->is_array())
+                    for (const auto &c : *tc)
+                    {
+                        if (!c.is_object())
+                            continue;
+                        const nlohmann::json &fn =
+                            c.contains("function") && c["function"].is_object() ? c["function"] : c;
+                        std::string name = fn.value("name", "");
+                        std::string args;
+                        if (fn.contains("arguments"))
+                        {
+                            if (fn["arguments"].is_string())
+                                args = fn["arguments"].get<std::string>();
+                            else
+                                args = fn["arguments"].dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+                        }
+                        out += "<details class=\"toolcall\"><summary>tool call: ";
+                        out += html_escape(name.empty() ? "?" : name);
+                        out += "</summary><pre class=\"code\">";
+                        out += html_escape(args);
+                        out += "</pre></details>";
+                    }
+            }
+            auto content = m.find("content");
+            if (content == m.end() || content->is_null())
+                return out;
+            if (content->is_string())
+            {
+                if (role == "tool")
+                {
+                    std::string tool, path, body;
+                    split_tool_output(content->get<std::string>(), tool, path, body);
+                    out += tool_result_card(tool, path, body, m.value("tool_call_id", ""));
+                }
+                else
+                    out += html_render_text(content->get<std::string>());
+                return out;
+            }
+            if (!content->is_array())
+                return out;
+            for (const auto &b : *content)
+            {
+                if (b.is_string())
+                {
+                    out += html_render_text(b.get<std::string>());
+                    continue;
+                }
+                if (!b.is_object())
+                    continue;
+                std::string bt = b.value("type", "");
+                if (bt == "text" && b.contains("text") && b["text"].is_string())
+                    out += html_render_text(b["text"].get<std::string>());
+                else if (bt == "reasoning" || bt == "thinking")
+                {
+                    std::string body = b.value(bt, std::string());
+                    if (!body.empty())
+                    {
+                        out += "<details class=\"think\"><summary>thinking</summary><div class=\"prose\">";
+                        out += html_escape(body);
+                        out += "</div></details>";
+                    }
+                }
+                else if (bt == "tool_result")
+                {
+                    std::string tool, path, body;
+                    split_tool_output(block_content_text(b.contains("content") ? b["content"] : nlohmann::json()), tool, path, body);
+                    out += tool_result_card(tool, path, body, b.value("tool_use_id", ""));
+                }
+                else if (bt == "image_url" || bt == "image")
+                    out += "<div class=\"prose\">[image]</div>";
+                else
+                {
+                    out += "<pre class=\"code\">";
+                    out += html_escape(b.dump(2, ' ', false, nlohmann::json::error_handler_t::replace));
+                    out += "</pre>";
+                }
+            }
+            return out;
+        }
+
+        // write the transcript as one self-contained HTML file (no scripts, no
+        // external resources); false + err on refusal or write failure
+        static bool export_transcript_html(const nlohmann::json &messages, const std::string &session_id,
+                                           const std::filesystem::path &target, std::string &err)
+        {
+            if (!messages.is_array() || messages.empty())
+            {
+                err = "nothing to export: the transcript is empty";
+                return false;
+            }
+            std::string body;
+            body.reserve(messages.size() * 512 + 1024);
+            size_t shown = 0;
+            for (const auto &m : messages)
+            {
+                if (!m.is_object())
+                    continue;
+                std::string role = m.value("role", "");
+                body += "<div class=\"msg ";
+                body += role == "user" || role == "assistant" || role == "tool" || role == "system" ? role : "other";
+                body += "\"><div class=\"who\">";
+                body += html_escape(role.empty() ? "(unknown)" : role);
+                body += "</div><div class=\"body\">";
+                std::string inner = message_export_html(m);
+                if (inner.empty())
+                    inner = "<div class=\"prose muted\">(empty)</div>";
+                body += inner;
+                body += "</div></div>";
+                shown++;
+            }
+            std::string stamp = cell::utc_stamp(); // YYYYMMDD-HHMMSS
+            std::string when = stamp.size() == 15
+                                   ? std::format("{}-{}-{} {}:{}:{} UTC", stamp.substr(0, 4), stamp.substr(4, 2),
+                                                 stamp.substr(6, 2), stamp.substr(9, 2), stamp.substr(11, 2), stamp.substr(13, 2))
+                                   : stamp;
+            std::string html;
+            html.reserve(body.size() + 4096);
+            html += "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n";
+            html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
+            html += "<title>cell.cpp transcript - ";
+            html += html_escape(session_id);
+            html += "</title>\n";
+            html += "<style>\n";
+            html += ":root{color-scheme:light}\n";
+            html += "*{box-sizing:border-box}\n";
+            html += "body{margin:0;background:#f6f7f9;color:#1c2733;font:15px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}\n";
+            html += "header{padding:24px 32px 8px}\n";
+            html += "h1{margin:0 0 4px;font-size:20px}\n";
+            html += ".meta{margin:0;color:#5b6b7c;font-size:13px}\n";
+            html += ".meta code{background:#eceff3;border-radius:4px;padding:1px 5px}\n";
+            html += "main{max-width:960px;margin:0 auto;padding:8px 24px 48px}\n";
+            html += ".msg{background:#ffffff;border:1px solid #e3e7ec;border-left:4px solid #c6ccd3;border-radius:8px;padding:10px 16px;margin:14px 0}\n";
+            html += ".msg.user{border-left-color:#3b82c4}\n";
+            html += ".msg.assistant{border-left-color:#3aa655}\n";
+            html += ".msg.tool{border-left-color:#98a1ab;background:#fafbfc}\n";
+            html += ".msg.system{border-left-color:#c9a227;background:#fffdf2}\n";
+            html += ".who{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#687585}\n";
+            html += ".msg.user .who{color:#2b6ea3}\n";
+            html += ".msg.assistant .who{color:#2c7d43}\n";
+            html += ".body{margin-top:4px}\n";
+            html += ".prose{white-space:pre-wrap;overflow-wrap:anywhere}\n";
+            html += ".muted{color:#8a97a5}\n";
+            html += "pre.code{background:#f0f2f5;border:1px solid #e0e4e9;border-radius:6px;padding:10px 12px;overflow-x:auto;white-space:pre;font:13px/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace;margin:6px 0}\n";
+            html += "details{margin:6px 0}\n";
+            html += "summary{cursor:pointer;font-size:13px;font-weight:600;color:#5b6b7c}\n";
+            html += "details.think summary{color:#7c5cbf}\n";
+            html += "details.think .prose{color:#6b5a95;background:#f7f4fc;border:1px solid #e8e0f5;border-radius:6px;padding:8px 12px}\n";
+            html += "</style>\n";
+            html += "</head>\n<body>\n";
+            html += "<header><h1>cell.cpp chat transcript</h1><p class=\"meta\">session <code>";
+            html += html_escape(session_id);
+            html += "</code> | ";
+            html += std::to_string(shown);
+            html += " message(s) | exported ";
+            html += html_escape(when);
+            html += "</p></header>\n<main>\n";
+            html += body;
+            html += "</main>\n</body>\n</html>\n";
+            if (!plat::write_file_atomic(target, html))
+            {
+                err = std::format("failed to write {}", target.string());
+                return false;
+            }
+            return true;
+        }
+
         class session
         {
         private:
@@ -9337,6 +9688,8 @@ static void print_help()
     cell::sys::println("  /saved [list]               list compaction archives of the current session");
     cell::sys::println("  /saved show NAME            display an archived transcript (written by /compact)");
     cell::sys::println("  /saved rm NAME              delete an archived transcript");
+    cell::sys::println("  /export [PATH]              export the current transcript to a self-contained HTML file (default: cell-export-<UTC>.html in the working directory)");
+    cell::sys::println("  /export saved NAME [PATH]   export one compaction archive to HTML (name resolved like /saved show)");
     cell::sys::println("  /session ID                 switch to a saved session (cwd follows the session's directory)");
     cell::sys::println("  /session rm ID              delete a session (file + usage stats)");
     cell::sys::println("  /usages                     show per-model and per-session usage statistics");
@@ -11087,6 +11440,44 @@ static int run_selftest()
         R.expect(!cell::chat::resolve_saved(hj2.now().directory() / "saved", "msg", hit, serr) && serr.find("ambiguous") != std::string::npos, "resolve_saved rejects ambiguous prefixes");
         std::error_code remec;
         std::filesystem::remove_all(cell::session_dir(sid3), remec);
+    }
+
+    // /export: transcript → self-contained HTML
+    {
+        std::string xerr;
+        nlohmann::json ex_msgs = nlohmann::json::array({
+            {{"role", "system"}, {"content", "be <b>safe</b> & terse"}},
+            {{"role", "user"}, {"content", "write `<script>alert(1)</script>` please"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({
+                             {{"type", "reasoning"}, {"reasoning", "hidden chain"}},
+                             {{"type", "text"}, {"text", "```cpp\nint main() {}\n```\ndone"}},
+                         })},
+             {"tool_calls", nlohmann::json::array({
+                                {{"id", "call_1"}, {"type", "function"}, {"function", {{"name", "ls"}, {"arguments", "{\"path\":\".\"}"}}}},
+                            })}},
+            {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "<tool_output tool=\"exec\" path=\"probe\">\n<h1>injected</h1>\n</tool_output>"}},
+            {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "call_2"}, {"content", "<tool_output tool=\"read\">\nfile body\n</tool_output>"}}})}},
+        });
+        std::filesystem::path out = cell::root / "selftest-export.html";
+        R.expect(cell::chat::export_transcript_html(ex_msgs, "selftest-sid", out, xerr), "HTML export writes the transcript");
+        {
+            std::ifstream f(out);
+            std::string html((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            R.expect(html.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos, "HTML export escapes message content");
+            R.expect(html.find("<script") == std::string::npos, "HTML export contains no raw script tags");
+            R.expect(html.find("<h1>injected</h1>") == std::string::npos && html.find("&lt;h1&gt;injected&lt;/h1&gt;") != std::string::npos, "HTML export escapes tool result bodies");
+            R.expect(html.find("tool result: exec | probe") != std::string::npos, "HTML export renders wrapped tool results with the wrapper attributes");
+            R.expect(html.find("tool result: read") != std::string::npos, "HTML export renders Anthropic-style tool_result blocks");
+            R.expect(html.find("tool call: ls") != std::string::npos, "HTML export renders assistant tool calls");
+            R.expect(html.find("hidden chain") != std::string::npos && html.find("<summary>thinking</summary>") != std::string::npos, "HTML export renders reasoning blocks as collapsed sections");
+            R.expect(html.find("<pre class=\"code\">int main() {}") != std::string::npos, "HTML export renders code fences");
+            R.expect(html.find("be &lt;b&gt;safe&lt;/b&gt; &amp; terse") != std::string::npos, "HTML export escapes system messages");
+        }
+        std::error_code xec;
+        std::filesystem::remove(out, xec);
+        R.expect(!cell::chat::export_transcript_html(nlohmann::json::array(), "sid", out, xerr) && !xerr.empty(), "HTML export refuses an empty transcript");
+        R.expect(!cell::box::exist(out.string()), "HTML export writes nothing on refusal");
     }
 
     R.expect(vault.set("overwrite_key", "v1") && vault.get("overwrite_key") == "v1", "crypt::set new");
@@ -13013,6 +13404,66 @@ int main(int argc, char const *argv[])
                         continue;
                     }
                     cell::sys::error("usage: /saved list | /saved show NAME | /saved rm NAME");
+                    continue;
+                }
+                if (cmd == "/export")
+                {
+                    // write the transcript (or one compaction archive) as a
+                    // self-contained HTML file; the default lands in the cwd
+                    std::filesystem::path out;
+                    nlohmann::json msgs;
+                    std::string what; // label shown in the page header
+                    if (toks.size() >= 2 && toks[1] == "saved")
+                    {
+                        if (toks.size() < 3)
+                        {
+                            cell::sys::error("usage: /export [PATH] | /export saved NAME [PATH]");
+                            continue;
+                        }
+                        std::string err;
+                        std::filesystem::path hit;
+                        if (!cell::chat::resolve_saved(s->directory() / "saved", toks[2], hit, err))
+                        {
+                            cell::sys::error("{}", err);
+                            continue;
+                        }
+                        std::ifstream f(hit);
+                        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                        msgs = cell::chat::parse_messages_jsonl(text);
+                        if (msgs.empty())
+                        {
+                            cell::sys::error("saved archive {} is empty or unreadable", hit.filename().string());
+                            continue;
+                        }
+                        what = hit.stem().string();
+                        if (toks.size() >= 4)
+                            out = toks[3];
+                    }
+                    else
+                    {
+                        msgs = s->msg();
+                        what = s->id();
+                        if (toks.size() >= 2)
+                            out = toks[1];
+                    }
+                    if (out.empty())
+                        out = std::format("cell-export-{}.html", cell::utc_stamp());
+                    else
+                    {
+                        std::string ext = out.extension().string();
+                        for (auto &c : ext)
+                            c = (char)std::tolower((unsigned char)c);
+                        if (ext != ".html" && ext != ".htm")
+                            out += ".html";
+                    }
+                    std::string err;
+                    if (!cell::chat::export_transcript_html(msgs, what, out, err))
+                    {
+                        cell::sys::error("{}", err);
+                        continue;
+                    }
+                    log.info("sess", std::format("exported msgs={} to={}", msgs.size(), out.string()));
+                    cell::sys::println("exported {} message(s) to {}", msgs.size(), out.string());
                     continue;
                 }
                 if (cmd == "/usages")
