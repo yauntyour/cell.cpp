@@ -240,9 +240,12 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation |
 | `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
 | `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
-| `/session rm ID` | Delete a session file and its usage record |
+| `/session rm ID` | Delete a session (folder with transcript, Teamwork data, archives) and its usage record |
+| `/saved [list]` | List the compaction archives of the current session (`saved/msg-<UTC time>.jsonl` in the session folder) |
+| `/saved show NAME` | Display an archived transcript (exact name or unique substring of one) |
+| `/saved rm NAME` | Delete an archived transcript |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
-| `/compact` | Aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
+| `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
 | `/compact auto [on\|off]` | Show or toggle automatic compaction after long agent runs (persisted, default on) |
 | `/compact model provider:model` | Route summarization through a specific registered provider/model; `inherit` resets it to the session model |
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
@@ -359,9 +362,10 @@ tasks, runs them serially or in parallel, and gets back a consolidated report. E
 independent message history; children are restricted to read-only tools in a parallel job and can
 never call `tw` themselves, so the hierarchy stays a tree of depth 1.
 
-Jobs live with the session: `<root>/sessions/<cwd-key>/<session-id>-teamworks.json`, with one
-`<job-id>/<worker>.json` transcript per child. The store is kept in memory and mirrored to disk
-through the async writer, so listing/querying jobs costs no disk I/O.
+Jobs live with the session: `<root>/sessions/<cwd-key>/<session-id>/teamworks.json`, with one
+`<session-id>/<job-id>/<worker>.json` transcript per child. Job ids are UTC wall-clock stamps —
+`tw-YYYYMMDD-HHMMSS` (a `-N` suffix disambiguates same-second collisions). The store is kept in
+memory and mirrored to disk through the async writer, so listing/querying jobs costs no disk I/O.
 
 ### Shapes
 
@@ -545,18 +549,24 @@ never appears in the vault file — the self-test asserts this.
 
 - Each session id is `<cwd-key>-<unix-millis>-<8 random hex>`; the cwd key is the first 16 hex characters of the
   SHA-256 of the normalized absolute working directory (lowercased on Windows).
-- Files live at `.cell/sessions/<cwd-key>/<id>.json` and record `id`, `cwd` and the full message
-  array. `.cell/sessions/sessions.json` is the hash → path index that lets every group be resolved
-  back to a real directory; `/sessions` groups by it and marks the current cwd with `>`.
-- `/session ID` and startup resume logic **follow the session's cwd** (`current_path` + cache
-  invalidation), so tools keep operating on the project the conversation belongs to; `/session`
-  and `/session rm ID` reset the read-before-edit log because recorded reads no longer apply.
-  Switching to an existing session prints its last five user/assistant text messages again, omitting
-  thinking and tool-call content.
-- `/new` keeps the old file (revisitable), `/clear` keeps the id, `/session rm` deletes both the file
-  and its usage record; orphaned usage records are pruned at startup and on `/usages`.
-- Legacy flat `.cell/sessions/<id>.json` files are migrated once at startup into the current cwd
-  group with a rewritten id and `cwd` field.
+- **Each session is a folder**: `.cell/sessions/<cwd-key>/<id>/`. It holds the JSONL transcript
+  `messages.jsonl` (one message object per line — the standard agent log shape), the Teamwork store
+  `teamworks.json` with one `<job-id>/` transcript directory per job, and the compaction archives
+  `saved/msg-<UTC time>.jsonl`. `.cell/sessions/sessions.json` is the hash → path index that lets
+  every group be resolved back to a real directory; `/sessions` groups by it and marks the current
+  cwd with `>`.
+- `/session ID` and startup resume logic **follow the session's cwd** (resolved through the index,
+  `current_path` + cache invalidation), so tools keep operating on the project the conversation
+  belongs to; `/session` and `/session rm ID` reset the read-before-edit log because recorded reads
+  no longer apply. Switching to an existing session prints its last five user/assistant text
+  messages again, omitting thinking and tool-call content.
+- `/new` keeps the old folder (revisitable), `/clear` keeps the id, `/session rm` deletes the whole
+  folder and the usage record; orphaned usage records are pruned at startup and on `/usages`.
+- **Compaction archives**: every `/compact` (manual or automatic) first writes the complete
+  transcript to `saved/msg-<UTC time>.jsonl` inside the session folder (same-second archives get a
+  `-N` suffix) before the context is rewritten; if the archive or the summary cannot be produced
+  the context is left untouched. `/saved list`, `/saved show NAME` and `/saved rm NAME` access the
+  archives of the current session.
 - Session, config and index writes go through `cell::async_io::file_writer` (coalesced per path, one
   background thread). Every write is an **atomic replace**: the content is written to a sibling
   `<name>.tmp`, flushed to the storage device, then renamed over the target, so a crash can never
@@ -632,7 +642,13 @@ where you launch it from.
 └── sessions/
     ├── sessions.json     # cwd hash -> cwd path index
     └── 6333a2b6f7084f1a/ # one directory per working directory
-        └── 6333a2b6f7084f1a-1787819024.json
+        └── 6333a2b6f7084f1a-1787819024-ab12cd34/   # one folder per session
+            ├── messages.jsonl    # transcript: one message object per line
+            ├── teamworks.json    # Teamwork store (jobs of this session)
+            ├── tw-20260910-124236/          # one transcript dir per job
+            │   └── worker_0.json
+            └── saved/
+                └── msg-20260910-124500.jsonl  # full transcript archived by /compact
 ```
 
 Usage records accumulate `requests`, `messages`, `input_chars`, `output_chars`, `input_tokens`,
