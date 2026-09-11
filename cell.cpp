@@ -6892,86 +6892,409 @@ namespace cell
         // Everything the renderer emits is entity-escaped, so transcript content
         // can never inject markup; the only raw HTML is the scaffold produced here.
 
-        // minimal XML/HTML entity escape for element bodies and attribute values
-        // (& first, so the other replacements cannot be re-escaped)
+        // minimal XML/HTML entity escape for element bodies and attribute values;
+        // nullptr means the character is safe to copy verbatim
+        static const char *html_escape_char(char c)
+        {
+            switch (c)
+            {
+            case '&': return "&amp;";
+            case '<': return "&lt;";
+            case '>': return "&gt;";
+            case '"': return "&quot;";
+            case '\'': return "&#39;";
+            default: return nullptr;
+            }
+        }
+
+        // escape a whole string (& handled by html_escape_char, so the other
+        // replacements can never be re-escaped)
         static std::string html_escape(std::string_view s)
         {
             std::string out;
             out.reserve(s.size() + s.size() / 8);
             for (char c : s)
+                if (const char *e = html_escape_char(c))
+                    out += e;
+                else
+                    out += c;
+            return out;
+        }
+
+        // leading/trailing blanks of one line, without copying
+        static std::string_view trim_view(std::string_view s)
+        {
+            size_t b = 0, e = s.size();
+            while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
+                b++;
+            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
+                e--;
+            return s.substr(b, e - b);
+        }
+
+        // only http(s) / mailto links are turned into anchors
+        static bool html_link_ok(std::string_view url)
+        {
+            return url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0 || url.rfind("mailto:", 0) == 0;
+        }
+
+        // inline markdown subset for one line of transcript prose: `code`,
+        // **bold**, *italic*, ~~strikethrough~~, [text](url). Every byte copied
+        // out is escaped, so nothing from the transcript can become markup.
+        static std::string html_inline(std::string_view s)
+        {
+            std::string out;
+            out.reserve(s.size() + s.size() / 8);
+            size_t i = 0;
+            while (i < s.size())
             {
-                switch (c)
+                char c = s[i];
+                if (c == '`')
                 {
-                case '&': out += "&amp;"; break;
-                case '<': out += "&lt;"; break;
-                case '>': out += "&gt;"; break;
-                case '"': out += "&quot;"; break;
-                case '\'': out += "&#39;"; break;
-                default: out += c;
+                    size_t close = s.find('`', i + 1);
+                    if (close != std::string_view::npos && close > i + 1)
+                    {
+                        out += "<code class=\"ic\">";
+                        out += html_escape(s.substr(i + 1, close - i - 1));
+                        out += "</code>";
+                        i = close + 1;
+                        continue;
+                    }
                 }
+                else if (c == '*' && s.substr(i).rfind("**", 0) == 0)
+                {
+                    size_t close = s.find("**", i + 2);
+                    if (close != std::string_view::npos && close > i + 2)
+                    {
+                        out += "<strong>";
+                        out += html_inline(s.substr(i + 2, close - i - 2));
+                        out += "</strong>";
+                        i = close + 2;
+                        continue;
+                    }
+                }
+                else if (c == '~' && s.substr(i).rfind("~~", 0) == 0)
+                {
+                    size_t close = s.find("~~", i + 2);
+                    if (close != std::string_view::npos && close > i + 2)
+                    {
+                        out += "<del>";
+                        out += html_inline(s.substr(i + 2, close - i - 2));
+                        out += "</del>";
+                        i = close + 2;
+                        continue;
+                    }
+                }
+                else if (c == '*' && i + 1 < s.size() && s[i + 1] != ' ' && s[i + 1] != '\t')
+                {
+                    size_t close = s.find('*', i + 1);
+                    if (close != std::string_view::npos && close > i + 1 && s[close - 1] != ' ' && s[close - 1] != '\t')
+                    {
+                        out += "<em>";
+                        out += html_inline(s.substr(i + 1, close - i - 1));
+                        out += "</em>";
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                else if (c == '[')
+                {
+                    size_t rb = s.find(']', i + 1);
+                    if (rb != std::string_view::npos && rb + 1 < s.size() && s[rb + 1] == '(')
+                    {
+                        size_t rp = s.find(')', rb + 2);
+                        if (rp != std::string_view::npos)
+                        {
+                            std::string url = text::trim(s.substr(rb + 2, rp - rb - 2));
+                            if (html_link_ok(url) && url.find_first_of(" \t\"'<>") == std::string::npos)
+                            {
+                                out += "<a class=\"lnk\" href=\"";
+                                out += html_escape(url);
+                                out += "\" target=\"_blank\" rel=\"noopener noreferrer\">";
+                                out += html_inline(s.substr(i + 1, rb - i - 1));
+                                out += "</a>";
+                                i = rp + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if (const char *e = html_escape_char(c))
+                    out += e;
+                else
+                    out += c;
+                ++i;
             }
             return out;
         }
 
-        // render transcript text as HTML: ``` fences become <pre> blocks,
-        // everything else is escaped pre-formatted prose — no other markup is
-        // interpreted. An unterminated fence is flushed as a code block.
+        // one fenced code block: an optional quiet language label above the body
+        static std::string code_block_html(std::string_view lang, std::string_view code)
+        {
+            std::string out = "<div class=\"codeblock\">";
+            if (!lang.empty())
+            {
+                out += "<span class=\"lang\">";
+                out += html_escape(lang);
+                out += "</span>";
+            }
+            out += "<pre class=\"code\">";
+            out += html_escape(code);
+            out += "</pre></div>";
+            return out;
+        }
+
+        // a markdown table separator row: only blanks, pipes, colons and dashes,
+        // with at least one dash
+        static bool table_separator(std::string_view s)
+        {
+            bool dash = false;
+            for (char c : s)
+            {
+                if (c == '-')
+                    dash = true;
+                else if (c != '|' && c != ':' && c != ' ' && c != '\t')
+                    return false;
+            }
+            return dash;
+        }
+
+        // "| a | b |" → {"a", "b"} (outer pipes and padding removed)
+        static std::vector<std::string> table_cells(std::string_view row)
+        {
+            row = trim_view(row);
+            if (!row.empty() && row.front() == '|')
+                row.remove_prefix(1);
+            if (!row.empty() && row.back() == '|')
+                row.remove_suffix(1);
+            std::vector<std::string> cells;
+            for (size_t start = 0;;)
+            {
+                size_t bar = row.find('|', start);
+                std::string_view cell = bar == std::string_view::npos ? row.substr(start) : row.substr(start, bar - start);
+                cells.emplace_back(trim_view(cell));
+                if (bar == std::string_view::npos)
+                    break;
+                start = bar + 1;
+            }
+            return cells;
+        }
+
+        // rows[first] is the header, rows[first + 1] the separator, rows after
+        // that the body; columns are padded to the header width
+        static std::string table_html(const std::vector<std::string_view> &rows, size_t first, size_t last)
+        {
+            std::vector<std::string> head = table_cells(rows[first]);
+            std::string out = "<div class=\"tabwrap\"><table class=\"md-tab\"><thead><tr>";
+            for (const auto &h : head)
+            {
+                out += "<th>";
+                out += html_inline(h);
+                out += "</th>";
+            }
+            out += "</tr></thead><tbody>";
+            for (size_t r = first + 2; r <= last; ++r)
+            {
+                std::vector<std::string> cells = table_cells(rows[r]);
+                out += "<tr>";
+                for (size_t c = 0; c < head.size(); ++c)
+                {
+                    out += "<td>";
+                    if (c < cells.size())
+                        out += html_inline(cells[c]);
+                    out += "</td>";
+                }
+                out += "</tr>";
+            }
+            out += "</tbody></table></div>";
+            return out;
+        }
+
+        // transcript text → HTML blocks: ``` fences become code blocks (the info
+        // string becomes the language label), "#" headings / lists / quotes /
+        // rules / pipe tables become real elements, and consecutive plain lines
+        // stay one pre-wrapped paragraph. Everything taken from the transcript is
+        // escaped in html_inline; an unterminated fence is flushed as a code block.
         static std::string html_render_text(std::string_view text)
         {
-            std::string out, prose, code;
-            auto flush_prose = [&]
+            std::vector<std::string_view> lines;
+            for (size_t start = 0; start <= text.size();)
             {
-                if (prose.empty())
+                size_t nl = text.find('\n', start);
+                size_t end = nl == std::string_view::npos ? text.size() : nl;
+                std::string_view line = text.substr(start, end - start);
+                if (!line.empty() && line.back() == '\r')
+                    line.remove_suffix(1);
+                lines.push_back(line);
+                if (nl == std::string_view::npos)
+                    break;
+                start = nl + 1;
+            }
+
+            std::string out;
+            out.reserve(text.size() + text.size() / 4);
+            std::string para, quote, code, lang, list;
+            bool in_fence = false;
+
+            auto flush_para = [&]
+            {
+                while (!para.empty() && para.back() == '\n')
+                    para.pop_back();
+                if (para.empty())
                     return;
-                out += "<div class=\"prose\">";
-                out += html_escape(prose);
-                out += "</div>";
-                prose.clear();
+                out += "<p class=\"p\">";
+                out += para;
+                out += "</p>";
+                para.clear();
+            };
+            auto flush_quote = [&]
+            {
+                while (!quote.empty() && quote.back() == '\n')
+                    quote.pop_back();
+                if (quote.empty())
+                    return;
+                out += "<blockquote class=\"md-q\">";
+                out += quote;
+                out += "</blockquote>";
+                quote.clear();
+            };
+            auto close_list = [&]
+            {
+                if (list.empty())
+                    return;
+                out += "</";
+                out += list;
+                out += ">";
+                list.clear();
             };
             auto flush_code = [&]
             {
-                if (code.empty())
-                    return;
-                out += "<pre class=\"code\">";
-                out += html_escape(code);
-                out += "</pre>";
+                while (!code.empty() && (code.back() == '\n' || code.back() == '\r'))
+                    code.pop_back();
+                out += code_block_html(lang, code);
                 code.clear();
+                lang.clear();
             };
-            bool in_fence = false;
-            size_t start = 0;
-            while (start <= text.size())
+
+            for (size_t i = 0; i < lines.size(); ++i)
             {
-                size_t nl = text.find('\n', start);
-                std::string_view line = text.substr(start, nl == std::string_view::npos ? text.size() - start : nl - start);
-                if (line.rfind("```", 0) == 0)
+                std::string_view line = trim_view(lines[i]);
+                if (in_fence)
                 {
-                    if (in_fence)
+                    if (line.rfind("```", 0) == 0)
                     {
                         flush_code();
                         in_fence = false;
                     }
                     else
                     {
-                        flush_prose();
-                        in_fence = true;
+                        code.append(lines[i]);
+                        code.push_back('\n');
                     }
+                    continue;
                 }
-                else if (in_fence)
+                if (line.rfind("```", 0) == 0)
                 {
-                    code.append(line);
-                    code.push_back('\n');
+                    flush_para();
+                    flush_quote();
+                    close_list();
+                    lang = std::string(trim_view(line.substr(3)));
+                    in_fence = true;
+                    continue;
                 }
-                else
+                if (line.empty())
                 {
-                    prose.append(line);
-                    prose.push_back('\n');
+                    flush_para();
+                    flush_quote();
+                    close_list();
+                    continue;
                 }
-                if (nl == std::string_view::npos)
-                    break;
-                start = nl + 1;
+                // pipe table (checked before the other block rules, so "|" text
+                // cannot be mistaken for prose): header + separator, then rows
+                std::string_view next = i + 1 < lines.size() ? trim_view(lines[i + 1]) : std::string_view();
+                if (line.front() == '|' && !next.empty() && next.front() == '|' && table_separator(next))
+                {
+                    size_t last = i + 1;
+                    while (last + 1 < lines.size())
+                    {
+                        std::string_view row = trim_view(lines[last + 1]);
+                        if (row.empty() || row.front() != '|')
+                            break;
+                        ++last;
+                    }
+                    flush_para();
+                    flush_quote();
+                    close_list();
+                    out += table_html(lines, i, last);
+                    i = last;
+                    continue;
+                }
+                // horizontal rule / heading
+                if (line.size() >= 3 && (line.find_first_not_of('-') == std::string_view::npos ||
+                                         line.find_first_not_of('*') == std::string_view::npos ||
+                                         line.find_first_not_of('_') == std::string_view::npos))
+                {
+                    flush_para();
+                    flush_quote();
+                    close_list();
+                    out += "<hr class=\"md-hr\">";
+                    continue;
+                }
+                size_t hashes = 0;
+                while (hashes < line.size() && line[hashes] == '#')
+                    ++hashes;
+                if (hashes >= 1 && hashes <= 6 && hashes < line.size() && (line[hashes] == ' ' || line[hashes] == '\t'))
+                {
+                    flush_para();
+                    flush_quote();
+                    close_list();
+                    std::string tag = "h" + std::to_string(std::min<size_t>(hashes + 1, 6));
+                    out += "<" + tag + " class=\"md-h\">";
+                    out += html_inline(trim_view(line.substr(hashes)));
+                    out += "</" + tag + ">";
+                    continue;
+                }
+                if (line.front() == '>')
+                {
+                    flush_para();
+                    close_list();
+                    quote += html_inline(trim_view(line.substr(1)));
+                    quote.push_back('\n');
+                    continue;
+                }
+                bool bullet = line.size() >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') &&
+                              (line[1] == ' ' || line[1] == '\t');
+                size_t digits = 0;
+                while (digits < line.size() && line[digits] >= '0' && line[digits] <= '9')
+                    ++digits;
+                bool numbered = digits > 0 && digits + 1 < line.size() && (line[digits] == '.' || line[digits] == ')') &&
+                                (line[digits + 1] == ' ' || line[digits + 1] == '\t');
+                if (bullet || numbered)
+                {
+                    flush_para();
+                    flush_quote();
+                    std::string want = bullet ? "ul" : "ol";
+                    if (list != want)
+                    {
+                        close_list();
+                        out += "<" + want + " class=\"md-list\">";
+                        list = want;
+                    }
+                    out += "<li>";
+                    out += html_inline(trim_view(line.substr(bullet ? 1 : digits + 1)));
+                    out += "</li>";
+                    continue;
+                }
+                flush_quote();
+                close_list();
+                para += html_inline(line);
+                para.push_back('\n');
             }
-            flush_prose();
-            flush_code();
+            flush_para();
+            flush_quote();
+            close_list();
+            if (in_fence)
+                flush_code();
             return out;
         }
 
@@ -7065,11 +7388,12 @@ namespace cell
         // render one transcript message to HTML: assistant tool_calls become
         // collapsed cards, reasoning/thinking blocks become collapsed thinking
         // sections, tool results (legacy role:"tool" and Anthropic tool_result
-        // blocks) become collapsed result cards; all content is entity-escaped
+        // blocks) become collapsed result cards; all content is entity-escaped.
+        // Message content is emitted first, the tool calls it produced after it.
         static std::string message_export_html(const nlohmann::json &m)
         {
             std::string role = m.value("role", "");
-            std::string out;
+            std::string calls;
             if (role == "assistant")
             {
                 auto tc = m.find("tool_calls");
@@ -7089,16 +7413,17 @@ namespace cell
                             else
                                 args = fn["arguments"].dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
                         }
-                        out += "<details class=\"toolcall\"><summary>tool call: ";
-                        out += html_escape(name.empty() ? "?" : name);
-                        out += "</summary><pre class=\"code\">";
-                        out += html_escape(args);
-                        out += "</pre></details>";
+                        calls += "<details class=\"toolcall\"><summary>tool call: ";
+                        calls += html_escape(name.empty() ? "?" : name);
+                        calls += "</summary><pre class=\"code\">";
+                        calls += html_escape(args);
+                        calls += "</pre></details>";
                     }
             }
+            std::string out;
             auto content = m.find("content");
             if (content == m.end() || content->is_null())
-                return out;
+                return calls;
             if (content->is_string())
             {
                 if (role == "tool")
@@ -7109,10 +7434,10 @@ namespace cell
                 }
                 else
                     out += html_render_text(content->get<std::string>());
-                return out;
+                return out + calls;
             }
             if (!content->is_array())
-                return out;
+                return out + calls;
             for (const auto &b : *content)
             {
                 if (b.is_string())
@@ -7150,7 +7475,7 @@ namespace cell
                     out += "</pre>";
                 }
             }
-            return out;
+            return out + calls;
         }
 
         // write the transcript as one self-contained HTML file (no scripts, no
@@ -7164,23 +7489,26 @@ namespace cell
                 return false;
             }
             std::string body;
-            body.reserve(messages.size() * 512 + 1024);
+            body.reserve(messages.size() * 640 + 2048);
             size_t shown = 0;
             for (const auto &m : messages)
             {
                 if (!m.is_object())
                     continue;
                 std::string role = m.value("role", "");
-                body += "<div class=\"msg ";
-                body += role == "user" || role == "assistant" || role == "tool" || role == "system" ? role : "other";
-                body += "\"><div class=\"who\">";
+                std::string kind = role == "user" || role == "assistant" || role == "tool" || role == "system" ? role : "other";
+                body += "<article class=\"msg ";
+                body += kind;
+                body += "\"><div class=\"head\"><span class=\"dot ";
+                body += kind;
+                body += "\" aria-hidden=\"true\"></span><span class=\"role\">";
                 body += html_escape(role.empty() ? "(unknown)" : role);
-                body += "</div><div class=\"body\">";
+                body += "</span></div><div class=\"body\">";
                 std::string inner = message_export_html(m);
                 if (inner.empty())
-                    inner = "<div class=\"prose muted\">(empty)</div>";
+                    inner = "<p class=\"p muted\">(empty)</p>";
                 body += inner;
-                body += "</div></div>";
+                body += "</div></article>";
                 shown++;
             }
             std::string stamp = cell::utc_stamp(); // YYYYMMDD-HHMMSS
@@ -7188,49 +7516,122 @@ namespace cell
                                    ? std::format("{}-{}-{} {}:{}:{} UTC", stamp.substr(0, 4), stamp.substr(4, 2),
                                                  stamp.substr(6, 2), stamp.substr(9, 2), stamp.substr(11, 2), stamp.substr(13, 2))
                                    : stamp;
+            // one self-contained stylesheet: plain, light/dark aware, no external
+            // fonts or scripts. The layout is deliberately minimal — whitespace and
+            // hairline rules instead of cards, one small role dot per message.
+            static constexpr std::string_view css = R"CSS(
+:root{color-scheme:light dark;
+--bg:#ffffff;--fg:#1f2328;--fg-dim:#5c6570;--fg-faint:#8b939c;
+--line:#e7e9ec;--line-soft:#f1f2f4;--code-bg:#f6f7f8;
+--user:#3b82f6;--assistant:#10a37f;--tool:#7c6cf0;--system:#c9871f;--other:#a8b0b9;
+--link:#1a6ee5;
+--mono:ui-monospace,"Cascadia Mono","JetBrains Mono",SFMono-Regular,Consolas,"Liberation Mono",monospace}
+@media (prefers-color-scheme:dark){:root{
+--bg:#0f1115;--fg:#e7e9ec;--fg-dim:#a2a9b4;--fg-faint:#767e88;
+--line:#23262c;--line-soft:#1c1f24;--code-bg:#16181d;
+--user:#6aa8f5;--assistant:#3ecfa4;--tool:#a795fb;--system:#e0b062;--other:#767e88;
+--link:#79b0f7}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.75 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+-webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%}
+code,pre,summary,.role,.lang{font-family:var(--mono)}
+a.lnk{color:var(--link);text-decoration:none}
+a.lnk:hover{text-decoration:underline}
+.hero{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+.hero-in{max-width:720px;margin:0 auto;padding:16px 28px;display:flex;align-items:baseline;
+justify-content:space-between;gap:14px;flex-wrap:wrap}
+.titles{min-width:0}
+h1{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+.sub{margin:3px 0 0;font-size:12px;color:var(--fg-faint);overflow-wrap:anywhere}
+.sub code{font-size:11.5px;color:var(--fg-dim)}
+.meta{display:flex;gap:14px;font-size:11.5px;color:var(--fg-faint);white-space:nowrap}
+.meta b{color:var(--fg-dim);font-weight:600}
+main{max-width:720px;margin:0 auto;padding:32px 28px 8px}
+.msg+.msg{border-top:1px solid var(--line);margin-top:26px;padding-top:26px}
+.msg.tool{margin-top:16px;padding-top:16px}
+.head{display:flex;align-items:center;gap:8px;margin:0 0 10px}
+.dot{width:6px;height:6px;flex:none;border-radius:50%;background:var(--other)}
+.dot.user{background:var(--user)}
+.dot.assistant{background:var(--assistant)}
+.dot.tool{background:var(--tool)}
+.dot.system{background:var(--system)}
+.role{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-faint)}
+.body{min-width:0}
+.p{margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.p:last-child{margin-bottom:0}
+.prose{white-space:pre-wrap;overflow-wrap:anywhere}
+.muted{color:var(--fg-faint)}
+h2.md-h,h3.md-h,h4.md-h,h5.md-h,h6.md-h{margin:22px 0 10px;font-weight:600;line-height:1.4;letter-spacing:-.01em}
+h2.md-h{font-size:17px}
+h3.md-h{font-size:15.5px}
+h4.md-h{font-size:15px}
+h5.md-h,h6.md-h{font-size:13px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.05em}
+.md-hr{border:0;border-top:1px solid var(--line);margin:22px 0}
+.md-q{margin:0 0 14px;padding-left:14px;border-left:2px solid var(--line);color:var(--fg-dim)}
+.md-q:last-child{margin-bottom:0}
+.md-list{margin:0 0 12px;padding-left:20px}
+.md-list li{margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.md-list li::marker{color:var(--fg-faint)}
+code.ic{font-size:.88em;background:var(--code-bg);border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}
+.tabwrap{margin:0 0 16px;overflow-x:auto}
+.md-tab{width:100%;border-collapse:collapse;font-size:13.5px}
+.md-tab th,.md-tab td{padding:7px 14px 7px 0;text-align:left;vertical-align:top;
+white-space:pre-wrap;border-bottom:1px solid var(--line-soft)}
+.md-tab thead th{border-bottom:1px solid var(--line);color:var(--fg-dim);font-size:11.5px;
+font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.md-tab tbody tr:last-child td{border-bottom:0}
+.md-tab th:last-child,.md-tab td:last-child{padding-right:0}
+.codeblock{margin:0 0 14px}
+.lang{font-size:11px;letter-spacing:.04em;text-transform:lowercase;color:var(--fg-faint)}
+.codeblock .lang{display:block;margin-bottom:6px}
+pre.code{margin:0;padding:12px 14px;background:var(--code-bg);border-radius:6px;overflow-x:auto;
+white-space:pre;font-size:12.5px;line-height:1.65;color:var(--fg)}
+details{margin:0 0 12px}
+details:last-child{margin-bottom:0}
+summary{display:block;cursor:pointer;list-style:none;padding:2px 0;font-size:12px;color:var(--fg-dim)}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"\25B8";display:inline-block;width:14px;color:var(--fg-faint)}
+details[open]>summary::before{content:"\25BE"}
+summary:hover{color:var(--fg)}
+details[open]>summary{margin-bottom:8px}
+details.think .prose{padding-left:14px;border-left:2px solid var(--line);color:var(--fg-dim)}
+footer{max-width:720px;margin:0 auto;padding:24px 28px 64px;font-size:11.5px;color:var(--fg-faint)}
+@media (max-width:640px){
+.hero-in{padding:14px 18px}
+main{padding:24px 18px 8px}
+footer{padding:20px 18px 48px}
+.msg+.msg{margin-top:20px;padding-top:20px}
+}
+@media print{
+:root{color-scheme:light}
+body{background:#fff}
+.hero{position:static}
+details{break-inside:avoid}
+}
+)CSS";
+
             std::string html;
-            html.reserve(body.size() + 4096);
+            html.reserve(body.size() + css.size() + 2048);
             html += "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n";
             html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
+            html += "<meta name=\"color-scheme\" content=\"light dark\">\n";
+            html += "<meta name=\"generator\" content=\"cell.cpp /export\">\n";
             html += "<title>cell.cpp transcript - ";
             html += html_escape(session_id);
-            html += "</title>\n";
-            html += "<style>\n";
-            html += ":root{color-scheme:light}\n";
-            html += "*{box-sizing:border-box}\n";
-            html += "body{margin:0;background:#f6f7f9;color:#1c2733;font:15px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}\n";
-            html += "header{padding:24px 32px 8px}\n";
-            html += "h1{margin:0 0 4px;font-size:20px}\n";
-            html += ".meta{margin:0;color:#5b6b7c;font-size:13px}\n";
-            html += ".meta code{background:#eceff3;border-radius:4px;padding:1px 5px}\n";
-            html += "main{max-width:960px;margin:0 auto;padding:8px 24px 48px}\n";
-            html += ".msg{background:#ffffff;border:1px solid #e3e7ec;border-left:4px solid #c6ccd3;border-radius:8px;padding:10px 16px;margin:14px 0}\n";
-            html += ".msg.user{border-left-color:#3b82c4}\n";
-            html += ".msg.assistant{border-left-color:#3aa655}\n";
-            html += ".msg.tool{border-left-color:#98a1ab;background:#fafbfc}\n";
-            html += ".msg.system{border-left-color:#c9a227;background:#fffdf2}\n";
-            html += ".who{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#687585}\n";
-            html += ".msg.user .who{color:#2b6ea3}\n";
-            html += ".msg.assistant .who{color:#2c7d43}\n";
-            html += ".body{margin-top:4px}\n";
-            html += ".prose{white-space:pre-wrap;overflow-wrap:anywhere}\n";
-            html += ".muted{color:#8a97a5}\n";
-            html += "pre.code{background:#f0f2f5;border:1px solid #e0e4e9;border-radius:6px;padding:10px 12px;overflow-x:auto;white-space:pre;font:13px/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace;margin:6px 0}\n";
-            html += "details{margin:6px 0}\n";
-            html += "summary{cursor:pointer;font-size:13px;font-weight:600;color:#5b6b7c}\n";
-            html += "details.think summary{color:#7c5cbf}\n";
-            html += "details.think .prose{color:#6b5a95;background:#f7f4fc;border:1px solid #e8e0f5;border-radius:6px;padding:8px 12px}\n";
-            html += "</style>\n";
-            html += "</head>\n<body>\n";
-            html += "<header><h1>cell.cpp chat transcript</h1><p class=\"meta\">session <code>";
+            html += "</title>\n<style>";
+            html += css;
+            html += "</style>\n</head>\n<body>\n";
+            html += "<header class=\"hero\"><div class=\"hero-in\"><div class=\"titles\">";
+            html += "<h1>cell.cpp transcript</h1><p class=\"sub\">session <code>";
             html += html_escape(session_id);
-            html += "</code> | ";
+            html += "</code></p></div><div class=\"meta\"><span><b>";
             html += std::to_string(shown);
-            html += " message(s) | exported ";
+            html += "</b> messages</span><span>";
             html += html_escape(when);
-            html += "</p></header>\n<main>\n";
+            html += "</span></div></div></header>\n<main>\n";
             html += body;
-            html += "</main>\n</body>\n</html>\n";
+            html += "</main>\n<footer>generated by cell.cpp &middot; /export</footer>\n</body>\n</html>\n";
             if (!plat::write_file_atomic(target, html))
             {
                 err = std::format("failed to write {}", target.string());
@@ -12910,6 +13311,11 @@ static int run_selftest()
                             })}},
             {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "<tool_output tool=\"exec\" path=\"probe\">\n<h1>injected</h1>\n</tool_output>"}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "call_2"}, {"content", "<tool_output tool=\"read\">\nfile body\n</tool_output>"}}})}},
+            {{"role", "assistant"},
+             {"content", "## Plan\n\n1. read\n2. write\n\n- alpha\n- [docs](https://example.com/x)\n\n"
+                         "| key | val |\n| --- | --- |\n| a | 1 |\n\n> quoted note\n\n"
+                         "**bold** *em* ~~old~~ `code` [bad](javascript:alert(1))\n\n"
+                         "```python\nprint(1)\n```\n"}},
         });
         std::filesystem::path out = cell::root / "selftest-export.html";
         R.expect(cell::chat::export_transcript_html(ex_msgs, "selftest-sid", out, xerr), "HTML export writes the transcript");
@@ -12922,9 +13328,28 @@ static int run_selftest()
             R.expect(html.find("tool result: exec | probe") != std::string::npos, "HTML export renders wrapped tool results with the wrapper attributes");
             R.expect(html.find("tool result: read") != std::string::npos, "HTML export renders Anthropic-style tool_result blocks");
             R.expect(html.find("tool call: ls") != std::string::npos, "HTML export renders assistant tool calls");
+            R.expect(html.find("done") < html.find("tool call: ls"), "HTML export shows message content before its tool calls");
             R.expect(html.find("hidden chain") != std::string::npos && html.find("<summary>thinking</summary>") != std::string::npos, "HTML export renders reasoning blocks as collapsed sections");
             R.expect(html.find("<pre class=\"code\">int main() {}") != std::string::npos, "HTML export renders code fences");
             R.expect(html.find("be &lt;b&gt;safe&lt;/b&gt; &amp; terse") != std::string::npos, "HTML export escapes system messages");
+            R.expect(html.find("<h3 class=\"md-h\">Plan</h3>") != std::string::npos, "HTML export renders markdown headings");
+            R.expect(html.find("<ol class=\"md-list\"><li>read</li><li>write</li></ol>") != std::string::npos, "HTML export renders ordered lists");
+            R.expect(html.find("<ul class=\"md-list\"><li>alpha</li>") != std::string::npos, "HTML export renders bullet lists");
+            R.expect(html.find("<blockquote class=\"md-q\">quoted note</blockquote>") != std::string::npos, "HTML export renders blockquotes");
+            R.expect(html.find("<table class=\"md-tab\">") != std::string::npos && html.find("<td>1</td>") != std::string::npos,
+                     "HTML export renders pipe tables");
+            R.expect(html.find("<strong>bold</strong>") != std::string::npos && html.find("<em>em</em>") != std::string::npos &&
+                         html.find("<del>old</del>") != std::string::npos && html.find("<code class=\"ic\">code</code>") != std::string::npos,
+                     "HTML export renders inline emphasis");
+            R.expect(html.find("<a class=\"lnk\" href=\"https://example.com/x\"") != std::string::npos, "HTML export links http urls");
+            R.expect(html.find("href=\"javascript") == std::string::npos && html.find("javascript:alert(1)") != std::string::npos,
+                     "HTML export refuses non-http links");
+            R.expect(html.find("<span class=\"lang\">python</span>") != std::string::npos, "HTML export labels fenced code blocks");
+            R.expect(html.find("<article class=\"msg assistant\">") != std::string::npos &&
+                         html.find("<span class=\"dot assistant\"") != std::string::npos,
+                     "HTML export wraps messages in role-styled cards");
+            R.expect(html.find("<style>") != std::string::npos && html.find("<link") == std::string::npos && html.find("src=") == std::string::npos,
+                     "HTML export embeds its stylesheet and loads nothing external");
         }
         std::error_code xec;
         std::filesystem::remove(out, xec);

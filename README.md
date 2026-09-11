@@ -247,7 +247,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/saved [list]` | List the compaction archives of the current session (`saved/msg-<UTC time>.jsonl` in the session folder) |
 | `/saved show NAME` | Display an archived transcript (exact name or unique substring of one) |
 | `/saved rm NAME` | Delete an archived transcript |
-| `/export [PATH]` | Export the current session transcript as a **self-contained HTML file** (no scripts/external resources; tool calls and reasoning render as collapsed sections; default `cell-export-<UTC time>.html` in the working directory) |
+| `/export [PATH]` | Export the current session transcript as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; markdown-lite rendering — headings, lists, quotes, rules, pipe tables, `code`, **bold**, *italic*, links — with tool calls, tool results and reasoning as collapsed sections; default `cell-export-<UTC time>.html` in the working directory) |
 | `/export saved NAME [PATH]` | Export one compaction archive to HTML (name resolved like `/saved show`) |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
 | `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
