@@ -12,8 +12,7 @@ A lightweight AI coding agent written in modern C++26. Connect to OpenAI or Anth
 
 </div>
 
-```bash
-PS D:\Developments\CXX\cell.cpp> cell                                                                                                  
+```markdown                                                                                                
 cell: cwd=D:\Developments\CXX\cell.cpp session=82db5d5997826cfd-1789051971045-d72020ad model=llama-cpp:Qwen3.8-27B sandbox=full-access
 context: loaded 1 message(s) from disk
 > 介绍一下自己，以及你能干什么
