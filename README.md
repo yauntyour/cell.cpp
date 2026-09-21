@@ -13,69 +13,106 @@ A lightweight AI coding agent written in modern C++26. Connect to OpenAI or Anth
 </div>
 
 ```bash
-shell> cell
-cell: cwd=path/to/ session=82db5d5997826cfd-1788623888 model=Z.AI:glm-5.3-flash sandbox=full-access
+PS D:\Developments\CXX\cell.cpp> cell                                                                                                  
+cell: cwd=D:\Developments\CXX\cell.cpp session=82db5d5997826cfd-1789051971045-d72020ad model=llama-cpp:Qwen3.8-27B sandbox=full-access
 context: loaded 1 message(s) from disk
-> 介绍一下自己，以及你能干什么   
-The user is asking me to introduce myself and what I can do, in Chinese. Let me respond in Chinese since they asked in Chinese.
+> 介绍一下自己，以及你能干什么
+The user is asking in Chinese: "Please introduce yourself and what you can do."
 
-I'm an AI assistant operating in a sandboxed environment with various file and shell tools. Let me give a helpful introduction covering:
-1. Who I am
-2. What tools/capabilities I have
-3. What I can help with
+This is a simple self-introduction question. According to the system prompt, I am Qwen (Tongyi Qianwen) made by Alibaba. I should reply in Chinese (language sync), and shouldn't mention specific version numbers. I should mention capabilities like:
 
-I should be accurate about my tools:
-- ls: list directory entries
-- read: read text files
-- write: create new files
-- edit: modify existing files (replace/insert/append/delete/query)
-- rg: search file contents with regex
-- exec: run shell commands (sandboxed, no network egress, high-risk commands need confirmation)
-- find: find files by glob pattern/metadata
+- Advanced human-computer interaction
+- Precision control of full attention
+- Long context window (about 100,000 characters / 1M context)
+- Knowledge cutoff date 2025
+- Strong in complex tasks: code, document writing, reasoning, Q&A
 
-I can also just chat and answer questions generally. Let me write a nice introduction in Chinese. I shouldn't make it too long, but should be informative. Maybe use some formatting like a list.
-你好！很高兴见到你 👋
+I should also mention the specific capabilities I can actually do in this environment: file operations, code execution, search, and coordination of child agents. Since I actually have tools here (file reading/writing, shell execution, search, team child agents), I can mention them in a natural way.
+
+The identity guidelines say "don't proactively bring up the version number." I should use the same language as the user. So I'll reply in Chinese.
+
+Let me write a friendly self-introduction:
+
+- Name: Qwen (Tongyi Qianwen), developed by Alibaba
+- Core capabilities
+- Things I can do in this session: file operations, code execution, project search, multi-stage task coordination
+- Knowledge cutoff 2025
+
+Format: A friendly introduction using some structure (short list). Since this is a simple question, I'll keep it medium length and not make it too long.
+你好！我是千问（Qwen），由阿里巴巴集团研发的大语言模型。下面简单介绍一下我自己和能做的事情：
 
 ## 我是谁
 
-我是一个 AI 编程助手（基于 GLM 大模型），运行在一个**沙盒化的工作环境**中。与普通聊天机器人不同的是，我可以直接操作你所在的这个文件系统，真正地"动手"干活，而不只是纸上谈兵。
+- **名称**：千问（Qwen）
+- **研发方**：阿里巴巴集团
+- **知识截止**：2025 年
+- **长文本能力**：原生支持超长上下文窗口，可无损处理数十万字的文档，支持理解长达数小时的视频内容
 
 ## 我能做什么
 
-### 📁 文件操作
-- **浏览**：列出目录内容、按名称/大小/修改时间递归查找文件
-- **读写**：读取文本文件、创建新文件
-- **编辑**：精确修改已有文件（替换、插入、删除、追加），支持大文件的分段读取和局部修改
+**核心能力方面：**
+- 复杂任务处理：逻辑推理、代码编写与调试、文档写作、多轮对话、创意生成
+- 精准的信息检索与理解：支持超长上下文，能处理海量文档并快速定位关键信息
+- 内容创作：写作、翻译、摘要、头脑风暴、方案规划
+- 编程：代码生成、解释、重构、排错、跨语言支持
+- 问答：知识、推理、分析
 
-### 🔍 代码搜索与分析
-- 用正则表达式递归搜索整个代码库的内容
-- 快速定位函数定义、引用、配置项等
+**在当前这个环境里，我还能实际动手操作：**
+- 读写文件、修改代码、执行 shell 命令
+- 搜索和检索项目内容
+- 把大任务拆分成多个子任务并行推进
 
-### 💻 执行命令
-- 运行 shell 命令（如编译、测试、运行脚本、安装依赖）
-- 沙盒安全限制：网络请求类命令（curl、git push 等）会被拦截，高风险命令需要二次确认
+如果你有具体的任务——比如想让我写一段代码、分析一份文档、整理某个问题，或者在这个项目里做点什么——直接告诉我需求就行。
+[2026-09-21 06:51:48] INFO  [llm  ] round=1 model=llama-cpp:Qwen3.8-27B stream=true ctx_msgs=2 tok_in=3197 tok_out=601 cache=0.0% time=36.99s ttf=13.38s tools=0 attempts=1
 
-### 🧠 通用智力
-- 写代码、改 bug、重构、写测试、代码审查
-- 解释技术概念、设计方案、撰写文档
-- 当然，也可以纯聊天答疑 😄
+> 检查工具列表
+reply> The user is asking me to check the tool list. Let me check the tools available to me. The system prompt lists the tools I have access to. Let me provide an overview.
 
-## 典型使用场景
+Tools available:
+1. `ls` - Directory listing (non-recursive, paginated)
+2. `read` - Read files (text with line numbers, binary as base64)
+3. `write` - Create new files (refuses to overwrite existing files)
+4. `edit` - Modify existing files (replace/insert/append/delete/query modes)
+5. `rg` - Regex search over file contents
+6. `find` - Search for files by glob/metadata
+7. `exec` - Execute shell commands (timeout default 30s, max 300s)
+8. `tw` - Manage Teamwork child agent jobs (serial/parallel/workflow)
+9. `notice` - Message bus for agent sessions
 
-| 场景 | 示例 |
-|------|------|
-| 熟悉陌生代码库 | "帮我看看这个项目的结构" |
-| 修 bug | "测试失败了，帮我找原因并修复" |
-| 开发功能 | "给这个项目加一个 XX 功能" |
-| 项目脚手架 | "从零搭建一个 XX 项目" |
-| 自动化 | "写个脚本批量处理这些文件" |
+I can also summarize the tool list. The user asked in Chinese, so I'll respond in Chinese.
 
----
+I could also demonstrate by listing the current directory to show what I can do. Let me do a simple `ls` to verify the tools work.
+好的，我当前环境里可用的工具有以下几个：
 
-想开始的话，可以直接告诉我你的需求，或者让我先 `ls` 看看当前目录里有什么。你今天想做点什么？
-[2026-09-05 16:03:46] INFO  [llm  ] round=1 model=Z.AI:glm-5.3-flash stream=true ctx_msgs=2 tok_in=1640 tok_out=603 cache=0.0% time=20.08s ttf=5.17s tools=0 attempts=1
+## 文件 / 项目操作类
+| 工具 | 用途 |
+|---|---|
+| `ls` | 列目录内容（非递归，支持分页） |
+| `read` | 读文件（文本带行号；二进制文件如图片、音视频以 base64 返回，方便多模态处理） |
+| `write` | 创建**新文件**（拒绝覆盖已有文件） |
+| `edit` | 修改已有文件：支持 replace / insert / append / delete / query 五种模式 |
+| `find` | 按 glob 模式 + 元数据（文件名、修改时间、大小）查找文件 |
+| `rg` | 递归正则搜索文件内容（支持忽略大小写、上下文行、扩展名过滤、计数模式） |
 
-> 
+## 执行 / 协作类
+| 工具 | 用途 |
+|---|---|
+| `exec` | 执行 shell 命令（默认超时 30 秒，最长 300 秒；高风险命令需二次确认） |
+| `tw` | 管理 Teamwork 子代理任务：支持串行 / 并行 / 多阶段 workflow，可复用之前的子任务 |
+| `notice` | 会话间消息总线：发送、列出、等待、清空通知 |
+
+## 简单总结一下
+
+- **文件操作**：读、写、改、搜、找都齐了
+- **命令执行**：可以直接跑 shell
+- **任务编排**：可以把大任务拆给多个子代理并行处理
+
+要不要我现在实际跑几个试试？比如看看当前目录里有什么文件。
+[2026-09-21 06:52:37] INFO  [llm  ] round=1 model=llama-cpp:Qwen3.8-27B stream=true ctx_msgs=4 tok_in=3488 tok_out=620 cache=91.5% time=24.89s ttf=1.03s tools=0 attempts=1
+
+> /export chat.html
+exported 5 message(s) to cell-export-20260921-065306.html
+> /quit
 ```
 
 ---

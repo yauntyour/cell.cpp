@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="generator" content="cell.cpp /export">
+<title>cell.cpp transcript - 82db5d5997826cfd-1789051971045-d72020ad</title>
+<style>
+:root{color-scheme:light dark;
+--bg:#ffffff;--fg:#1f2328;--fg-dim:#5c6570;--fg-faint:#8b939c;
+--line:#e7e9ec;--line-soft:#f1f2f4;--code-bg:#f6f7f8;
+--user:#3b82f6;--assistant:#10a37f;--tool:#7c6cf0;--system:#c9871f;--other:#a8b0b9;
+--ok:#0f7b4f;--run:#a8730c;--bad:#c0392b;
+--page:100%;--pad:32px;--tree:236px;--hero-h:124px;
+--link:#1a6ee5;
+--mono:ui-monospace,"Cascadia Mono","JetBrains Mono",SFMono-Regular,Consolas,"Liberation Mono",monospace}
+@media (prefers-color-scheme:dark){:root{
+--bg:#0f1115;--fg:#e7e9ec;--fg-dim:#a2a9b4;--fg-faint:#767e88;
+--line:#23262c;--line-soft:#1c1f24;--code-bg:#16181d;
+--user:#6aa8f5;--assistant:#3ecfa4;--tool:#a795fb;--system:#e0b062;--other:#767e88;
+--ok:#4bbf8a;--run:#dcae52;--bad:#e2705f;
+--link:#79b0f7}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.75 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+-webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%}
+code,pre,summary,.role,.lang{font-family:var(--mono)}
+a.lnk{color:var(--link);text-decoration:none}
+a.lnk:hover{text-decoration:underline}
+.hero{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+.hero-in{max-width:var(--page);margin:0 auto;padding:15px var(--pad);display:flex;align-items:baseline;
+justify-content:space-between;gap:14px;flex-wrap:wrap}
+.titles{min-width:0}
+h1{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+.sub{margin:3px 0 0;font-size:12px;color:var(--fg-faint);overflow-wrap:anywhere}
+.sub code{font-size:11.5px;color:var(--fg-dim)}
+.meta{display:flex;gap:14px;font-size:11.5px;color:var(--fg-faint);white-space:nowrap}
+.meta b{color:var(--fg-dim);font-weight:600}
+/* view tabs — the switcher is pure CSS (a targeted pane shows itself, a forward
+   sibling selector hides the default pane), so the export stays script-free */
+.tabs{display:flex;gap:16px;max-width:var(--page);margin:0 auto;padding:0 var(--pad);
+overflow-x:auto;border-top:1px solid var(--line-soft)}
+.tabs a{flex:none;padding:9px 0 8px;margin-bottom:-1px;border-bottom:2px solid transparent;
+font-size:12.5px;color:var(--fg-faint);text-decoration:none;white-space:nowrap}
+.tabs a b{margin-left:5px;font-weight:600;opacity:.75}
+.tabs a:hover{color:var(--fg-dim)}
+body:not(:has(#pane-teamwork :target)):not(:has(#pane-workflow :target)) .tabs a[href="#pane-chat"],
+body:has(#pane-teamwork:target) .tabs a[href="#pane-teamwork"],
+body:has(#pane-teamwork :target) .tabs a[href="#pane-teamwork"],
+body:has(#pane-workflow:target) .tabs a[href="#pane-workflow"],
+body:has(#pane-workflow :target) .tabs a[href="#pane-workflow"]{color:var(--fg);border-bottom-color:var(--fg)}
+.panes{max-width:var(--page);margin:0 auto}
+.pane{display:none;scroll-margin-top:var(--hero-h)}
+#pane-chat{display:flex}
+/* the tabs select a pane, the rail selects an entry *inside* one: a jump to
+   #j0 / #w0-0 / #wf0 has to keep that pane open, so "contains the target"
+   counts as selected just like "is the target" */
+.pane:target,.pane:has(:target){display:flex}
+#pane-teamwork:target~#pane-chat,#pane-workflow:target~#pane-chat,
+#pane-teamwork:has(:target)~#pane-chat,#pane-workflow:has(:target)~#pane-chat{display:none}
+.job,.ws,.subpage{scroll-margin-top:calc(var(--hero-h) + 12px)}
+/* left rail: the execution chain (chat) / the agent list (teamwork). It is a
+   flex item with an explicit width, so its bottom-right corner can be dragged
+   to widen the rail (resize is the only script-free way to do this) and the
+   stream absorbs whatever is left */
+.tree{position:sticky;top:var(--hero-h);align-self:flex-start;flex:0 0 auto;
+width:var(--tree);min-width:168px;max-width:62vw;max-height:calc(100vh - var(--hero-h) - 6px);
+overflow-y:auto;overflow-x:hidden;resize:horizontal;
+padding:26px 18px 46px var(--pad);border-right:1px solid var(--line)}
+.tree::-webkit-resizer{background:repeating-linear-gradient(135deg,transparent 0 3px,var(--line) 3px 4px)}
+.tree h2{margin:0 0 12px;font-size:10.5px;font-weight:600;letter-spacing:.14em;
+text-transform:uppercase;color:var(--fg-faint)}
+.tree ol,.tree ul{margin:0;padding:0;list-style:none}
+.tree a{display:flex;align-items:flex-start;gap:7px;min-width:0;padding:2.5px 5px;margin-left:-5px;
+border-radius:5px;font-size:12.5px;color:var(--fg-dim);text-decoration:none}
+.tree a:hover{color:var(--fg)}
+.tree .ix{flex:none;width:1.5em;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+.tree .lbl{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tree .dot{margin-top:6px}
+.tree .st{flex:none;margin-left:auto;font-family:var(--mono);font-size:10.5px}
+.tree .kids a{padding-left:calc(2.6em + 5px);font-family:var(--mono);font-size:11px;color:var(--fg-faint)}
+.tree .kind{font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+/* teamwork rail: every entry is one click away from the section it names and
+   its labels wrap, so the rail never grows a scrollbar of its own */
+.tree .agents .lbl{white-space:normal;overflow-wrap:anywhere}
+.tree .job>a{padding-top:7px}
+.tree .job>a .lbl{font-family:var(--mono);font-size:11.5px}
+.tree .job>.kind{display:block;padding:1px 0 4px calc(2.6em + 5px)}
+.tree .stages{margin:0 0 6px 1.1em;padding-left:12px;border-left:1px solid var(--line-soft)}
+.tree .stages>li{padding:3px 0 2px;min-width:0}
+.tree .stages>li>a{min-width:0}
+.tree .stages .kind{display:block;padding:2px 0 3px;overflow-wrap:anywhere}
+.tree .stages ul{margin-left:1.1em}
+.tree .stages ul li{display:flex;align-items:flex-start;gap:6px;min-width:0}
+.stream{flex:1 1 0;min-width:0;padding:26px var(--pad) 72px}
+.msg{scroll-margin-top:calc(var(--hero-h) + 14px)}
+.msg+.msg{border-top:1px solid var(--line);margin-top:26px;padding-top:26px}
+.msg.tool{margin-top:16px;padding-top:16px}
+.head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.head .ix{flex:none;font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+.kind{font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+a.kind{text-decoration:none}
+a.kind:hover{color:var(--fg)}
+.st{color:var(--fg-faint)}
+.st.ok{color:var(--ok)}
+.st.run{color:var(--run)}
+.st.bad{color:var(--bad)}
+.st.idle{color:var(--fg-faint)}
+.dot{width:6px;height:6px;flex:none;border-radius:50%;background:var(--other)}
+.dot.user{background:var(--user)}
+.dot.assistant{background:var(--assistant)}
+.dot.tool{background:var(--tool)}
+.dot.system{background:var(--system)}
+.role{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-faint)}
+.body{min-width:0}
+.p{margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.p:last-child{margin-bottom:0}
+.prose{white-space:pre-wrap;overflow-wrap:anywhere}
+.muted{color:var(--fg-faint)}
+h2.md-h,h3.md-h,h4.md-h,h5.md-h,h6.md-h{margin:22px 0 10px;font-weight:600;line-height:1.4;letter-spacing:-.01em}
+h2.md-h{font-size:17px}
+h3.md-h{font-size:15.5px}
+h4.md-h{font-size:15px}
+h5.md-h,h6.md-h{font-size:13px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.05em}
+.md-hr{border:0;border-top:1px solid var(--line);margin:22px 0}
+.md-q{margin:0 0 14px;padding-left:14px;border-left:2px solid var(--line);color:var(--fg-dim)}
+.md-q:last-child{margin-bottom:0}
+.md-list{margin:0 0 12px;padding-left:20px}
+.md-list li{margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.md-list li::marker{color:var(--fg-faint)}
+code.ic{font-size:.88em;background:var(--code-bg);border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}
+.tabwrap{margin:0 0 16px;overflow-x:auto}
+.md-tab{width:100%;border-collapse:collapse;font-size:13.5px}
+.md-tab th,.md-tab td{padding:7px 14px 7px 0;text-align:left;vertical-align:top;
+white-space:pre-wrap;border-bottom:1px solid var(--line-soft)}
+.md-tab thead th{border-bottom:1px solid var(--line);color:var(--fg-dim);font-size:11.5px;
+font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.md-tab tbody tr:last-child td{border-bottom:0}
+.md-tab th:last-child,.md-tab td:last-child{padding-right:0}
+.codeblock{margin:0 0 14px}
+.lang{font-size:11px;letter-spacing:.04em;text-transform:lowercase;color:var(--fg-faint)}
+.codeblock .lang{display:block;margin-bottom:6px}
+pre.code{margin:0;padding:12px 14px;background:var(--code-bg);border-radius:6px;overflow-x:auto;
+white-space:pre;font-size:12.5px;line-height:1.65;color:var(--fg)}
+details{margin:0 0 12px}
+details:last-child{margin-bottom:0}
+summary{display:block;cursor:pointer;list-style:none;padding:2px 0;font-size:12px;color:var(--fg-dim)}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"\25B8";display:inline-block;width:14px;color:var(--fg-faint)}
+details[open]>summary::before{content:"\25BE"}
+summary:hover{color:var(--fg)}
+details[open]>summary{margin-bottom:8px}
+details.think .prose{padding-left:14px;border-left:2px solid var(--line);color:var(--fg-dim)}
+/* teamwork pane: job section + one section per child agent */
+.job{margin:0 0 34px}
+.job>.head .role{color:var(--fg-dim)}
+.ws{margin:0 0 22px;padding-top:16px;border-top:1px solid var(--line-soft)}
+.ws .works{margin:0 0 10px;color:var(--fg-dim)}
+.ws .report{margin:0 0 12px}
+.raw{margin:0}
+.substream{margin-left:2px;padding-left:16px;border-left:2px solid var(--line-soft)}
+.substream .msg+.msg{margin-top:18px;padding-top:18px}
+.substream .msg .head{margin-bottom:7px}
+/* workflow sub-page */
+.subpage{margin:0 0 26px;border:1px solid var(--line);border-radius:12px;
+padding:22px 26px 24px}
+.crumbs{display:flex;gap:8px;margin:0 0 14px;font-size:11.5px;color:var(--fg-faint)}
+.crumbs a{color:var(--fg-faint);text-decoration:none}
+.crumbs a:hover{color:var(--fg)}
+.page-title{margin:0 0 4px;font-size:17px;font-weight:600;letter-spacing:-.01em}
+/* workflow flowchart: a vertical rail (drawn with borders — no images) and one
+   node per stage. Parallel stages fan their agents out into branch boxes joined
+   by a fork, gates get a dashed edge and a diamond marker, and the flow is
+   book-ended by a start and a status terminator. */
+.flow{position:relative;margin:18px 0 4px}
+.flow::before{content:"";position:absolute;left:19px;top:16px;bottom:16px;border-left:1px solid var(--line)}
+.fnode{display:flex;align-items:stretch;margin:0 0 12px}
+.frail{position:relative;flex:0 0 40px;min-height:30px}
+.fnode:not(:last-child) .frail::after{content:"";position:absolute;left:14px;bottom:-6px;width:0;height:0;
+border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--line)}
+.fdot{position:absolute;left:19px;top:20px;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;
+border-radius:50%;background:var(--fg-faint);border:1.5px solid var(--bg)}
+.fdot.ok{background:var(--ok)}
+.fdot.run{background:var(--run)}
+.fdot.bad{background:var(--bad)}
+.fnode.gate .fdot{border-radius:1px;transform:rotate(45deg)}
+.fnode.cap .fdot{background:var(--bg);border-color:var(--fg-faint)}
+.fbox{flex:1 1 auto;min-width:0;border:1px solid var(--line);border-radius:10px;padding:11px 16px 13px}
+.fnode.gate .fbox{border-style:dashed}
+.fnode.now .fbox{border-color:var(--fg-faint);background:var(--code-bg)}
+.fnode.cap .fbox{border:0;background:none;padding:4px 0 0 2px}
+.fhd{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.fhd .fn{font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+.fname{font-size:13px;font-weight:600}
+.fnode.cap .fname{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--fg-faint)}
+.fmeta{font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+.kbadge{font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
+color:var(--fg-dim);border:1px solid var(--line);border-radius:20px;padding:0 7px}
+.fbr{display:grid;grid-template-columns:repeat(var(--n,1),minmax(0,1fr));gap:12px;margin:12px 0 0;
+padding:0;list-style:none}
+.fbr:not(.fan)>li{padding:5px 0;border-top:1px solid var(--line-soft)}
+.fbr:not(.fan)>li:first-child{border-top:0;padding-top:0}
+.fbr.fan{position:relative;margin-top:18px;padding-top:14px}
+.fbr.fan::before{content:"";position:absolute;top:0;left:calc(50%/var(--n,1));right:calc(50%/var(--n,1));
+border-top:1px solid var(--line)}
+.fbr.fan>li{position:relative;border:1px solid var(--line-soft);border-radius:8px;padding:9px 12px}
+.fbr.fan>li::before{content:"";position:absolute;top:-14px;left:50%;height:14px;width:0;
+border-left:1px solid var(--line)}
+.frow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.frow .nm{font-family:var(--mono);font-size:12px}
+.frow .st{font-family:var(--mono);font-size:10.5px}
+.fbr .ex{display:block;margin-top:3px;font-size:11.5px;color:var(--fg-faint);overflow-wrap:anywhere}
+footer{max-width:var(--page);margin:0 auto;padding:22px var(--pad) 64px;display:flex;gap:14px;
+flex-wrap:wrap;justify-content:space-between;font-size:11.5px;color:var(--fg-faint)}
+@media (max-width:900px){
+:root{--pad:18px;--hero-h:0px}
+#pane-chat,.pane:target,.pane:has(:target){flex-direction:column}
+.tree{position:static;width:auto;max-width:none;max-height:none;resize:none;overflow:visible;
+border-right:0;border-bottom:1px solid var(--line);padding:20px var(--pad)}
+.stream{padding:20px var(--pad) 48px}
+.subpage{border-radius:8px;padding:18px}
+.msg+.msg{margin-top:20px;padding-top:20px}
+}
+@media print{
+:root{color-scheme:light;--hero-h:0px}
+body{background:#fff}
+.hero{position:static}
+.pane{display:block!important}
+.tree{display:none}
+.stream{flex:none;padding:0}
+.subpage{border:0;margin:0 0 24px;padding:0}
+.fbox,.fbr.fan>li,.fnode{break-inside:avoid}
+details{break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<header class="hero"><div class="hero-in"><div class="titles"><h1>cell.cpp transcript</h1><p class="sub">session <code>82db5d5997826cfd-1789051971045-d72020ad</code></p></div><div class="meta"><span><b>5</b> messages</span><span>2026-09-21 06:53:06 UTC</span></div></div><nav class="tabs"><a href="#pane-chat">conversation<b>5</b></a></nav></header>
+<div class="panes">
+<section class="pane" id="pane-chat"><aside class="tree"><h2>execution chain</h2><ol class="chain"><li><a href="#m1"><span class="ix">01</span><span class="dot system" aria-hidden="true"></span><span class="lbl">You are a helpful assistant.</span></a></li><li><a href="#m2"><span class="ix">02</span><span class="dot user" aria-hidden="true"></span><span class="lbl">介绍一下自己，以及你能干什么</span></a></li><li><a href="#m3"><span class="ix">03</span><span class="dot assistant" aria-hidden="true"></span><span class="lbl">你好！我是千问（Qwen），由阿里巴巴集团研发的大语言模型。下面简单介绍一下我自己和能做的事…</span></a><ul class="kids"><li><a href="#m3">thinking</a></li></ul></li><li><a href="#m4"><span class="ix">04</span><span class="dot user" aria-hidden="true"></span><span class="lbl">检查工具列表</span></a></li><li><a href="#m5"><span class="ix">05</span><span class="dot assistant" aria-hidden="true"></span><span class="lbl">好的，我当前环境里可用的工具有以下几个： ## 文件 / 项目操作类 | 工具 | 用途 |…</span></a><ul class="kids"><li><a href="#m5">thinking</a></li></ul></li></ol></aside><div class="stream"><article class="msg system" id="m1"><div class="head"><span class="ix">01</span><span class="dot system" aria-hidden="true"></span><span class="role">system</span></div><div class="body"><p class="p">You are a helpful assistant.</p></div></article><article class="msg user" id="m2"><div class="head"><span class="ix">02</span><span class="dot user" aria-hidden="true"></span><span class="role">user</span></div><div class="body"><p class="p">介绍一下自己，以及你能干什么</p></div></article><article class="msg assistant" id="m3"><div class="head"><span class="ix">03</span><span class="dot assistant" aria-hidden="true"></span><span class="role">assistant</span></div><div class="body"><details class="think"><summary>thinking</summary><div class="prose">The user is asking in Chinese: &quot;Please introduce yourself and what you can do.&quot;
+
+This is a simple self-introduction question. According to the system prompt, I am Qwen (Tongyi Qianwen) made by Alibaba. I should reply in Chinese (language sync), and shouldn&#39;t mention specific version numbers. I should mention capabilities like:
+
+- Advanced human-computer interaction
+- Precision control of full attention
+- Long context window (about 100,000 characters / 1M context)
+- Knowledge cutoff date 2025
+- Strong in complex tasks: code, document writing, reasoning, Q&amp;A
+
+I should also mention the specific capabilities I can actually do in this environment: file operations, code execution, search, and coordination of child agents. Since I actually have tools here (file reading/writing, shell execution, search, team child agents), I can mention them in a natural way.
+
+The identity guidelines say &quot;don&#39;t proactively bring up the version number.&quot; I should use the same language as the user. So I&#39;ll reply in Chinese.
+
+Let me write a friendly self-introduction:
+
+- Name: Qwen (Tongyi Qianwen), developed by Alibaba
+- Core capabilities
+- Things I can do in this session: file operations, code execution, project search, multi-stage task coordination
+- Knowledge cutoff 2025
+
+Format: A friendly introduction using some structure (short list). Since this is a simple question, I&#39;ll keep it medium length and not make it too long.
+</div></details><p class="p">你好！我是千问（Qwen），由阿里巴巴集团研发的大语言模型。下面简单介绍一下我自己和能做的事情：</p><h3 class="md-h">我是谁</h3><ul class="md-list"><li><strong>名称</strong>：千问（Qwen）</li><li><strong>研发方</strong>：阿里巴巴集团</li><li><strong>知识截止</strong>：2025 年</li><li><strong>长文本能力</strong>：原生支持超长上下文窗口，可无损处理数十万字的文档，支持理解长达数小时的视频内容</li></ul><h3 class="md-h">我能做什么</h3><p class="p"><strong>核心能力方面：</strong></p><ul class="md-list"><li>复杂任务处理：逻辑推理、代码编写与调试、文档写作、多轮对话、创意生成</li><li>精准的信息检索与理解：支持超长上下文，能处理海量文档并快速定位关键信息</li><li>内容创作：写作、翻译、摘要、头脑风暴、方案规划</li><li>编程：代码生成、解释、重构、排错、跨语言支持</li><li>问答：知识、推理、分析</li></ul><p class="p"><strong>在当前这个环境里，我还能实际动手操作：</strong></p><ul class="md-list"><li>读写文件、修改代码、执行 shell 命令</li><li>搜索和检索项目内容</li><li>把大任务拆分成多个子任务并行推进</li></ul><p class="p">如果你有具体的任务——比如想让我写一段代码、分析一份文档、整理某个问题，或者在这个项目里做点什么——直接告诉我需求就行。</p></div></article><article class="msg user" id="m4"><div class="head"><span class="ix">04</span><span class="dot user" aria-hidden="true"></span><span class="role">user</span></div><div class="body"><p class="p">检查工具列表</p></div></article><article class="msg assistant" id="m5"><div class="head"><span class="ix">05</span><span class="dot assistant" aria-hidden="true"></span><span class="role">assistant</span></div><div class="body"><details class="think"><summary>thinking</summary><div class="prose">The user is asking me to check the tool list. Let me check the tools available to me. The system prompt lists the tools I have access to. Let me provide an overview.
+
+Tools available:
+1. `ls` - Directory listing (non-recursive, paginated)
+2. `read` - Read files (text with line numbers, binary as base64)
+3. `write` - Create new files (refuses to overwrite existing files)
+4. `edit` - Modify existing files (replace/insert/append/delete/query modes)
+5. `rg` - Regex search over file contents
+6. `find` - Search for files by glob/metadata
+7. `exec` - Execute shell commands (timeout default 30s, max 300s)
+8. `tw` - Manage Teamwork child agent jobs (serial/parallel/workflow)
+9. `notice` - Message bus for agent sessions
+
+I can also summarize the tool list. The user asked in Chinese, so I&#39;ll respond in Chinese.
+
+I could also demonstrate by listing the current directory to show what I can do. Let me do a simple `ls` to verify the tools work.
+</div></details><p class="p">好的，我当前环境里可用的工具有以下几个：</p><h3 class="md-h">文件 / 项目操作类</h3><div class="tabwrap"><table class="md-tab"><thead><tr><th>工具</th><th>用途</th></tr></thead><tbody><tr><td><code class="ic">ls</code></td><td>列目录内容（非递归，支持分页）</td></tr><tr><td><code class="ic">read</code></td><td>读文件（文本带行号；二进制文件如图片、音视频以 base64 返回，方便多模态处理）</td></tr><tr><td><code class="ic">write</code></td><td>创建<strong>新文件</strong>（拒绝覆盖已有文件）</td></tr><tr><td><code class="ic">edit</code></td><td>修改已有文件：支持 replace / insert / append / delete / query 五种模式</td></tr><tr><td><code class="ic">find</code></td><td>按 glob 模式 + 元数据（文件名、修改时间、大小）查找文件</td></tr><tr><td><code class="ic">rg</code></td><td>递归正则搜索文件内容（支持忽略大小写、上下文行、扩展名过滤、计数模式）</td></tr></tbody></table></div><h3 class="md-h">执行 / 协作类</h3><div class="tabwrap"><table class="md-tab"><thead><tr><th>工具</th><th>用途</th></tr></thead><tbody><tr><td><code class="ic">exec</code></td><td>执行 shell 命令（默认超时 30 秒，最长 300 秒；高风险命令需二次确认）</td></tr><tr><td><code class="ic">tw</code></td><td>管理 Teamwork 子代理任务：支持串行 / 并行 / 多阶段 workflow，可复用之前的子任务</td></tr><tr><td><code class="ic">notice</code></td><td>会话间消息总线：发送、列出、等待、清空通知</td></tr></tbody></table></div><h3 class="md-h">简单总结一下</h3><ul class="md-list"><li><strong>文件操作</strong>：读、写、改、搜、找都齐了</li><li><strong>命令执行</strong>：可以直接跑 shell</li><li><strong>任务编排</strong>：可以把大任务拆给多个子代理并行处理</li></ul><p class="p">要不要我现在实际跑几个试试？比如看看当前目录里有什么文件。</p></div></article></div></section>
+</div>
+<footer><span>generated by cell.cpp &middot; /export</span><span>5 messages</span></footer>
+</body>
+</html>
