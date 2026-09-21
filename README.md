@@ -189,6 +189,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
   --no-color                  disable colored log output
   --verbose                   enable DEBUG-level log output on console
   --selftest                  run internal self tests
+  --help, -h                  show this usage summary and exit
 ```
 
 | Option | Value | Effect |
@@ -204,6 +205,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 | `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
 | `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
 | `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
+| `--help`, `-h` | flag | Prints the usage summary and exits with `0`. |
 
 **Load order.** `.cell/config.json` is read first (a parse error is reported as a warning and the
 program continues with defaults); legacy config shapes are migrated on the fly. CLI flags are then
@@ -247,7 +249,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/saved [list]` | List the compaction archives of the current session (`saved/msg-<UTC time>.jsonl` in the session folder) |
 | `/saved show NAME` | Display an archived transcript (exact name or unique substring of one) |
 | `/saved rm NAME` | Delete an archived transcript |
-| `/export [PATH]` | Export the current session transcript as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; markdown-lite rendering — headings, lists, quotes, rules, pipe tables, `code`, **bold**, *italic*, links — with tool calls, tool results and reasoning as collapsed sections; default `cell-export-<UTC time>.html` in the working directory) |
+| `/export [PATH]` | Export the current session as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; full-width two-pane layout — a sticky left rail with the execution chain that links 1:1 to the messages on the right, **draggable at its bottom-right corner** to widen it; markdown-lite rendering — headings, lists, quotes, rules, pipe tables, `code`, **bold**, *italic*, links — with tool calls, tool results and reasoning as collapsed sections; Teamwork jobs get an **agent-list pane**: the rail is a clickable list of jobs/stages/child agents that jumps straight to each agent's report + full transcript, wrapping labels instead of scrolling; workflow jobs get a **flowchart sub-page** with its own rail — start/stage/terminator nodes on a vertical rail, parallel stages forking into per-agent branch boxes, gates drawn as dashed diamonds; default `cell-export-<UTC time>.html` in the working directory) |
 | `/export saved NAME [PATH]` | Export one compaction archive to HTML (name resolved like `/saved show`) |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
 | `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
