@@ -132,6 +132,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 - [Architecture](#architecture)
 - [The agent loop](#the-agent-loop)
 - [Streaming UI and keyboard control](#streaming-ui-and-keyboard-control)
+- [Interruptions and `/reload`](#interruptions-and-reload)
 - [Logging, signals and exit codes](#logging-signals-and-exit-codes)
 - [Self-test](#self-test)
 - [Implementation notes](#implementation-notes)
@@ -149,6 +150,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
+| ⏸️ | **Interrupted turns** — Esc or a failed request keeps the partial reply (truncated at its last token), cancels any half-streamed tool call, appends a system message with the reason, and remembers the state so `/reload` continues where the turn stopped | `cell::chat::record_interrupt` |
 | 🗜️ | **Automatic context compaction** — on context-overflow errors (compress + retry once) and after long tool-heavy turns; the compression model can differ from the chat model | `cell::chat`, `compact()` |
 | 🧠 | **Chain of thought** — `/think` with 5 levels (off/low/med/high/max); OpenAI streams `reasoning_content`, Anthropic streams `thinking_delta`, both rendered dim; reasoning content is persisted in sessions | `cell::llm` |
 | 🔎 | **Numbered reads** — `read` returns every line prefixed with a right-aligned line number, and `rg` groups hits as `=== file ===` + `line: content`, so the model can cite exact lines to `edit` | `cell::box` |
@@ -292,6 +294,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/compact auto [on\|off]` | Show or toggle automatic compaction after long agent runs (persisted, default on) |
 | `/compact model provider:model` | Route summarization through a specific registered provider/model; `inherit` resets it to the session model |
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
+| `/reload` | Resume an interrupted turn: the transcript already ends with the partial reply plus the system message that explains the interrupt, so it is simply sent again — no user message is added (see [Interruptions](#interruptions-and-reload)) |
 | `/skills` | List available skills |
 | `/skill NAME` | Inject a skill body into the current session as a system message |
 | `/teamworks` | List Teamwork jobs of the current session (see [Teamwork](#teamwork)) |
@@ -674,8 +677,10 @@ never appears in the vault file — the self-test asserts this.
   SHA-256 of the normalized absolute working directory (lowercased on Windows).
 - **Each session is a folder**: `.cell/sessions/<cwd-key>/<id>/`. It holds the JSONL transcript
   `messages.jsonl` (one message object per line — the standard agent log shape), the Teamwork store
-  `teamworks.json` with one `<job-id>/` transcript directory per job, and the compaction archives
-  `saved/msg-<UTC time>.jsonl`. `.cell/sessions/sessions.json` is the hash → path index that lets
+  `teamworks.json` with one `<job-id>/` transcript directory per job, the compaction archives
+  `saved/msg-<UTC time>.jsonl`, and the interrupt state `interrupt.json` (written when a turn is cut
+  short, emptied by the next user message or by a `/reload` that completes). `.cell/sessions/sessions.json`
+  is the hash → path index that lets
   every group be resolved back to a real directory; `/sessions` groups by it and marks the current
   cwd with `>`.
 - `/session ID` and startup resume logic **follow the session's cwd** (resolved through the index,
@@ -767,6 +772,7 @@ where you launch it from.
     └── 6333a2b6f7084f1a/ # one directory per working directory
         └── 6333a2b6f7084f1a-1787819024-ab12cd34/   # one folder per session
             ├── messages.jsonl    # transcript: one message object per line
+            ├── interrupt.json    # {"reason": "..."} while an interrupted turn can still be /reload-ed
             ├── teamworks.json    # Teamwork store (jobs of this session)
             ├── tw-20260910-124236/          # one transcript dir per job
             │   └── worker_0.json
@@ -829,8 +835,9 @@ config are persisted.
 
 **Failures and retries.** A failed LLM request is retried up to 5 attempts per round with a 5-second
 delay between attempts (`[retrying in 5s... attempt N/5]`); exhausting them ends the turn with
-`[llm error after 5 attempts]`. If the failure is a context-overflow error, the round is compacted
-once and retried immediately instead of burning a retry attempt (see
+`[llm error after 5 attempts]` and records an interrupted turn (see
+[Interruptions](#interruptions-and-reload)). If the failure is a context-overflow error, the round is
+compacted once and retried immediately instead of burning a retry attempt (see
 [automatic compaction](#slash-commands)).
 
 ## Streaming UI and keyboard control
@@ -839,8 +846,10 @@ once and retried immediately instead of burning a retry attempt (see
   answer **plain**, tool results and their echo **cyan**.
 - While waiting for the first token a `⏳ Ns` spinner is refreshed every 500 ms; afterwards a
   `~N tok` counter is refreshed on line boundaries.
-- **Esc** during a stream cancels it: the partial reply is kept in the transcript and `[cancelled]`
-  is printed. (Implemented by `cell::plat::peek_key`, which temporarily puts stdin in raw mode.)
+- **Esc** during a stream cancels it: the turn is recorded as *interrupted* — the partial reply
+  (chain-of-thought and answer text as far as it got) stays in the transcript and `[cancelled]` is
+  printed. See [Interruptions](#interruptions-and-reload). (Implemented by `cell::plat::peek_key`,
+  which temporarily puts stdin in raw mode.)
 - **Ctrl+C** (and `SIGTERM`/`SIGHUP`/`SIGABRT` on Windows) runs the persistence hook — repair the tool
   transcript, save session, save config, flush async writes — restores the terminal and exits with the
   signal number. The terminating signals are taken from a dedicated `sigwait` thread, so the
@@ -848,6 +857,29 @@ once and retried immediately instead of burning a retry attempt (see
   deliberately do **not** try to serialize state: they restore the default action and terminate.
 - Non-interactive mode (stdin is not a tty) reads all of stdin as one message, requires a configured
   provider, runs the agent loop once and exits.
+
+## Interruptions and `/reload`
+
+A turn can end before the model is finished in two ways: **Esc** during the stream, or an LLM request
+that fails on its last retry. Either way the turn is not thrown away:
+
+- Whatever the model had already produced is **kept verbatim and truncated at the last token that
+  fully arrived** (`sse_feed` only applies complete stream events, so the accumulated text always ends
+  on a token boundary — nothing is completed or padded).
+- A **tool call that was still being emitted is cancelled**: its arguments are usually truncated JSON,
+  it was never approved or executed, and no result is invented for it. The partial assistant message
+  is stored without its `tool_calls`, so the transcript stays valid for every provider.
+- A **system message** is appended that records the reason (Esc, or the error and attempt count) —
+  it is part of the conversation, not just console output, so the model sees why the previous turn
+  stopped.
+- The session remembers this as its **interrupt state** (`interrupt.json` in the session folder, so it
+  survives a restart). It is cleared by the next user message (including `/ins`) or by a `/reload`
+  that reaches a natural end; `/clear` drops it too.
+
+`/reload` continues exactly where the turn stopped: it sends the transcript as it stands (partial
+reply + interrupt notice, no new user message) and lets the model pick up. If that attempt is
+interrupted as well, the state is simply refreshed with the new reason. `/reload` with nothing to
+resume reports an error instead of sending anything.
 
 ## Logging, signals and exit codes
 
@@ -885,7 +917,9 @@ normalization (per-child provider/model/think, reuse references, name sanitizing
 store round-trips, child append/remove, history and report queries**, incremental SSE parsing
 and buffer compaction, the lazy directory walker, thread-pool job accounting, logger rotation, vault
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
-semantics, the cwd index, load-time re-sanitization of exec results, skill discovery (including
+semantics, the cwd index, load-time re-sanitization of exec results, interrupted turns (partial
+reply truncation, tool-call cancellation, the reason notice, and the persisted/cleared interrupt
+state), skill discovery (including
 directory-style) and usage statistics. Prints `selftest OK` / `selftest FAILED`.
 
 ## Implementation notes

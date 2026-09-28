@@ -6981,8 +6981,10 @@ namespace cell
     //  chat — session persistence: one folder per session, grouped in a
     //  directory per working-directory hash, plus the in-memory session map.
     //  The folder holds the JSONL transcript (messages.jsonl, one message
-    //  object per line), the Teamwork store and job transcripts, and the
-    //  compaction archives (saved/msg-<UTC time>.jsonl).
+    //  object per line), the Teamwork store and job transcripts, the
+    //  compaction archives (saved/msg-<UTC time>.jsonl), and the interrupt
+    //  state (interrupt.json — set when a turn is cut short, cleared by the
+    //  next user message or by a /reload that reaches a natural end).
     // =========================================================================
 
     namespace chat
@@ -8642,12 +8644,37 @@ details{break-inside:avoid}
             nlohmann::json messages = nlohmann::json::array(); // [{"role":"user","content":"hi"},...]
             std::filesystem::path dir;                         // <root>/sessions/<cwd-key>/<id>/
             std::filesystem::path file;                        // dir / "messages.jsonl"
+            std::filesystem::path interrupt_file;              // dir / "interrupt.json"
+            std::string interrupt_reason;                      // non-empty while the last turn is interrupted
             bool loaded = false;
+
+            // the interrupt state is a small file next to the transcript: a
+            // resumed session must still know its last turn was cut short,
+            // otherwise /reload could not pick it up after a restart
+            void load_interrupt()
+            {
+                std::ifstream f(interrupt_file);
+                if (!f)
+                    return;
+                std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                auto j = nlohmann::json::parse(text, nullptr, false);
+                if (j.is_object() && j.contains("reason") && j["reason"].is_string())
+                    interrupt_reason = j["reason"].get<std::string>();
+            }
+            void persist_interrupt()
+            {
+                // "" is the cleared state: the file stays behind but reads back
+                // as inactive, so there is exactly one write path (no unlink race
+                // against the background writer's pending writes)
+                async_io::submit(interrupt_file, interrupt_reason.empty()
+                                                      ? std::string()
+                                                      : nlohmann::json{{"reason", interrupt_reason}}.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+            }
 
         public:
             session() : session(cell::make_session_id()) {}
             session(const std::string &id)
-                : session_id(id), dir(cell::session_dir(session_id)), file(dir / "messages.jsonl")
+                : session_id(id), dir(cell::session_dir(session_id)), file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json")
             {
                 // a session folder may live under another cwd's group: the index
                 // maps the id prefix (the cwd key) back to the real directory
@@ -8664,6 +8691,7 @@ details{break-inside:avoid}
                     return;
                 }
                 loaded = true;
+                load_interrupt();
                 if (!std::filesystem::exists(file))
                 {
                     cell::sys::logger::instance().debug("sess", std::format("created id={} (no file on disk)", session_id));
@@ -8739,6 +8767,21 @@ details{break-inside:avoid}
             const std::filesystem::path &path() const { return file; }
             const std::filesystem::path &directory() const { return dir; }
             nlohmann::json &msg() { return messages; }
+            // an interrupted turn stays recoverable until the session sees the
+            // next user message or a /reload that reaches a natural end
+            const std::string &interrupt_state() const { return interrupt_reason; }
+            void set_interrupt(const std::string &reason)
+            {
+                interrupt_reason = reason;
+                persist_interrupt();
+            }
+            void clear_interrupt()
+            {
+                if (interrupt_reason.empty())
+                    return;
+                interrupt_reason.clear();
+                persist_interrupt();
+            }
             void append(const std::string &role, const nlohmann::json &content)
             {
                 messages.push_back({{"role", role}, {"content", content}});
@@ -8848,6 +8891,84 @@ details{break-inside:avoid}
                 }
             }
         }
+        // An interrupted stream is persisted exactly as it stands. Text and
+        // reasoning the model had already produced are kept verbatim — sse_feed
+        // only ever applies COMPLETE stream events, so the accumulated content
+        // always ends on the last token that fully arrived and needs no repair.
+        // A tool call that was still being emitted is dropped outright instead:
+        // its arguments are usually truncated JSON, it was never approved or
+        // executed, and leaving it in the transcript would make every provider
+        // reject the next request over an unanswered call. Returns the number of
+        // characters kept (0 = nothing replayable, so nothing is pushed).
+        static long long truncate_interrupted_reply(nlohmann::json &reply)
+        {
+            if (!reply.is_object())
+                return 0;
+            reply.erase("tool_calls"); // the call is cancelled, not answered
+            auto it = reply.find("content");
+            if (it == reply.end() || it->is_null())
+                return 0;
+            if (it->is_string())
+                return (long long)it->get_ref<const std::string &>().size();
+            if (!it->is_array())
+            {
+                reply.erase(it);
+                return 0;
+            }
+            nlohmann::json kept = nlohmann::json::array();
+            long long chars = 0;
+            for (auto &b : *it)
+            {
+                if (!b.is_object())
+                    continue;
+                const std::string type = b.value("type", "");
+                if (type == "tool_use" || type == "function_call")
+                    continue; // cancelled, never run
+                if (type == "thinking" && (!b.contains("signature") || !b["signature"].is_string() ||
+                                           b["signature"].get_ref<const std::string &>().empty()))
+                    continue; // interrupted mid-thinking: without its signature the block is not replayable
+                for (const char *k : {"text", "reasoning", "thinking"})
+                    if (b.contains(k) && b[k].is_string())
+                        chars += (long long)b[k].get_ref<const std::string &>().size();
+                kept.push_back(std::move(b));
+            }
+            if (kept.empty())
+            {
+                reply.erase(it); // moved-from blocks: drop the whole content
+                return 0;
+            }
+            *it = std::move(kept);
+            return chars;
+        }
+
+        // the system message that records WHY a turn stopped; it belongs to the
+        // transcript (not just the console) so /reload replays it verbatim
+        static std::string interrupt_notice(const std::string &reason)
+        {
+            return std::format(
+                "[cell] the previous assistant turn was interrupted ({}) at {} UTC. "
+                "Whatever the model had produced by then is above, truncated at the last token that fully arrived. "
+                "A tool call that was still being emitted was cancelled: it was never executed and produced no result, "
+                "so issue it again if it is still needed. Continue from where the turn stopped.",
+                reason, cell::utc_stamp());
+        }
+
+        // persist an interrupted turn: the partial reply (if any) followed by the
+        // system notice, plus the session state that lets /reload resume it
+        static void record_interrupt(session &sess, nlohmann::json &reply, const std::string &reason)
+        {
+            long long kept = truncate_interrupted_reply(reply);
+            if (kept > 0)
+            {
+                reply["role"] = "assistant";
+                sess.msg().push_back(std::move(reply));
+            }
+            sess.msg().push_back({{"role", "system"}, {"content", interrupt_notice(reason)}});
+            sess.set_interrupt(reason);
+            cell::sys::logger::instance().warn("llm", std::format("interrupted id={} reason={} partial_chars={}",
+                                                                  sess.id(), reason, kept));
+        }
+
         static std::string message_display_text(const nlohmann::json &message)
         {
             std::string role = message.value("role", "");
@@ -12473,6 +12594,7 @@ static void print_help()
     cell::sys::println("  /compact auto [on|off]      show or toggle automatic compaction after long runs (default on)");
     cell::sys::println("  /compact model provider:model  set the compression model (registered providers only; `inherit` resets it)");
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
+    cell::sys::println("  /reload                     resume the interrupted turn (partial reply + interrupt notice are already in the transcript)");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
     cell::sys::println("  /skill NAME                 load a skill into the session");
     cell::sys::println("  /teamworks                  list Teamwork jobs of the current session");
@@ -14720,6 +14842,74 @@ static int run_selftest()
         std::filesystem::remove_all(cell::session_dir(sid3), remec);
     }
 
+    // an interrupted turn: the partial reply survives (tool calls do not), a
+    // system notice records the reason, and the state lives until it is cleared
+    {
+        // truncation: reasoning + text are kept verbatim, a half-streamed tool
+        // call is dropped instead of being answered with a synthesised result
+        nlohmann::json r1 = {
+            {"role", "assistant"},
+            {"content", nlohmann::json::array({
+                            {{"type", "reasoning"}, {"reasoning", "think"}},
+                            {{"type", "text"}, {"text", "half an ans"}},
+                            {{"type", "tool_use"}, {"id", "c1"}, {"name", "ls"}, {"input", "{\"pa"}},
+                        })},
+            {"tool_calls", nlohmann::json::array({{{"id", "c1"}, {"type", "function"}}})}};
+        R.expect(cell::chat::truncate_interrupted_reply(r1) == 16 && !r1.contains("tool_calls") && r1["content"].size() == 2,
+                 "interrupted reply keeps reasoning + text and drops the pending tool call");
+        // a tool call with no text at all leaves nothing to replay
+        nlohmann::json r2 = {{"role", "assistant"},
+                             {"tool_calls", nlohmann::json::array({{{"id", "c2"}}})}};
+        R.expect(cell::chat::truncate_interrupted_reply(r2) == 0, "a reply with only tool calls keeps nothing");
+        // an unsigned thinking block (interrupted mid-thinking) is not replayable
+        nlohmann::json r3 = {{"role", "assistant"},
+                             {"content", nlohmann::json::array({
+                                             {{"type", "thinking"}, {"thinking", "unsig"}},
+                                             {{"type", "thinking"}, {"thinking", "sig"}, {"signature", "abc"}},
+                                             {{"type", "text"}, {"text", "tail"}},
+                                         })}};
+        R.expect(cell::chat::truncate_interrupted_reply(r3) == 7 && r3["content"].size() == 2,
+                 "unsigned thinking is dropped, signed thinking + text survive");
+        // the notice names the reason (it is what /reload replays)
+        R.expect(cell::chat::interrupt_notice("interrupted by the user (Esc)").find("interrupted by the user (Esc)") != std::string::npos,
+                 "interrupt notice carries the reason");
+
+        std::string sid5 = std::format("selftest-intr-{}", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        {
+            cell::chat::history hi;
+            hi.use(sid5);
+            auto &sx = hi.now();
+            sx.append("user", "do the thing");
+            nlohmann::json partial = {{"role", "assistant"},
+                                      {"content", "half"},
+                                      {"tool_calls", nlohmann::json::array({{{"id", "c3"}}})}};
+            cell::chat::record_interrupt(sx, partial, "interrupted by the user (Esc) during streaming");
+            R.expect(sx.msg().size() == 3 && sx.msg()[1].value("role", "") == "assistant" &&
+                         sx.msg()[2].value("role", "") == "system" && !sx.msg()[1].contains("tool_calls"),
+                     "record_interrupt appends the partial reply plus a system notice");
+            R.expect(sx.interrupt_state().find("Esc") != std::string::npos, "record_interrupt sets the session state");
+            sx.unload();
+            cell::async_io::flush(); // durability barrier: state + transcript write asynchronously
+        }
+        // the state outlives the process: a fresh session object reloads it
+        {
+            cell::chat::history hr;
+            hr.use(sid5);
+            R.expect(hr.now().interrupt_state().find("Esc") != std::string::npos, "interrupt state reloads from the session folder");
+            // a new user message is the other thing that clears it
+            hr.now().clear_interrupt();
+            hr.now().unload();
+            cell::async_io::flush();
+        }
+        {
+            cell::chat::history hc;
+            hc.use(sid5);
+            R.expect(hc.now().interrupt_state().empty(), "cleared interrupt state stays cleared after a reload");
+        }
+        std::error_code irsec;
+        std::filesystem::remove_all(cell::session_dir(sid5), irsec);
+    }
+
     // /export: transcript → self-contained HTML
     {
         std::string xerr;
@@ -16312,6 +16502,7 @@ int main(int argc, char const *argv[])
                         continue;
                     long long before = (long long)s->msg().size();
                     s->msg().clear();
+                    s->clear_interrupt(); // the transcript an interrupt could resume is gone
                     cell::box::reset_read_log(); // context gone: recorded reads no longer apply
                     // clear teamwork: remove all job directories and the store file
                     {
@@ -16359,6 +16550,22 @@ int main(int argc, char const *argv[])
                     input = std::move(ins_text);
                     log.info("ins", std::format("interject chars={}", input.size()));
                     goto llm_start;
+                }
+                if (cmd == "/reload")
+                {
+                    // resume an interrupted turn. The transcript already ends with
+                    // the partial reply (truncated at its last token) and the
+                    // system message that explains the interrupt, so sending it
+                    // again is the whole operation — nothing is injected.
+                    const std::string &reason = s->interrupt_state();
+                    if (reason.empty())
+                    {
+                        cell::sys::error("no interrupted turn to resume (the last turn ended normally or the state was already cleared)");
+                        continue;
+                    }
+                    log.info("cmd", std::format("reload id={} reason={}", s->id(), reason));
+                    cell::sys::println("[reload] resuming interrupted turn ({})", reason);
+                    goto llm_round;
                 }
                 if (cmd == "/provides")
                 {
@@ -17719,6 +17926,17 @@ int main(int argc, char const *argv[])
             inject_notices(false);
             s->msg().push_back({{"role", "user"}, {"content", input}});
             log.info("user", std::format("chars={} text={}", input.size(), input));
+            // a new user message supersedes an interrupted turn: it is no longer
+            // the last thing in the transcript, so there is nothing left to resume
+            if (!s->interrupt_state().empty())
+            {
+                log.info("llm", std::format("interrupt_cleared id={} why=new user input", s->id()));
+                s->clear_interrupt();
+            }
+        // /reload lands here too: the transcript already ends with the partial
+        // reply and the interrupt notice, so replaying it as-is is exactly
+        // "continue from where the turn stopped" — no user message is added
+        llm_round:
             cell::sys::print("reply> ");
 
             bool done = false;
@@ -17940,14 +18158,10 @@ int main(int argc, char const *argv[])
                         log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
                         cell::sys::println();
                         cell::sys::error("[cancelled]");
-                        if (reply_text_len(reply) > 0 || !tool_calls.empty())
-                        {
-                            s->msg().push_back(reply);
-                            // a cancelled turn leaves the assistant's tool_calls
-                            // unanswered, and every provider rejects that shape on
-                            // the next request: pair them before persisting
-                            cell::chat::repair_tool_pairing(s->msg());
-                        }
+                        // Ctrl+C prints nothing and exits through the signal hook;
+                        // this path (Esc) keeps the interrupted turn on disk
+                        cell::chat::record_interrupt(*s, reply, "interrupted by the user (Esc) during streaming");
+                        cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
                         done = true;
                         natural_end = false;
                         break;
@@ -17975,11 +18189,18 @@ int main(int argc, char const *argv[])
                     }
                     else
                     {
-                        // final attempt failed
+                        // final attempt failed: the reply assembled so far is kept
+                        // (do_chat assembles it even after an aborted transfer) and
+                        // the turn is recorded as interrupted, so the user can
+                        // /reload instead of retyping the request
                         double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
                         log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)s->msg().size(), final_sec, err.empty() ? "n/a" : err, kMaxRetries));
                         cell::sys::println();
                         cell::sys::error("[llm error after {} attempts] {}", kMaxRetries, err.empty() ? "request failed" : err);
+                        cell::chat::record_interrupt(*s, reply,
+                                                     std::format("LLM client error after {} attempts: {}", kMaxRetries,
+                                                                 trunc(err.empty() ? "request failed" : err, 300)));
+                        cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
                         done = true;
                         natural_end = false;
                         break;
@@ -18306,6 +18527,14 @@ int main(int argc, char const *argv[])
                 }
                 done = true;
                 cell::stats::add(s->id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(s->msg().size() - before));
+            }
+            // the turn reached its natural end: whatever a previous turn left
+            // behind is answered now, so the interrupt state is resolved (this is
+            // also what a successful /reload clears it with)
+            if (natural_end && !s->interrupt_state().empty())
+            {
+                log.info("llm", std::format("interrupt_cleared id={} why=turn completed", s->id()));
+                s->clear_interrupt();
             }
             // auto-compact after long agent runs: three or more tool calls or
             // thinking entries since the last user message, or a context that has
