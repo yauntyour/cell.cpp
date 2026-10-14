@@ -414,7 +414,8 @@ namespace cell
         // POSIX uses a single-threaded poll loop (no reader threads to join, no
         // 20 ms busy-wait); Windows keeps two readers but terminates the job
         // before joining them.
-        inline bool spawn_cmd(const std::string &cmd, double timeout_s, std::string &output, int &exit_code, std::string &stderr_output)
+        inline bool spawn_cmd(const std::string &cmd, double timeout_s, std::string &output, int &exit_code, std::string &stderr_output,
+                              const std::filesystem::path &cwd = {})
         {
             // the child inherits our stdout: anything still buffered must go out
             // first, or the child's output can overtake ours on screen
@@ -461,7 +462,9 @@ namespace cell
             std::string cmdline = "cmd.exe /c " + cmd;
             std::vector<char> buf(cmdline.begin(), cmdline.end());
             buf.push_back('\0');
-            if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            std::string cwd_s = cwd.empty() ? std::string() : cwd.string();
+            if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                                cwd_s.empty() ? nullptr : cwd_s.c_str(), &si, &pi))
             {
                 CloseHandle(hread_out);
                 CloseHandle(hwrite_out);
@@ -540,6 +543,8 @@ namespace cell
                 std::signal(SIGTERM, SIG_DFL);
                 std::signal(SIGHUP, SIG_DFL);
                 setpgid(0, 0); // own process group: the parent reaps the whole tree
+                if (!cwd.empty() && chdir(cwd.string().c_str()) != 0)
+                    _exit(127); // invalid working directory: never run the command
                 close(fds_out[0]);
                 close(fds_err[0]);
                 dup2(fds_out[1], STDOUT_FILENO);
@@ -1883,16 +1888,17 @@ namespace cell
         }
         return cached;
     }
-    // SHA-256 of normalized cwd, hex, truncated to 16 chars.
-    static std::string cwd_id()
+    // SHA-256 of a normalized directory string, hex, truncated to 16 chars.
+    static std::string cwd_key_of_norm(std::string s)
     {
-        static std::string cached_wd, cached_id;
-        std::string wd = workdir().string();
-        if (!cached_id.empty() && cached_wd == wd)
-            return cached_id;
-        std::string s = wd;
 #ifdef _WIN32
         lower_ascii(s);
+        // fold to the native separator style so "D:/x" and "D:\\x" always
+        // yield the same key (current_path() produces backslashes, and the
+        // keys of existing session groups were built from it)
+        for (char &c : s)
+            if (c == '/')
+                c = '\\';
 #endif
         static bool sodium_ready = false;
         if (!sodium_ready)
@@ -1904,10 +1910,185 @@ namespace cell
         for (size_t i = 0; i < crypto_hash_sha256_BYTES; i++)
             out += std::format("{:02x}", digest[i]);
         out.resize(16);
-        cached_wd = std::move(wd);
-        cached_id = out;
         return out;
     }
+    // SHA-256 of normalized cwd, hex, truncated to 16 chars.
+    static std::string cwd_id()
+    {
+        static std::string cached_wd, cached_id;
+        std::string wd = workdir().string();
+        if (!cached_id.empty() && cached_wd == wd)
+            return cached_id;
+        cached_wd = wd;
+        cached_id = cwd_key_of_norm(wd);
+        return cached_id;
+    }
+    // Key of an explicit directory, without touching the process-wide cache:
+    // the multi-workspace engine derives session groups from its own contexts.
+    static std::string cwd_id_of(const std::filesystem::path &dir)
+    {
+        std::error_code ec;
+        std::filesystem::path p = std::filesystem::absolute(dir, ec);
+        if (ec || p.empty())
+            p = dir;
+        p = p.lexically_normal();
+        // lexically_normal keeps a trailing separator when the last element is
+        // "." ("x/." -> "x/"), which current_path() never produces: strip it so
+        // both key sources agree on the same directory
+        std::string s = p.string();
+        while (s.size() > p.root_path().string().size() && (s.back() == '/' || s.back() == '\\'))
+            s.pop_back();
+        return cwd_key_of_norm(std::move(s));
+    }
+    // ---- the execution context of the calling thread ------------------------
+    // The CLI is single-workspace: its process working directory *is* the
+    // workspace, and every helper below falls back to it. A multi-workspace
+    // frontend (cell-app) installs an explicit context per engine / tool call
+    // instead, so path resolution, the sandbox boundary and the box-level
+    // caches never consult the process-wide state. Installed by
+    // exec_context_guard; empty members mean "fall back to the process cwd".
+    namespace box
+    {
+        struct context; // the per-context box state (read log / caches), defined in box
+    }
+    struct exec_context
+    {
+        std::filesystem::path cwd;         // workspace directory; empty = process cwd
+        std::string cwd_norm;              // normalized sandbox boundary; empty = workdir_norm()
+        box::context *box_state = nullptr; // null = the process-wide default
+    };
+    inline exec_context &default_exec_context()
+    {
+        static exec_context c;
+        return c;
+    }
+    inline exec_context *&tls_exec_context()
+    {
+        static thread_local exec_context *c = nullptr;
+        return c;
+    }
+    inline exec_context &current_exec_context()
+    {
+        exec_context *c = tls_exec_context();
+        return c ? *c : default_exec_context();
+    }
+    // Scoped installation for a turn / a tool call; restores the previous
+    // context on exit (nested calls included). An empty cwd plus a null box
+    // state leaves the ambient context untouched, which is the CLI's behaviour.
+    struct exec_context_guard
+    {
+        exec_context ctx;
+        exec_context *prev = nullptr;
+        bool active = false;
+        explicit exec_context_guard(const std::filesystem::path &cwd, box::context *bs)
+        {
+            if (cwd.empty() && !bs)
+                return;
+            ctx.cwd = cwd;
+            ctx.cwd_norm = cwd.empty() ? std::string() : normalize_path(cwd.string());
+            ctx.box_state = bs;
+            prev = tls_exec_context();
+            tls_exec_context() = &ctx;
+            active = true;
+        }
+        ~exec_context_guard()
+        {
+            if (active)
+                tls_exec_context() = prev;
+        }
+        exec_context_guard(const exec_context_guard &) = delete;
+        exec_context_guard &operator=(const exec_context_guard &) = delete;
+    };
+    // The workspace of the calling thread's context (or the process cwd).
+    static std::filesystem::path exec_cwd()
+    {
+        const exec_context &c = current_exec_context();
+        return c.cwd.empty() ? workdir() : c.cwd;
+    }
+    static const std::string &exec_cwd_norm()
+    {
+        const exec_context &c = current_exec_context();
+        return c.cwd_norm.empty() ? workdir_norm() : c.cwd_norm;
+    }
+    // cwd key of the calling thread's context (or the process cwd's key)
+    static std::string exec_cwd_id()
+    {
+        const exec_context &c = current_exec_context();
+        return c.cwd.empty() ? cwd_id() : cwd_id_of(c.cwd);
+    }
+    // =========================================================================
+    //  claims — cross-session file-edit claims ("first come, first served")
+    // =========================================================================
+    // A session's agent loop that edits a file claims it: a second concurrent
+    // session that tries to EDIT the same file is refused with a clear message
+    // instead of interleaving writes. Reads never claim and are never refused.
+    // A claim records its owning session (the conflict scope: a session's own
+    // teamwork children cooperate with it rather than fighting over files) and
+    // the concrete loop instance that took it (the release key: a turn releases
+    // its own claims at turn end, a teamwork job releases its own when the job
+    // attempt ends — however that attempt ends). Claims can therefore never
+    // outlive the agent loop that took them.
+    namespace claims
+    {
+        struct entry
+        {
+            std::string owner; // the session whose agent(s) hold the claim
+            std::string loop;  // the loop instance that took it (release key)
+        };
+        inline std::mutex &mx()
+        {
+            static std::mutex m;
+            return m;
+        }
+        inline std::unordered_map<std::string, entry> &map()
+        {
+            static std::unordered_map<std::string, entry> m;
+            return m;
+        }
+        // Refusal text when `path` is claimed by a session other than `owner`;
+        // empty when the path is free or held by the caller's own session.
+        inline std::string refusal(const std::string &path, const std::string &owner, const char *caller)
+        {
+            std::lock_guard lk(mx());
+            auto it = map().find(path);
+            if (it == map().end() || it->second.owner == owner)
+                return "";
+            return std::format("{} refused: '{}' is occupied by another session ({}) — concurrent sessions edit files "
+                               "first-come, first-served; retry after that session's agent loop ends (reads are unaffected)",
+                               caller, path, it->second.owner);
+        }
+        // Atomic check-and-claim: empty string = taken, otherwise the refusal
+        // (another session holds it). A session may re-take its own file.
+        inline std::string take(const std::string &path, const std::string &owner, const std::string &loop, const char *caller)
+        {
+            std::lock_guard lk(mx());
+            auto it = map().find(path);
+            if (it != map().end() && it->second.owner != owner)
+                return std::format("{} refused: '{}' is occupied by another session ({}) — concurrent sessions edit files "
+                                   "first-come, first-served; retry after that session's agent loop ends (reads are unaffected)",
+                                   caller, path, it->second.owner);
+            map()[path] = entry{owner, loop};
+            return "";
+        }
+        // Free every claim taken by the loop instance `loop` (its agent loop
+        // ended). Returns the number of claims released.
+        inline size_t release_loop(const std::string &loop)
+        {
+            std::lock_guard lk(mx());
+            size_t n = 0;
+            for (auto it = map().begin(); it != map().end();)
+            {
+                if (it->second.loop == loop)
+                {
+                    it = map().erase(it);
+                    n++;
+                }
+                else
+                    ++it;
+            }
+            return n;
+        }
+    } // namespace claims
     static std::string session_prefix(const std::string &session_id)
     {
         size_t d = session_id.find('-');
@@ -1951,7 +2132,7 @@ namespace cell
     // (the previous scheme) collided whenever two sessions were created inside the
     // same second — /new straight after /clear would even resurrect the id that
     // had just been forgotten, since the file on disk was never deleted.
-    static std::string make_session_id()
+    static std::string make_session_id(const std::string &cwd_key)
     {
         long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -1964,12 +2145,13 @@ namespace cell
         std::error_code ec;
         for (unsigned int n = 0;; n++)
         {
-            std::string id = n == 0 ? std::format("{}-{}-{:08x}", cwd_id(), ms, rnd)
-                                    : std::format("{}-{}-{:08x}-{}", cwd_id(), ms, rnd, n);
+            std::string id = n == 0 ? std::format("{}-{}-{:08x}", cwd_key, ms, rnd)
+                                    : std::format("{}-{}-{:08x}-{}", cwd_key, ms, rnd, n);
             if (!std::filesystem::exists(session_dir(id), ec))
                 return id;
         }
     }
+    static std::string make_session_id() { return make_session_id(cwd_id()); }
     // Session ids are generated by make_session_id (cwd hash + timestamp + hex)
     // and are turned into path components: nothing else may reach the filesystem.
     static bool is_valid_session_id(std::string_view sid)
@@ -2007,9 +2189,18 @@ namespace cell
         static std::filesystem::path r;
         return r;
     }
+    // guards the cache and its users: concurrent engine contexts may look up
+    // (and remember) cwd keys from different threads; recursive because
+    // remember_cwd() updates the cache through sessions_index()
+    static std::recursive_mutex &index_mx()
+    {
+        static std::recursive_mutex mx;
+        return mx;
+    }
     // Cached sessions index; invalidated by root changes.
     static const nlohmann::json &sessions_index()
     {
+        std::lock_guard<std::recursive_mutex> lk(index_mx());
         if (index_cache() && index_cache_root() == root)
             return *index_cache();
         nlohmann::json j = nlohmann::json::object();
@@ -2032,6 +2223,7 @@ namespace cell
     }
     static std::string cwd_for_key(const std::string &key)
     {
+        std::lock_guard<std::recursive_mutex> lk(index_mx());
         const nlohmann::json &j = sessions_index();
         auto it = j.find(key);
         if (it != j.end() && it->is_string())
@@ -2042,6 +2234,7 @@ namespace cell
     {
         if (key.empty() || path.empty())
             return;
+        std::lock_guard<std::recursive_mutex> lk(index_mx());
         std::error_code ec;
         std::filesystem::create_directories(root / "sessions", ec);
         // Ensure cache is loaded
@@ -2906,13 +3099,15 @@ namespace cell
             return "full-access";
         }
         // tool gating by kind lives in cell::tools (ToolKind / is_tool_allowed)
-        // check if a path is inside the current working directory (workspace)
+        // check if a path is inside the current working directory (workspace).
+        // The boundary comes from the calling thread's execution context (a
+        // multi-workspace engine's own root), falling back to the process cwd.
         static bool is_in_workspace(std::string_view path)
         {
             if (path.empty())
                 return true;
             std::string ps = cell::normalize_path(path);
-            const std::string &wd = cell::workdir_norm();
+            const std::string &wd = cell::exec_cwd_norm();
             if (wd.empty())
                 return true;
             if (ps.size() < wd.size() || ps.compare(0, wd.size(), wd) != 0)
@@ -4338,6 +4533,29 @@ namespace cell
             }
             return true;
         }
+        // Rewrite the path-bearing arguments of a parsed tool call so that the
+        // sandbox gates and the handler agree on one absolute path, resolved
+        // against the runtime's workspace instead of the process cwd. Only
+        // used by multi-workspace engines (the CLI's runtime.cwd is empty and
+        // callers skip this). Pattern fields (rg "pattern", find "name"...) are
+        // match expressions, never paths, and stay untouched.
+        inline void absolutize_path_args(nlohmann::json &args, const std::filesystem::path &cwd, const std::string &tool)
+        {
+            auto abs = [&](const std::string &p) -> std::string
+            {
+                std::filesystem::path fp(p);
+                if (fp.is_absolute())
+                    return p;
+                return (cwd / fp).lexically_normal().string();
+            };
+            for (const char *k : {"path", "dirpath"})
+                if (args.contains(k) && args[k].is_string() && !args[k].get_ref<const std::string &>().empty())
+                    args[k] = abs(args[k].get<std::string>());
+            // exec: an unspecified working directory means "the workspace"
+            if (tool == "exec" &&
+                (!args.contains("wd") || !args["wd"].is_string() || args["wd"].get_ref<const std::string &>().empty()))
+                args["wd"] = cwd.lexically_normal().string();
+        }
         bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code, std::string_view wd = "")
         {
             if (!check(cmd))
@@ -4349,22 +4567,19 @@ namespace cell
                 return false;
             }
             exit_code = 1;
-            // change to the working directory if specified
+            // run in the requested directory (explicit spawn cwd: no shell
+            // quoting involved, and an invalid directory fails the launch
+            // instead of silently skipping the command)
             std::string actual_cmd(cmd);
+            std::filesystem::path run_dir;
             if (!wd.empty())
             {
                 std::string wd_s = cell::normalize_path(wd);
                 if (!wd_s.empty())
-                {
-#ifdef _WIN32
-                    actual_cmd = std::format("cd /d \"{}\" && {}", wd_s, cmd);
-#else
-                    actual_cmd = std::format("cd \"{}\" && {}", wd_s, cmd);
-#endif
-                }
+                    run_dir = wd_s;
             }
             std::string stderr_output;
-            bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code, stderr_output);
+            bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code, stderr_output, run_dir);
             // spawn_cmd only fails to LAUNCH the process (pipe / CreateProcess /
             // fork error): a command that ran and exited non-zero is ok=true with
             // its real exit code. surface a reason, or the result degrades to a
@@ -4394,40 +4609,50 @@ namespace cell
         {
             size_t start = 0, end = 0; // 1-based inclusive
         };
-        static std::unordered_map<std::string, std::vector<read_range>> &read_log()
+        struct file_cache_entry
         {
-            static std::unordered_map<std::string, std::vector<read_range>> log;
-            return log;
+            std::string content;
+            std::filesystem::file_time_type mtime;
+            uintmax_t size = 0;
+        };
+        // ---- per-context box state ------------------------------------------
+        // The CLI keeps one process-wide instance; a multi-workspace engine
+        // installs its own through cell::exec_context_guard, so concurrent
+        // contexts never share a read log, a path memo or an edit cache.
+        struct context
+        {
+            std::unordered_map<std::string, std::vector<read_range>> read_log;
+            std::shared_mutex read_mx;
+            std::unordered_map<std::string, std::string> canon;
+            std::shared_mutex canon_mx;
+            std::unordered_map<std::string, file_cache_entry> files;
+            std::shared_mutex files_mx;
+        };
+        inline context &default_context()
+        {
+            static context c;
+            return c;
         }
-        static std::shared_mutex &read_log_mx()
+        inline context &current_context()
         {
-            static std::shared_mutex mx;
-            return mx;
+            context *c = cell::current_exec_context().box_state;
+            return c ? *c : default_context();
         }
         // canonical, case-insensitive (on Windows) path key for the read log;
         // weakly_canonical results are memoized per input path (hot path: every
         // read tool call and edit check canonicalizes the same paths repeatedly)
-        static std::unordered_map<std::string, std::string> &canon_cache()
-        {
-            static std::unordered_map<std::string, std::string> c;
-            return c;
-        }
-        static std::shared_mutex &canon_mx()
-        {
-            static std::shared_mutex mx;
-            return mx;
-        }
         static std::string read_log_key(std::string_view path)
         {
+            context &ctx = current_context();
             {
-                std::shared_lock lk(canon_mx());
-                if (auto it = canon_cache().find(std::string(path)); it != canon_cache().end())
+                std::shared_lock lk(ctx.canon_mx);
+                if (auto it = ctx.canon.find(std::string(path)); it != ctx.canon.end())
                     return it->second;
             }
             std::string s = cell::normalize_path(path);
             {
-                std::lock_guard lk(canon_mx());
-                canon_cache().emplace(std::string(path), s);
+                std::lock_guard lk(ctx.canon_mx);
+                ctx.canon.emplace(std::string(path), s);
             }
             return s;
         }
@@ -4435,23 +4660,28 @@ namespace cell
         // path was returned by a read tool call
         static void record_read(std::string_view path, size_t start, size_t end)
         {
-            std::lock_guard lk(read_log_mx());
-            read_log()[read_log_key(path)].push_back({start, end});
+            context &ctx = current_context();
+            std::lock_guard lk(ctx.read_mx);
+            ctx.read_log[read_log_key(path)].push_back({start, end});
         }
-        // forget every recorded read (session switched, cleared or compacted)
-        static void reset_read_log()
+        // forget every recorded read (session switched, cleared or compacted).
+        // `c` targets an explicit context (a multi-workspace frontend's own box
+        // state); null = the calling thread's current context.
+        static void reset_read_log(context *c = nullptr)
         {
-            std::lock_guard lk(read_log_mx());
-            read_log().clear();
+            context &ctx = c ? *c : current_context();
+            std::lock_guard lk(ctx.read_mx);
+            ctx.read_log.clear();
         }
         // true when the recorded reads of path jointly cover [start, end]
         static bool read_covers(std::string_view path, size_t start, size_t end)
         {
             std::vector<read_range> spans;
             {
-                std::shared_lock lk(read_log_mx());
-                auto it = read_log().find(read_log_key(path));
-                if (it == read_log().end())
+                context &ctx = current_context();
+                std::shared_lock lk(ctx.read_mx);
+                auto it = ctx.read_log.find(read_log_key(path));
+                if (it == ctx.read_log.end())
                     return false;
                 spans = it->second;
             }
@@ -4479,21 +4709,15 @@ namespace cell
         // each file's bytes are cached under its canonical key and validated by
         // (size, mtime) on every access: an external writer is always picked up,
         // while consecutive edits to the same file never re-read the disk.
-        struct file_cache_entry
-        {
-            std::string content;
-            std::filesystem::file_time_type mtime;
-            uintmax_t size = 0;
-        };
+        // (the entry type and its storage live in `context` above; these
+        // accessors keep every call site below unchanged)
         static std::unordered_map<std::string, file_cache_entry> &file_cache()
         {
-            static std::unordered_map<std::string, file_cache_entry> c;
-            return c;
+            return current_context().files;
         }
         static std::shared_mutex &file_cache_mx()
         {
-            static std::shared_mutex mx;
-            return mx;
+            return current_context().files_mx;
         }
         // Get file status (mtime, size, exists). Returns false on error.
         static bool file_stat(std::string_view path, std::filesystem::file_time_type &mtime, uintmax_t &size)
@@ -6476,7 +6700,10 @@ namespace cell
             }
             return s;
         }
-        bool save(settings &s)
+        // `track_active` writes the current session into active_sessions under
+        // the process cwd's key (the CLI's rule). A multi-workspace frontend
+        // passes false: it maintains one entry per context itself.
+        bool save(settings &s, bool track_active)
         {
             std::error_code ec;
             std::filesystem::create_directories(root, ec);
@@ -6499,7 +6726,7 @@ namespace cell
             j["teamwork_max_children"] = s.teamwork_max_children;
             j["log_max_lines"] = s.log_max_lines;
             j["thread_pool_size"] = s.max_threads;
-            if (!s.session_id.empty())
+            if (track_active && !s.session_id.empty())
                 s.active_sessions[cwd_id()] = s.session_id;
             j["active_sessions"] = s.active_sessions;
             // atomic replace: a crash mid-save can no longer truncate config.json.
@@ -6507,6 +6734,7 @@ namespace cell
             // would then persist an empty provider list over the real one.
             return plat::write_file_atomic(file(), j.dump(2));
         }
+        bool save(settings &s) { return save(s, true); }
     } // namespace config
     // =========================================================================
     //  encrypt — the credential vault: base64, secure_string (sodium_malloc
@@ -6949,6 +7177,7 @@ namespace cell
             sandbox,
             user,
             autoallow,
+            claim, // transient: the file is held by another session's agent loop
         };
         // What the sandbox mode gates on: the tool's own declaration of what it
         // does, instead of a hard-coded name list. ReadOnly allows Read + Notice
@@ -7008,6 +7237,18 @@ namespace cell
             // full request machinery for teamwork runs (tw run / run_bg): only
             // main can assemble it, so the tw tool reaches it through here
             std::function<teamwork::runtime_context()> team_rt;
+            // The workspace this runtime's tools operate in: relative path
+            // arguments resolve against it, and box_ctx carries the sandbox
+            // boundary plus the per-context box caches. Empty/null = the
+            // process working directory (the CLI's single-workspace behaviour).
+            std::filesystem::path cwd;
+            cell::box::context *box_ctx = nullptr;
+            // Cross-session edit claims (see cell::claims): the session that
+            // owns this call's edits (conflict scope) and the loop instance
+            // token that releases them when it ends. Unset callbacks = claims
+            // disabled (tests, direct box use); an empty returned owner = same.
+            std::function<std::string()> claim_owner;
+            std::function<std::string()> claim_loop;
         };
         class tool
         {
@@ -7260,13 +7501,55 @@ namespace cell
             {
                 blocked_.store(false, std::memory_order_relaxed);
                 rejected_for_.store(rejection_reason::none, std::memory_order_relaxed);
+                // install this runtime's execution context for the whole call:
+                // the sandbox gates, the handler and the box caches below must
+                // all see one workspace (no-op for the CLI's ambient context)
+                cell::exec_context_guard ctx_guard(rt.cwd, rt.box_ctx);
                 // parse the input JSON once and reuse across all sandbox checks
-                const nlohmann::json parsed = nlohmann::json::parse(input, nullptr, false);
+                nlohmann::json parsed = nlohmann::json::parse(input, nullptr, false);
+                // resolve relative path arguments against the engine's workspace
+                // so every consumer sees the same absolute path
+                if (!rt.cwd.empty() && parsed.is_object())
+                    box::absolutize_path_args(parsed, rt.cwd, name());
+                // cross-session edit claims: writing or editing a file that
+                // another session's agent loop is working on is refused with a
+                // clear message (first come, first served). Reads never claim;
+                // edit's read-only "query" mode is exempt too.
+                std::string claim_path, claim_owner, claim_loop;
+                const bool claimable = rt.claim_owner && parsed.is_object() &&
+                                       (name() == "write" || (name() == "edit" && parsed.value("mode", "replace") != "query"));
+                if (claimable)
+                {
+                    claim_owner = rt.claim_owner();
+                    claim_loop = rt.claim_loop ? rt.claim_loop() : std::string();
+                    if (!claim_owner.empty() && parsed.contains("path") && parsed["path"].is_string())
+                    {
+                        claim_path = cell::normalize_path(parsed["path"].get<std::string>());
+                        // cheap pre-check before any approval prompt is shown
+                        if (std::string refuse = cell::claims::refusal(claim_path, claim_owner, name().c_str()); !refuse.empty())
+                        {
+                            blocked_.store(true, std::memory_order_relaxed);
+                            rejected_for_.store(rejection_reason::claim, std::memory_order_relaxed);
+                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=claim path={}", name(), claim_path));
+                            return ToolOutput::fail(std::move(refuse));
+                        }
+                    }
+                }
                 ToolOutput output;
                 if (!check_action(rt, input, parsed, output))
                     return output;
                 if (parsed.is_discarded())
                     return ToolOutput::fail(std::format("[{}] invalid JSON arguments: {}", name(), input.size() > 200 ? input.substr(0, 200) + "..." : input));
+                // gates passed: take the claim (another loop may have claimed
+                // the file while this call waited for approval)
+                if (!claim_path.empty())
+                    if (std::string refuse = cell::claims::take(claim_path, claim_owner, claim_loop, name().c_str()); !refuse.empty())
+                    {
+                        blocked_.store(true, std::memory_order_relaxed);
+                        rejected_for_.store(rejection_reason::claim, std::memory_order_relaxed);
+                        cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=claim_race path={}", name(), claim_path));
+                        return ToolOutput::fail(std::move(refuse));
+                    }
                 return handler_(parsed, rt);
             }
         };
@@ -10452,13 +10735,22 @@ details{break-inside:avoid}
 
         public:
             session() : session(cell::make_session_id()) {}
-            session(const std::string &id)
+            session(const std::string &id) : session(id, workdir()) {}
+            // `fallback_cwd` is where the session lives when the id prefix has
+            // no index entry yet: the process cwd for the CLI, the context's
+            // workspace for a multi-workspace engine.
+            session(const std::string &id, const std::filesystem::path &fallback_cwd)
                 : session_id(id), dir(cell::session_dir(session_id)), file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json")
             {
                 // a session folder may live under another cwd's group: the index
                 // maps the id prefix (the cwd key) back to the real directory
                 std::string indexed = cell::cwd_for_key(cell::session_prefix(session_id));
-                cwd = indexed.empty() ? workdir().string() : indexed;
+                cwd = indexed.empty() ? fallback_cwd.string() : indexed;
+            }
+            // a fresh session id bound to an explicit cwd (multi-workspace)
+            static session fresh(const std::filesystem::path &cwd_dir, const std::string &cwd_key)
+            {
+                return session(cell::make_session_id(cwd_key), cwd_dir);
             }
             session(session &&) = default;
             session &operator=(session &&) = default;
@@ -10567,12 +10859,13 @@ details{break-inside:avoid}
             }
         };
 
-        // select the latest session folder in the current cwd group; used
-        // when active_sessions does not yet contain an entry for this directory
-        static std::string latest_session_id_for_cwd()
+        // select the latest session folder in a cwd group; used when
+        // active_sessions does not yet contain an entry for this directory.
+        // `cwd_key` defaults to the process cwd's group (the CLI's rule).
+        static std::string latest_session_id_for_cwd(const std::string &cwd_key = cell::cwd_id())
         {
             std::error_code ec;
-            std::filesystem::path dir = root / "sessions" / cwd_id();
+            std::filesystem::path dir = root / "sessions" / cwd_key;
             if (!std::filesystem::is_directory(dir, ec))
                 return "";
 
@@ -10965,16 +11258,29 @@ details{break-inside:avoid}
         private:
             std::unordered_map<std::string, session> session_list;
             std::string current = "current";
+            // fixed workspace for multi-workspace engines; unset = the process
+            // cwd is the workspace (the CLI's single-workspace behaviour)
+            std::optional<std::filesystem::path> cwd_;
+            cell::box::context *box_ctx_ = nullptr;
 
         public:
             history() = default;
+            explicit history(const std::filesystem::path &cwd) : cwd_(cwd) {}
+            // the workspace this history belongs to (process cwd when unset)
+            std::filesystem::path cwd() const { return cwd_ ? *cwd_ : workdir(); }
+            std::string cwd_key() const { return cwd_ ? cell::cwd_id_of(*cwd_) : cwd_id(); }
+            // the explicit workspace, when one was set (empty = process cwd)
+            std::filesystem::path explicit_cwd() const { return cwd_ ? *cwd_ : std::filesystem::path{}; }
+            // per-context box state, when the frontend installed one
+            cell::box::context *box_context() { return box_ctx_; }
+            void set_box_context(cell::box::context *c) { box_ctx_ = c; }
             session &now()
             {
                 auto it = session_list.find(current);
                 if (it == session_list.end())
                 {
                     cell::sys::logger::instance().debug("sess", std::format("map_miss creating={}", current));
-                    session s = (current == "current") ? session() : session(current);
+                    session s = (current == "current") ? session::fresh(cwd(), cwd_key()) : session(current, cwd());
                     it = session_list.emplace(current, std::move(s)).first;
                 }
                 else
@@ -10994,7 +11300,7 @@ details{break-inside:avoid}
             void use(const std::string &session_id)
             {
                 current = session_id;
-                box::reset_read_log(); // switching context: recorded reads no longer apply
+                box::reset_read_log(box_ctx_); // switching context: recorded reads no longer apply
             }
             // drop the in-memory session and reset to a fresh one; the on-disk file is kept
             void forget_current()
@@ -11003,7 +11309,7 @@ details{break-inside:avoid}
                 if (it != session_list.end())
                     session_list.erase(it);
                 current = "current";
-                box::reset_read_log(); // fresh context: recorded reads no longer apply
+                box::reset_read_log(box_ctx_); // fresh context: recorded reads no longer apply
             }
             void remove(const std::string &session_id)
             {
@@ -12083,7 +12389,7 @@ details{break-inside:avoid}
                         out.push_back(std::move(p));
                 }
             };
-            std::filesystem::path group = sessions / cwd_id();
+            std::filesystem::path group = sessions / cell::exec_cwd_id();
             scan_group(group);
             if (all_cwds)
             {
@@ -12663,7 +12969,7 @@ details{break-inside:avoid}
                 if (!normalize_job(input, job_id, max_children, job, err))
                     return false;
                 job["session_id"] = sid;
-                job["cwd"] = workdir().string();
+                job["cwd"] = cell::exec_cwd().string();
                 job["dir"] = job_directory(sid, job_id).string();
                 store["jobs"][job_id] = std::move(job);
                 return true; }))
@@ -12713,7 +13019,7 @@ details{break-inside:avoid}
                 return false;
             }
             normalized["session_id"] = jstr(*job, "session_id", sid);
-            normalized["cwd"] = jstr(*job, "cwd", workdir().string());
+            normalized["cwd"] = jstr(*job, "cwd", cell::exec_cwd().string());
             normalized["dir"] = (*job).contains("dir") ? (*job)["dir"] : nlohmann::json(job_directory(sid, job_id).string());
             normalized["created_at"] = jint(*job, "created_at", jint(normalized, "created_at", 0));
             normalized["status"] = jstr(*job, "status", "pending");
@@ -14247,7 +14553,7 @@ details{break-inside:avoid}
                 j["rounds"] = result.rounds;
                 j["tool_calls"] = result.tool_calls;
                 j["reused"] = result.reused;
-                j["cwd"] = jstr(job, "cwd", workdir().string());
+                j["cwd"] = jstr(job, "cwd", cell::exec_cwd().string());
                 j["created_at"] = jint(job, "created_at", 0);
                 j["messages"] = messages;
                 async_io::submit(session_file, j.dump()); // compact: written per round
@@ -14263,6 +14569,12 @@ details{break-inside:avoid}
                 std::string raw_path;
                 if (args.is_object() && args.contains("path") && args["path"].is_string())
                     raw_path = args["path"].get<std::string>();
+                // resolve against this worker's workspace before any use: the
+                // args reach this guard raw (argument rewriting happens only
+                // inside the tool's own execute()), and in a multi-workspace
+                // engine the process cwd is not the workspace
+                if (!raw_path.empty() && !std::filesystem::path(raw_path).is_absolute())
+                    raw_path = (cell::exec_cwd() / raw_path).lexically_normal().string();
                 // no path, or one the sandbox blocks: let the tool report it —
                 // the lease never records a path the sandbox would refuse anyway
                 if (raw_path.empty() || !box::check_path(raw_path))
@@ -14435,6 +14747,15 @@ details{break-inside:avoid}
                     worker_tools_rt.session_id = [run_sid]()
                     { return run_sid; };
                     worker_tools_rt.live_session = nullptr;
+                    // a child's edits belong to the job's owning session (the
+                    // parent and its other children cooperate rather than
+                    // fighting over files); the job attempt's loop releases
+                    // them when it ends (run_workflow_body)
+                    const std::string claim_job = jstr(job, "id");
+                    worker_tools_rt.claim_owner = [run_sid]() -> std::string
+                    { return run_sid; };
+                    worker_tools_rt.claim_loop = [claim_job]() -> std::string
+                    { return "teamwork " + claim_job; };
                 }
                 for (auto &call : tool_calls)
                 {
@@ -14521,6 +14842,11 @@ details{break-inside:avoid}
                                         size_t worker_index, runtime_context &rt,
                                         const std::filesystem::path &job_store)
         {
+            // workers run on pool threads: re-install the engine context so the
+            // file lease, the box caches and path resolution follow the job's
+            // workspace (no-op for the CLI's ambient context)
+            cell::exec_context_guard ctx_guard(rt.tools_rt ? rt.tools_rt->cwd : std::filesystem::path{},
+                                               rt.tools_rt ? rt.tools_rt->box_ctx : nullptr);
             worker_report r = run_worker_impl(job, worker, worker_index, rt, job_store);
             post_progress(job, r.name, "worker",
                           std::format("worker {} finished status={} ({} rounds, {} tool calls): {}",
@@ -14644,6 +14970,18 @@ details{break-inside:avoid}
                                              const nlohmann::json &job_snapshot, runtime_context &rt,
                                              size_t start_stage, std::string &out)
         {
+            // the children's edits claim files only while this attempt runs:
+            // release every claim the job's loop took when it returns, whatever
+            // the outcome (completed / waiting at a gate / stopped / failed)
+            struct claim_guard_t
+            {
+                std::string token;
+                ~claim_guard_t()
+                {
+                    if (size_t n = cell::claims::release_loop(token); n)
+                        cell::sys::logger::instance().debug("claims", std::format("released {} file claim(s) loop={}", n, token));
+                }
+            } claim_guard{"teamwork " + job_id};
             std::vector<stage_plan_entry> plan = stage_plan(job_snapshot);
             if (plan.empty())
             {
@@ -14971,6 +15309,11 @@ details{break-inside:avoid}
                 }
                 std::string report;
                 std::string status;
+                // re-install the job's engine context on this thread: path
+                // resolution, session lookup and box state must follow the
+                // job's workspace, not the ambient thread state
+                cell::exec_context_guard ctx_guard(job.rt.tools_rt ? job.rt.tools_rt->cwd : std::filesystem::path{},
+                                                   job.rt.tools_rt ? job.rt.tools_rt->box_ctx : nullptr);
                 try
                 {
                     status = run_workflow_body(job.job_id, job.store, job.snapshot, job.rt,
@@ -16662,6 +17005,153 @@ static int run_selftest()
     R.expect(cell::box::exec(slow_cmd, 2, cmd_out, rc) && rc == 124, "box::exec timeout kills and reports 124");
     R.expect(cell::box::remove("box_test.txt") && !cell::box::exist("box_test.txt"), "box::remove file");
     R.expect(cell::box::remove("box_dir/sub") && cell::box::remove("box_dir"), "box::remove dir");
+
+    // multi-workspace execution contexts (the cell-app WebUI runs several
+    // engines with different workspace directories in ONE process): tool
+    // calls carrying different runtimes must resolve paths, run exec, keep
+    // caches and enforce the read-only boundary per context, even concurrently
+    {
+        std::error_code wctx_ec;
+        std::filesystem::path wa = std::filesystem::absolute("ctx_ws_a", wctx_ec);
+        std::filesystem::path wb = std::filesystem::absolute("ctx_ws_b", wctx_ec);
+        std::filesystem::remove_all(wa, wctx_ec);
+        std::filesystem::remove_all(wb, wctx_ec);
+        std::filesystem::create_directories(wa, wctx_ec);
+        std::filesystem::create_directories(wb, wctx_ec);
+        {
+            std::ofstream fa(wa / "f.txt", std::ios::binary);
+            fa << "AAA\n";
+            std::ofstream fb(wb / "f.txt", std::ios::binary);
+            fb << "BBB\n";
+        }
+        R.expect(cell::cwd_id_of(wa) != cell::cwd_id_of(wb), "distinct workspaces yield distinct cwd keys");
+        R.expect(cell::cwd_id_of(wa) == cell::cwd_id_of(wa / "."), "cwd key ignores lexical noise");
+        R.expect(cell::exec_cwd() == cell::workdir(), "no context installed: exec_cwd falls back to the process cwd");
+        R.expect(cell::exec_cwd_id() == cell::cwd_id(), "no context installed: exec_cwd_id falls back to the process key");
+
+        cell::box::context cta, ctb;
+        auto [wtools, wdefs] = build_tools(false);
+        (void)wdefs;
+        cell::box::SandboxMode wsaved = cell::box::sandbox_mode();
+        cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+        std::atomic<int> wfails{0};
+        auto wprobe = [&](cell::box::context &bc, const std::filesystem::path &wd, const char *want)
+        {
+            cell::tools::runtime wrt;
+            wrt.cwd = wd;
+            wrt.box_ctx = &bc;
+            auto rd = wtools.at("read")->execute(wrt, R"({"path":"f.txt"})");
+            if (!rd.ok || rd.text.find(want) == std::string::npos)
+            {
+                wfails.fetch_add(1);
+                return;
+            }
+            auto wr = wtools.at("write")->execute(wrt, R"({"path":"w.txt","content":"x"})");
+            if (!wr.ok)
+                wfails.fetch_add(1);
+        };
+        std::thread wta([&]
+                        { wprobe(cta, wa, "AAA"); });
+        std::thread wtb([&]
+                        { wprobe(ctb, wb, "BBB"); });
+        wta.join();
+        wtb.join();
+        R.expect(wfails.load() == 0, "concurrent contexts read/write their own workspace files");
+        R.expect(cell::box::exist((wa / "w.txt").string()) && cell::box::exist((wb / "w.txt").string()),
+                 "concurrent writes land in the right directories");
+        R.expect(!cell::box::exist((std::filesystem::absolute(std::filesystem::path("w.txt"))).string()),
+                 "nothing leaks into the process cwd");
+        {
+            std::shared_lock lk1(cta.read_mx);
+            std::shared_lock lk2(ctb.read_mx);
+            R.expect(cta.read_log.size() == 1 && ctb.read_log.size() == 1,
+                     "read logs stay per-context (no cross-context bleeding)");
+        }
+        {
+            std::lock_guard lk1(cta.files_mx);
+            std::lock_guard lk2(ctb.files_mx);
+            R.expect(cta.files.size() == 1 && ctb.files.size() == 1, "edit file caches stay per-context");
+        }
+        R.expect(cta.canon.size() == ctb.canon.size() && cta.canon.size() >= 2,
+                 "canonical path memos stay per-context");
+
+        // exec defaults to the context's workspace directory (wd injection)
+        {
+            cell::tools::runtime wrt;
+            wrt.cwd = wa;
+            wrt.box_ctx = &cta;
+            wrt.approval_prompt = [](const std::string &, const std::string &, std::string &) -> bool
+            { return true; };
+#ifdef _WIN32
+            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"cd"})");
+#else
+            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"pwd"})");
+#endif
+            R.expect(run.ok && run.text.find("ctx_ws_a") != std::string::npos && run.text.find("exitcode=0") != std::string::npos,
+                     "exec defaults to the context workspace directory");
+        }
+
+        // the read-only boundary follows each context's own workspace
+        cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
+        {
+            cell::tools::runtime wrt;
+            wrt.cwd = wa;
+            wrt.box_ctx = &cta;
+            auto inside = wtools.at("read")->execute(wrt, R"({"path":"f.txt"})");
+            R.expect(inside.ok, "read-only allows a path inside the context workspace");
+            std::string outside_json = std::string("{\"path\":") + nlohmann::json((wb / "f.txt").string()).dump() + "}";
+            auto outside = wtools.at("read")->execute(wrt, outside_json);
+            R.expect(!outside.ok, "read-only blocks a sibling workspace path");
+        }
+        cell::box::sandbox_mode() = wsaved;
+
+        // cross-session edit claims: first come, first served; reads exempt;
+        // released exactly when the owning agent loop ends
+        {
+            cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+            cell::tools::runtime ra;
+            ra.cwd = wa;
+            ra.box_ctx = &cta;
+            ra.claim_owner = []() -> std::string
+            { return "sess-a"; };
+            ra.claim_loop = []() -> std::string
+            { return "loop-a"; };
+            cell::tools::runtime rb;
+            rb.cwd = wa; // same workspace: claims are cross-SESSION, not cross-workspace
+            rb.box_ctx = &ctb;
+            rb.claim_owner = []() -> std::string
+            { return "sess-b"; };
+            rb.claim_loop = []() -> std::string
+            { return "loop-b"; };
+            auto okw = wtools.at("write")->execute(ra, R"({"path":"claim.txt","content":"one\n"})");
+            R.expect(okw.ok, "claims: the owner writes (and claims) a new file");
+            auto okr = wtools.at("read")->execute(rb, R"({"path":"claim.txt"})");
+            R.expect(okr.ok && okr.text.find("one") != std::string::npos, "claims: reads by another session are not blocked");
+            auto refused = wtools.at("edit")->execute(rb, R"({"path":"claim.txt","mode":"append","content":"two\n"})");
+            R.expect(!refused.ok && refused.text.find("another session") != std::string::npos,
+                     "claims: a second session is refused with an occupancy message");
+            auto okr2 = wtools.at("read")->execute(ra, R"({"path":"claim.txt"})");
+            (void)okr2;
+            auto own = wtools.at("edit")->execute(ra, R"({"path":"claim.txt","mode":"append","content":"two\n"})");
+            R.expect(own.ok, "claims: the owning session may keep editing its file");
+            R.expect(cell::claims::release_loop("loop-a") == 1, "claims: the loop release frees its claim");
+            auto okr3 = wtools.at("read")->execute(rb, R"({"path":"claim.txt"})");
+            (void)okr3;
+            auto again = wtools.at("edit")->execute(rb, R"({"path":"claim.txt","mode":"append","content":"three\n"})");
+            R.expect(again.ok, "claims: after the release another session may edit the file");
+            cell::claims::release_loop("loop-b");
+            // edit's query mode is read-only: it neither claims nor is refused
+            auto q = wtools.at("edit")->execute(rb, R"({"path":"claim.txt","mode":"query","search":"one"})");
+            R.expect(q.ok, "claims: edit query runs");
+            R.expect(cell::claims::refusal(cell::normalize_path((wa / "claim.txt").string()), "sess-probe", "edit").empty(),
+                     "claims: query mode took no claim");
+            cell::box::sandbox_mode() = wsaved;
+        }
+
+        std::filesystem::remove_all(wa, wctx_ec);
+        std::filesystem::remove_all(wb, wctx_ec);
+    }
+
 
     // rg / find (glob is merged into find)
     R.expect(cell::box::mkdir("rg_dir"), "rg dir");
@@ -18987,6 +19477,10 @@ namespace cell
             std::function<void(std::string_view)> on_status;  // informational line (retry, compact, ...)
             std::function<void(std::string_view)> on_error;   // error line
             std::function<void(std::string_view)> on_notice;  // notice rendered + delivered to the session
+            // structured companion to on_notice: the raw record (id, from,
+            // topic, body, created_at), for frontends that render notices
+            // themselves (folding, grouping) instead of plain text
+            std::function<void(const cell::notice::message &)> on_notice_msg;
             std::function<void(const round_view &)> on_round_end;
             std::function<void(const tool_view &)> on_tool_begin; // about to execute
             std::function<void(const tool_view &)> on_tool_end;   // executed (echo + marker)
@@ -19375,6 +19869,17 @@ namespace cell
 
         void runner::install_runtime()
         {
+            // the engine's workspace: explicit for a multi-workspace context,
+            // empty for the CLI (tools then resolve against the process cwd)
+            tool_rt_.cwd = h_.explicit_cwd();
+            tool_rt_.box_ctx = h_.box_context();
+            // cross-session edit claims: this engine's edits belong to its
+            // current session, and the running turn's loop releases them when
+            // the turn ends (see run_turn's claim guard)
+            tool_rt_.claim_owner = [this]() -> std::string
+            { return h_.now().id(); };
+            tool_rt_.claim_loop = [this]() -> std::string
+            { return "session " + h_.now().id(); };
             tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action) -> std::string
             { return autoallow_check(tool, action); };
             tool_rt_.approval_required = [](const std::string &tool, const std::string &operation) -> bool
@@ -19503,6 +20008,8 @@ namespace cell
             }
             for (auto &m : got)
             {
+                if (ev.on_notice_msg)
+                    ev.on_notice_msg(m);
                 if (ev.on_notice)
                     ev.on_notice(cell::notice::render(m));
                 h_.now().msg().push_back({{"role", "system"},
@@ -19700,6 +20207,22 @@ namespace cell
                 std::atomic<const events *> &slot;
                 ~slot_guard() { slot.store(nullptr, std::memory_order_release); }
             } guard{current_events_};
+            // install the engine's execution context for the whole turn: every
+            // tool call, teamwork child and box-cache access below inherits the
+            // workspace of this engine (no-op for the CLI's ambient context)
+            cell::exec_context_guard ctx_guard(h_.explicit_cwd(), h_.box_context());
+            // cross-session edit claims taken by this turn release when the
+            // agent loop ends, whatever its exit path (natural end, cancel,
+            // error): a claim can never outlive its agent
+            struct claim_guard_t
+            {
+                std::string token;
+                ~claim_guard_t()
+                {
+                    if (size_t n = cell::claims::release_loop(token); n)
+                        cell::sys::logger::instance().debug("claims", std::format("released {} file claim(s) loop={}", n, token));
+                }
+            } claim_guard{"session " + h_.now().id()};
 
             if (!resume_turn)
             {
@@ -19828,7 +20351,7 @@ namespace cell
                         log.info("ctx", std::format("auto_compact_on_overflow ctx_msgs={} round={}", (long long)h_.now().msg().size(), rounds));
                         if (ev.on_status)
                             ev.on_status("[auto-compact on context overflow]");
-                        cell::box::reset_read_log();
+                        cell::box::reset_read_log(h_.box_context());
                         h_.now().unload();
                         cell::async_io::flush();
                         ui = stream_ui{};
@@ -20252,7 +20775,7 @@ namespace cell
                                                 turn_tool_calls, turn_thinking_entries, ctx_chars, (long long)h_.now().msg().size(), result));
                     if (ev.on_status)
                         ev.on_status(std::format("[auto-compact] {}", result));
-                    cell::box::reset_read_log();
+                    cell::box::reset_read_log(h_.box_context());
                 }
             }
             h_.now().unload();
@@ -21094,7 +21617,7 @@ int repl::run()
                  long long before = (long long)h.now().msg().size();
                  h.now().msg().clear();
                  h.now().clear_interrupt();   // the transcript an interrupt could resume is gone
-                 cell::box::reset_read_log(); // context gone: recorded reads no longer apply
+                 cell::box::reset_read_log(h.box_context()); // context gone: recorded reads no longer apply
                  // clear teamwork: remove all job directories and the store file
                  {
                      nlohmann::json store = cell::teamwork::load_store(h.now().id());
@@ -22052,7 +22575,7 @@ int repl::run()
                      return cmd_flow::handled;
                  }
                  cell::sys::println("{}", eng.compact_now(ev));
-                 cell::box::reset_read_log(); // compaction drops read tool results from context
+                 cell::box::reset_read_log(h.box_context()); // compaction drops read tool results from context
                  h.now().unload();
                  cell::async_io::flush();
                  cell::config::save(cfg);
