@@ -135,27 +135,21 @@ static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
 // Token-usage extraction from an OpenAI-style or Anthropic/Responses-style
 // `usage` object. Shared by cell::engine (per-round stats) and
 // teamwork::accumulate_usage (worker reports).
-static std::optional<long long> usage_in(const nlohmann::json &u)
+static std::optional<long long> usage_field(const nlohmann::json &u, std::initializer_list<const char *> keys)
 {
     if (u.is_object())
-    {
-        if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
-            return u["prompt_tokens"].get<long long>();
-        if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-            return u["input_tokens"].get<long long>();
-    }
+        for (const char *k : keys)
+            if (u.contains(k) && u[k].is_number_integer())
+                return u[k].get<long long>();
     return std::nullopt;
+}
+static std::optional<long long> usage_in(const nlohmann::json &u)
+{
+    return usage_field(u, {"prompt_tokens", "input_tokens"});
 }
 static std::optional<long long> usage_out(const nlohmann::json &u)
 {
-    if (u.is_object())
-    {
-        if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
-            return u["completion_tokens"].get<long long>();
-        if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
-            return u["output_tokens"].get<long long>();
-    }
-    return std::nullopt;
+    return usage_field(u, {"completion_tokens", "output_tokens"});
 }
 static std::optional<long long> usage_total(const nlohmann::json &u)
 {
@@ -168,6 +162,13 @@ static std::optional<long long> usage_total(const nlohmann::json &u)
             return *in + *out;
     }
     return std::nullopt;
+}
+
+// dump() with error_handler_t::replace, so one invalid UTF-8 byte in a tool
+// result can never throw out of a serialisation path (indent < 0 = compact)
+static std::string dump_safe(const nlohmann::json &j, int indent = -1)
+{
+    return j.dump(indent, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 static const char *__base64_basechars__ = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2903,27 +2904,20 @@ namespace cell
 
         static std::string get_audio_format(const std::string &media_type)
         {
-            if (media_type == "audio/mpeg")
-                return "mp3";
-            if (media_type == "audio/wav")
-                return "wav";
-            if (media_type == "audio/ogg")
-                return "ogg";
-            if (media_type == "audio/flac")
-                return "flac";
-            if (media_type == "audio/aac")
-                return "aac";
-            if (media_type == "audio/mp4")
-                return "m4a";
-            if (media_type == "audio/x-ms-wma")
-                return "wma";
-            if (media_type == "audio/opus")
-                return "opus";
-            if (media_type == "audio/aiff")
-                return "aiff";
-            if (media_type == "audio/midi")
-                return "midi";
-            return "mp3";
+            static const std::unordered_map<std::string, std::string> formats = {
+                {"audio/mpeg", "mp3"},
+                {"audio/wav", "wav"},
+                {"audio/ogg", "ogg"},
+                {"audio/flac", "flac"},
+                {"audio/aac", "aac"},
+                {"audio/mp4", "m4a"},
+                {"audio/x-ms-wma", "wma"},
+                {"audio/opus", "opus"},
+                {"audio/aiff", "aiff"},
+                {"audio/midi", "midi"},
+            };
+            auto it = formats.find(media_type);
+            return it != formats.end() ? it->second : "mp3";
         }
 
         // =====================================================================
@@ -3320,6 +3314,11 @@ namespace cell
             return entry;
         }
         // -------- output hardening --------
+        // the truncation notice both cap helpers append
+        static std::string cap_marker(size_t max_bytes)
+        {
+            return std::format("\n[cell: output truncated: exceeded {} bytes]\n", max_bytes);
+        }
         // prompt-injection neutraliser for any tool output fed back to the LLM.
         // Flags command-override fingerprints line-by-line and redacts the offending
         // lines; also caps the size so one result cannot blow up the context window.
@@ -3335,7 +3334,7 @@ namespace cell
             if (raw.size() > max_bytes)
             {
                 storage = raw.substr(0, max_bytes); // single bounded copy
-                storage += std::format("\n[cell: output truncated: exceeded {} bytes]\n", max_bytes);
+                storage += cap_marker(max_bytes);
                 out = storage; // view after the append: no dangling on realloc
             }
             static constexpr std::string_view fingerprints[] = {
@@ -3806,7 +3805,7 @@ namespace cell
             {
                 std::string out = raw;
                 out.resize(max_bytes);
-                out += std::format("\n[cell: output truncated: exceeded {} bytes]\n", max_bytes);
+                out += cap_marker(max_bytes);
                 return out;
             }
             return raw;
@@ -6442,6 +6441,18 @@ namespace cell
 #endif
         }
     } // namespace sys
+    // RAII: release every cross-session file claim taken under `token` when the
+    // scope exits, whatever the exit path (natural end, cancel, error). Shared
+    // by an agent turn and a teamwork run — a claim never outlives its loop.
+    struct claim_loop_guard
+    {
+        std::string token;
+        ~claim_loop_guard()
+        {
+            if (size_t n = cell::claims::release_loop(token); n)
+                cell::sys::logger::instance().debug("claims", std::format("released {} file claim(s) loop={}", n, token));
+        }
+    };
     // =========================================================================
     //  config — the provider registry and persisted settings, including
     //  on-the-fly migration of legacy config shapes.
@@ -7169,6 +7180,19 @@ namespace cell
                 return true;
             }
 
+            // store one entry; overwrite=false refuses an existing key
+            bool put(const std::string &map_key, const std::string &raw_value, bool overwrite)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (!overwrite && vault.find(map_key) != vault.end())
+                    return false;
+                nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
+                if (!e.is_object())
+                    return false;
+                vault[map_key] = std::move(e);
+                return save();
+            }
+
         public:
             crypt()
             {
@@ -7213,14 +7237,7 @@ namespace cell
             }
             bool add(const std::string &map_key, const std::string &raw_value)
             {
-                std::lock_guard<std::mutex> lk(mx);
-                if (vault.find(map_key) != vault.end())
-                    return false;
-                nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
-                if (!e.is_object())
-                    return false;
-                vault[map_key] = e;
-                return save();
+                return put(map_key, raw_value, false);
             }
             size_t remove(const std::string &map_key)
             {
@@ -7238,12 +7255,7 @@ namespace cell
             // add or overwrite an existing entry
             bool set(const std::string &map_key, const std::string &raw_value)
             {
-                std::lock_guard<std::mutex> lk(mx);
-                nlohmann::json e = encrypt(raw_value.data(), raw_value.size());
-                if (!e.is_object())
-                    return false;
-                vault[map_key] = e;
-                return save();
+                return put(map_key, raw_value, true);
             }
             bool set(const std::string &map_key, const secure_string &raw_value)
             {
@@ -7765,6 +7777,14 @@ namespace cell
                 }
             }
         }
+        // text of one content value (string or text blocks) without the JSON
+        // fallback: only real text counts (reply extraction, summaries)
+        static std::string content_text(const nlohmann::json &content)
+        {
+            std::string text;
+            append_content_text(content, text);
+            return text;
+        }
         // Returns true if the content array contains multimodal blocks
         // (image_url, input_image, input_audio, audio, etc.) that must not be
         // flattened to text by sanitize_messages.
@@ -7786,12 +7806,11 @@ namespace cell
         }
         static std::string string_content(const nlohmann::json &content)
         {
-            std::string text;
-            append_content_text(content, text);
+            std::string text = content_text(content);
             if (text.empty() && !content.is_null())
             {
                 // Preserve JSON payloads rather than silently dropping them.
-                text = content.dump();
+                text = dump_safe(content);
             }
             return text;
         }
@@ -7830,6 +7849,66 @@ namespace cell
             return ok;
         }
 
+        // -------- shared client plumbing --------
+        // The auth line on its own; the caller's copy is wiped after the
+        // request (see post_json / stream_post / finish_stream).
+        static std::string bearer_header(const encrypt::secure_string &api_key)
+        {
+            std::string auth = "Authorization: Bearer ";
+            auth.append(api_key.data(), api_key.size());
+            return auth;
+        }
+        // x-api-key line (the native Anthropic surface)
+        static std::string xapi_key_header(const encrypt::secure_string &api_key)
+        {
+            std::string auth = "x-api-key: ";
+            auth.append(api_key.data(), api_key.size());
+            return auth;
+        }
+        // Auth headers for the OpenAI-style clients
+        static std::vector<std::string> bearer_headers(const encrypt::secure_string &api_key)
+        {
+            return {"Content-Type: application/json", bearer_header(api_key)};
+        }
+        // x-api-key style headers (the native Anthropic surface)
+        static std::vector<std::string> api_key_headers(const encrypt::secure_string &api_key)
+        {
+            return {"Content-Type: application/json", xapi_key_header(api_key), "anthropic-version: 2023-06-01"};
+        }
+        // non-streaming counterpart of the finish_stream epilogue: POST a JSON
+        // body with `hdrs`, then wipe the header copies that carried the key
+        static bool post_json(CURL *curl, const std::string &url, const std::string &proxy,
+                              std::vector<std::string> &hdrs, const nlohmann::json &payload,
+                              std::string &buf, std::string &err, long *http_status)
+        {
+            bool ok = net::CURL_post(curl, url.c_str(), dump_safe(payload), buf, hdrs, &err, proxy.c_str(), http_status);
+            for (auto &h : hdrs)
+                encrypt::wipe(h);
+            return ok;
+        }
+        // streaming counterpart: CURL_stream_post followed by the finish_stream
+        // epilogue (wipe, status, HTTP/mid-stream failure -> err)
+        static bool stream_post(CURL *curl, const std::string &url, const std::string &proxy,
+                                std::vector<std::string> &hdrs, const nlohmann::json &payload,
+                                net::StreamCallback cb, net::XferCallback on_xfer, void *xfer_data,
+                                long *http_status, std::string &sse_buf, size_t &sse_base,
+                                std::string &stream_err, std::string &err)
+        {
+            long http = 0;
+            bool ok = net::CURL_stream_post(curl, url.c_str(), dump_safe(payload), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy.c_str());
+            return finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
+        }
+        // persisted reply content: streamed reasoning and answer text as blocks
+        static nlohmann::json reasoning_content_array(const std::string &text, const std::string &reasoning)
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            if (!reasoning.empty())
+                arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
+            if (!text.empty())
+                arr.push_back({{"type", "text"}, {"text", text}});
+            return arr;
+        }
+
         class OpenAI
         {
         private:
@@ -7837,12 +7916,6 @@ namespace cell
             std::string proxy_;
             CURL *curl = curl_easy_init();
 
-            static std::vector<std::string> headers(const encrypt::secure_string &api_key)
-            {
-                std::string auth = "Authorization: Bearer ";
-                auth.append(api_key.data(), api_key.size());
-                return {"Content-Type: application/json", std::move(auth)};
-            }
             // Flatten our internal transcript into the subset that all
             // OpenAI-compatible Chat Completions providers accept. In particular,
             // assistant reasoning arrays and Anthropic-style tool_result parts are
@@ -8001,11 +8074,8 @@ namespace cell
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
-                std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (!ok)
+                std::vector<std::string> hdrs = bearer_headers(api_key);
+                if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false), buf, err, http_status))
                     return false;
                 try
                 {
@@ -8098,24 +8168,15 @@ namespace cell
                     };
                     sse_feed(sse_buf, sse_base, data, handle);
                 };
-                std::vector<std::string> hdrs = headers(api_key);
-                long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
+                std::vector<std::string> hdrs = bearer_headers(api_key);
+                bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 if (text.empty() && reasoning.empty())
                     reply["content"] = nullptr;
                 else if (!reasoning.empty())
-                {
                     // store reasoning_content in reply for session persistence
-                    nlohmann::json arr = nlohmann::json::array();
-                    if (!reasoning.empty())
-                        arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
-                    if (!text.empty())
-                        arr.push_back({{"type", "text"}, {"text", text}});
-                    reply["content"] = std::move(arr);
-                }
+                    reply["content"] = reasoning_content_array(text, reasoning);
                 else
                     reply["content"] = text;
                 if (!tool_calls.empty())
@@ -8134,13 +8195,6 @@ namespace cell
             const std::string api_base;
             std::string proxy_;
             CURL *curl = curl_easy_init();
-
-            static std::vector<std::string> headers(const encrypt::secure_string &api_key)
-            {
-                std::string auth = "Authorization: Bearer ";
-                auth.append(api_key.data(), api_key.size());
-                return {"Content-Type: application/json", std::move(auth)};
-            }
 
             // convert Chat Completions messages to Responses API input items + extract instructions
             static std::pair<nlohmann::json, std::string> convert_input(const nlohmann::json &messages)
@@ -8416,11 +8470,8 @@ namespace cell
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/responses";
-                std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (!ok)
+                std::vector<std::string> hdrs = bearer_headers(api_key);
+                if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false), buf, err, http_status))
                     return false;
                 try
                 {
@@ -8578,10 +8629,8 @@ namespace cell
                     };
                     sse_feed(sse_buf, sse_base, data, handle);
                 };
-                std::vector<std::string> hdrs = headers(api_key);
-                long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
+                std::vector<std::string> hdrs = bearer_headers(api_key);
+                bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply in Chat Completions-compatible format
                 reply["role"] = "assistant";
                 // when the model produced tool calls, content must be null (per the
@@ -8592,26 +8641,13 @@ namespace cell
                     // path keeps the text; dropping it here made the two styles
                     // disagree and silently threw away content the model produced.
                     if (!reasoning.empty() || !text.empty())
-                    {
-                        nlohmann::json arr = nlohmann::json::array();
-                        if (!reasoning.empty())
-                            arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
-                        if (!text.empty())
-                            arr.push_back({{"type", "text"}, {"text", text}});
-                        reply["content"] = std::move(arr);
-                    }
+                        reply["content"] = reasoning_content_array(text, reasoning);
                     else
                         reply["content"] = nullptr;
                 }
                 else if (!reasoning.empty())
-                {
                     // store reasoning_content in reply for session persistence
-                    nlohmann::json arr = nlohmann::json::array();
-                    arr.push_back({{"type", "reasoning"}, {"reasoning", reasoning}});
-                    if (!text.empty())
-                        arr.push_back({{"type", "text"}, {"text", text}});
-                    reply["content"] = std::move(arr);
-                }
+                    reply["content"] = reasoning_content_array(text, reasoning);
                 else if (text.empty())
                     reply["content"] = nullptr;
                 else
@@ -8650,13 +8686,6 @@ namespace cell
             const std::string api_base;
             CURL *curl = curl_easy_init();
             std::string proxy_;
-
-            static std::vector<std::string> headers(const encrypt::secure_string &api_key)
-            {
-                std::string auth = "x-api-key: ";
-                auth.append(api_key.data(), api_key.size());
-                return {"Content-Type: application/json", std::move(auth), "anthropic-version: 2023-06-01"};
-            }
 
         public:
             static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream, int think_level = 0)
@@ -8838,11 +8867,8 @@ namespace cell
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
-                std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (!ok)
+                std::vector<std::string> hdrs = api_key_headers(api_key);
+                if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false, think_level), buf, err, http_status))
                     return false;
                 try
                 {
@@ -8961,10 +8987,8 @@ namespace cell
                     };
                     sse_feed(sse_buf, sse_base, data, handle);
                 };
-                std::vector<std::string> hdrs = headers(api_key);
-                long http = 0;
-                bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
+                std::vector<std::string> hdrs = api_key_headers(api_key);
+                bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true, think_level), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 reply["content"] = nlohmann::json::array();
@@ -9023,7 +9047,7 @@ namespace cell
                 {
                     // strict dump() throws type_error.316 on a non-UTF-8 byte and
                     // would take the whole turn (and the transcript write) with it
-                    out += m.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                    out += dump_safe(m);
                     out.push_back('\n');
                 }
             return out;
@@ -9529,13 +9553,13 @@ namespace cell
                              b.contains("text") && b["text"].is_string())
                         out += b["text"].get<std::string>();
                     else if (!b.is_null())
-                        out += b.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                        out += dump_safe(b);
                     out.push_back('\n');
                 }
                 return out;
             }
             if (!content.is_null())
-                return content.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                return dump_safe(content);
             return "";
         }
 
@@ -9625,7 +9649,7 @@ namespace cell
                             if (fn["arguments"].is_string())
                                 args = fn["arguments"].get<std::string>();
                             else
-                                args = fn["arguments"].dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+                                args = dump_safe(fn["arguments"], 2);
                         }
                         calls += "<details class=\"toolcall\"><summary>tool call: ";
                         calls += html_escape(name.empty() ? "?" : name);
@@ -9685,7 +9709,7 @@ namespace cell
                 else
                 {
                     out += "<pre class=\"code\">";
-                    out += html_escape(b.dump(2, ' ', false, nlohmann::json::error_handler_t::replace));
+                    out += html_escape(dump_safe(b, 2));
                     out += "</pre>";
                 }
             }
@@ -10776,7 +10800,7 @@ details{break-inside:avoid}
                 // against the background writer's pending writes)
                 async_io::submit(interrupt_file, interrupt_reason.empty()
                                                      ? std::string()
-                                                     : nlohmann::json{{"reason", interrupt_reason}}.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+                                                     : dump_safe(nlohmann::json{{"reason", interrupt_reason}}));
             }
 
         public:
@@ -11105,14 +11129,7 @@ details{break-inside:avoid}
             {
                 std::string text;
                 if (auto c = msgs[idx].find("content"); c != msgs[idx].end())
-                {
-                    if (c->is_string())
-                        text = c->get<std::string>();
-                    else if (c->is_array())
-                        for (auto &b : *c)
-                            if (b.is_object() && b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
-                                text += b["text"].get<std::string>();
-                }
+                    text = llm::content_text(*c);
                 if (text.empty())
                     continue;
                 if (!merged.empty())
@@ -11204,7 +11221,7 @@ details{break-inside:avoid}
                     else if (bt == "text" && b.contains("text") && b["text"].is_string())
                         conv_body += b["text"].get_ref<const std::string &>();
                     else if (bt == "tool_use" || bt == "tool_result" || b.contains("text") || b.contains("input") || b.contains("content"))
-                        conv_body += b.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+                        conv_body += dump_safe(b) + "\n";
                 }
                 bool conv_truncated = conv_body.size() > 400;
                 conv_body = cell::text::utf8_safe(conv_body, 400);
@@ -11898,6 +11915,18 @@ details{break-inside:avoid}
             return peek(sid).size();
         }
 
+        // non-empty lines of a JSONL audit file; callers rewrite the file afterwards
+        static std::vector<std::string> read_lines(const std::filesystem::path &p)
+        {
+            std::vector<std::string> lines;
+            std::ifstream in(p);
+            std::string ln;
+            while (std::getline(in, ln))
+                if (!ln.empty())
+                    lines.push_back(std::move(ln));
+            return lines;
+        }
+
         // delivered notices land in seen.jsonl (one JSON per line) as an audit
         // trail; the file is trimmed to its tail once it grows past the cap.
         // Returns false when the line cannot be archived: delivery outranks the
@@ -11921,13 +11950,7 @@ details{break-inside:avoid}
                 auto size = std::filesystem::file_size(p, sec);
                 if (!sec && size > kSeenCapBytes)
                 {
-                    std::vector<std::string> lines;
-                    std::ifstream in(p);
-                    std::string ln;
-                    while (std::getline(in, ln))
-                        if (!ln.empty())
-                            lines.push_back(std::move(ln));
-                    in.close();
+                    std::vector<std::string> lines = read_lines(p);
                     std::string tail;
                     size_t start = lines.size() > kSeenKeepLines ? lines.size() - kSeenKeepLines : 0;
                     for (size_t i = start; i < lines.size(); i++)
@@ -12053,13 +12076,7 @@ details{break-inside:avoid}
             std::filesystem::path p = seen_path(target);
             if (!std::filesystem::exists(p, ec))
                 return 0;
-            std::vector<std::string> lines;
-            std::ifstream in(p);
-            std::string ln;
-            while (std::getline(in, ln))
-                if (!ln.empty())
-                    lines.push_back(std::move(ln));
-            in.close();
+            std::vector<std::string> lines = read_lines(p);
             std::string kept;
             size_t removed = 0;
             for (auto &l : lines)
@@ -12666,6 +12683,14 @@ details{break-inside:avoid}
             }
             return true;
         }
+        // open + reload in one step: the preamble of every job-mutating command
+        static bool load_job(const std::string &job_id, const std::string &sid, job_ref &ref,
+                             nlohmann::json &store, nlohmann::json *&job, std::string &out)
+        {
+            if (!open_job(job_id, sid, ref, out))
+                return false;
+            return reload_job(ref.store, job_id, store, job, out);
+        }
 
         // ---- worker spec normalization --------------------------------------
         static bool normalize_worker_item(const nlohmann::json &item, const std::string &default_name,
@@ -12805,6 +12830,31 @@ details{break-inside:avoid}
             std::vector<size_t> workers; // indexes into job["list"]
         };
 
+        // stage-level provider/model/think defaults, inherited by every agent of
+        // the stage that does not set its own; grant defaults fill missing keys
+        static nlohmann::json stage_defaults_of(const nlohmann::json &st, const nlohmann::json &grant_defaults)
+        {
+            nlohmann::json out = nlohmann::json::object();
+            for (const char *key : {"provider", "model"})
+                if (st.contains(key) && !jstr(st, key).empty())
+                    out[key] = jstr(st, key);
+            if (st.contains("think") && !st["think"].is_null())
+                out["think"] = st["think"];
+            for (auto &[k, v] : grant_defaults.items())
+                if (!out.contains(k))
+                    out[k] = v;
+            return out;
+        }
+        // a worker entry with every key it does not set filled from `defaults`
+        static nlohmann::json merged_with_defaults(const nlohmann::json &item, const nlohmann::json &defaults)
+        {
+            nlohmann::json merged = item.is_object() ? item : nlohmann::json::object();
+            for (auto &[k, v] : defaults.items())
+                if (!merged.contains(k))
+                    merged[k] = v;
+            return merged;
+        }
+
         static bool normalize_job(const nlohmann::json &input, const std::string &job_id,
                                   size_t max_children, nlohmann::json &out, std::string &err)
         {
@@ -12878,22 +12928,11 @@ details{break-inside:avoid}
                     stage_out["workers"] = nlohmann::json::array();
                     // stage-level provider/model/think defaults, inherited by
                     // every agent of this stage that does not set its own
-                    nlohmann::json stage_defaults = nlohmann::json::object();
-                    for (const char *key : {"provider", "model"})
-                        if (st.contains(key) && !jstr(st, key).empty())
-                            stage_defaults[key] = jstr(st, key);
-                    if (st.contains("think") && !st["think"].is_null())
-                        stage_defaults["think"] = st["think"];
-                    for (auto &[k, v] : grant_defaults.items())
-                        if (!stage_defaults.contains(k))
-                            stage_defaults[k] = v;
+                    nlohmann::json stage_defaults = stage_defaults_of(st, grant_defaults);
                     size_t agent_index = 0;
                     for (auto &item : *agents)
                     {
-                        nlohmann::json merged = item.is_object() ? item : nlohmann::json::object();
-                        for (auto &[k, v] : stage_defaults.items())
-                            if (!merged.contains(k))
-                                merged[k] = v;
+                        nlohmann::json merged = merged_with_defaults(item, stage_defaults);
                         nlohmann::json worker;
                         if (!normalize_worker_item(merged, std::format("worker_{}", flat_counter), worker, err))
                         {
@@ -12986,21 +13025,10 @@ details{break-inside:avoid}
                 size_t stage_index = 0;
                 for (auto &st : input["workflow"]["stages"])
                 {
-                    nlohmann::json stage_defaults = nlohmann::json::object();
-                    for (const char *key : {"provider", "model"})
-                        if (st.contains(key) && !jstr(st, key).empty())
-                            stage_defaults[key] = jstr(st, key);
-                    if (st.contains("think") && !st["think"].is_null())
-                        stage_defaults["think"] = st["think"];
-                    for (auto &[k, v] : grant_defaults.items())
-                        if (!stage_defaults.contains(k))
-                            stage_defaults[k] = v;
+                    nlohmann::json stage_defaults = stage_defaults_of(st, grant_defaults);
                     for (auto &item : st["agents"])
                     {
-                        nlohmann::json merged = item.is_object() ? item : nlohmann::json::object();
-                        for (auto &[k, v] : stage_defaults.items())
-                            if (!merged.contains(k))
-                                merged[k] = v;
+                        nlohmann::json merged = merged_with_defaults(item, stage_defaults);
                         nlohmann::json worker;
                         if (!normalize_worker_item(merged, std::format("worker_{}", flat_index), worker, err))
                         {
@@ -13209,11 +13237,9 @@ details{break-inside:avoid}
                              size_t max_children, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!open_job(job_id, sid, ref, out))
-                return false;
             nlohmann::json store;
             nlohmann::json *job = nullptr;
-            if (!reload_job(ref.store, job_id, store, job, out))
+            if (!load_job(job_id, sid, ref, store, job, out))
                 return false;
             std::string job_status = jstr(*job, "status", "pending");
             if (job_status == "completed")
@@ -13268,11 +13294,9 @@ details{break-inside:avoid}
         static bool remove_job(const std::string &job_id, bool agent_initiated, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!open_job(job_id, sid, ref, out))
-                return false;
             nlohmann::json store;
             nlohmann::json *job = nullptr;
-            if (!reload_job(ref.store, job_id, store, job, out))
+            if (!load_job(job_id, sid, ref, store, job, out))
                 return false;
             std::string status = jstr(*job, "status", "pending");
             if (agent_initiated && status == "completed")
@@ -13446,8 +13470,12 @@ details{break-inside:avoid}
             bool has_report = false;
         };
 
-        static void collect_tasks(bool all_cwds, const std::string &job_filter,
-                                  const std::string &worker_filter, std::vector<task_row> &out, const std::string &sid)
+        // walk every worker record of every job store in scope; `fn` receives the
+        // store path, the job id/record, the worker entry and its resolved name,
+        // index and (optional) merged report. Shared by the task/report queries.
+        template <class Fn>
+        static void for_each_job_worker(bool all_cwds, const std::string &job_filter, const std::string &worker_filter,
+                                        const std::string &sid, Fn &&fn)
         {
             for (auto &p : all_store_paths(all_cwds, sid))
             {
@@ -13468,38 +13496,50 @@ details{break-inside:avoid}
                     size_t index = 0;
                     for (auto &worker : *list)
                     {
-                        std::string name = jstr(worker, "name", std::format("worker_{}", index));
-                        index++;
+                        const size_t worker_index = index++;
+                        std::string name = jstr(worker, "name", std::format("worker_{}", worker_index));
                         if (!worker_filter.empty() && name != worker_filter)
                             continue;
-                        task_row row;
-                        row.job_id = id;
-                        row.session_id = jstr(job, "session_id");
-                        row.cwd = jstr(job, "cwd");
-                        row.worker = name;
-                        row.status = jstr(job, "status", "pending");
-                        row.provider = first_str(jstr(worker, "provider"), jstr(job, "provider"));
-                        row.model = first_str(jstr(worker, "model"), jstr(job, "model"));
-                        row.works = jstr(worker, "works");
-                        row.reuse = jstr(worker, "reuse");
-                        row.created_at = jint(job, "created_at", 0);
-                        if (reports)
-                        {
-                            auto r = reports->find(name);
-                            if (r != reports->end() && r->is_object())
-                            {
-                                row.has_report = true;
-                                row.status = jstr(*r, "status", row.status);
-                                row.rounds = (size_t)std::max<long long>(0, jint(*r, "rounds", 0));
-                                row.tool_calls = (size_t)std::max<long long>(0, jint(*r, "tool_calls", 0));
-                                row.provider = first_str(jstr(*r, "provider"), row.provider);
-                                row.model = first_str(jstr(*r, "model"), row.model);
-                            }
-                        }
-                        out.push_back(std::move(row));
+                        fn(p, id, job, worker, name, worker_index, reports);
                     }
                 }
             }
+        }
+
+        static void collect_tasks(bool all_cwds, const std::string &job_filter,
+                                  const std::string &worker_filter, std::vector<task_row> &out, const std::string &sid)
+        {
+            auto build_row = [&](const std::filesystem::path &, const std::string &id, const nlohmann::json &job,
+                                 const nlohmann::json &worker, const std::string &name, size_t,
+                                 const nlohmann::json *reports)
+            {
+                task_row row;
+                row.job_id = id;
+                row.session_id = jstr(job, "session_id");
+                row.cwd = jstr(job, "cwd");
+                row.worker = name;
+                row.status = jstr(job, "status", "pending");
+                row.provider = first_str(jstr(worker, "provider"), jstr(job, "provider"));
+                row.model = first_str(jstr(worker, "model"), jstr(job, "model"));
+                row.works = jstr(worker, "works");
+                row.reuse = jstr(worker, "reuse");
+                row.created_at = jint(job, "created_at", 0);
+                if (reports)
+                {
+                    auto r = reports->find(name);
+                    if (r != reports->end() && r->is_object())
+                    {
+                        row.has_report = true;
+                        row.status = jstr(*r, "status", row.status);
+                        row.rounds = (size_t)std::max<long long>(0, jint(*r, "rounds", 0));
+                        row.tool_calls = (size_t)std::max<long long>(0, jint(*r, "tool_calls", 0));
+                        row.provider = first_str(jstr(*r, "provider"), row.provider);
+                        row.model = first_str(jstr(*r, "model"), row.model);
+                    }
+                }
+                out.push_back(std::move(row));
+            };
+            for_each_job_worker(all_cwds, job_filter, worker_filter, sid, build_row);
             std::sort(out.begin(), out.end(), [](const task_row &a, const task_row &b)
                       {
                           if (a.created_at != b.created_at)
@@ -13651,16 +13691,10 @@ details{break-inside:avoid}
             {
                 if (!it->is_object() || jstr(*it, "role") != "assistant")
                     continue;
-                std::string text;
                 auto content = it->find("content");
                 if (content == it->end())
                     continue;
-                if (content->is_string())
-                    text = content->get<std::string>();
-                else if (content->is_array())
-                    for (auto &block : *content)
-                        if (block.is_object() && block.value("type", "") == "text" && block.contains("text") && block["text"].is_string())
-                            text += block["text"].get<std::string>();
+                std::string text = llm::content_text(*content);
                 if (!text.empty())
                     return text;
             }
@@ -13684,62 +13718,42 @@ details{break-inside:avoid}
                                     const std::string &worker_filter, bool include_missing,
                                     std::vector<report_row> &out, const std::string &sid)
         {
-            for (auto &p : all_store_paths(all_cwds, sid))
+            auto build_row = [&](const std::filesystem::path &store_p, const std::string &id, const nlohmann::json &job,
+                                 const nlohmann::json &worker, const std::string &name, size_t worker_index,
+                                 const nlohmann::json *reports)
             {
-                nlohmann::json store = load_store_from(p);
-                auto jobs = store.find("jobs");
-                if (jobs == store.end() || !jobs->is_object())
-                    continue;
-                for (auto &[id, job] : jobs->items())
+                report_row row;
+                row.job_id = id;
+                row.worker = name;
+                row.created_at = jint(job, "created_at", 0);
+                row.provider = first_str(jstr(worker, "provider"), jstr(job, "provider"));
+                row.model = first_str(jstr(worker, "model"), jstr(job, "model"));
+                if (reports)
                 {
-                    if (!job_filter.empty() && id != job_filter)
-                        continue;
-                    auto list = job.find("list");
-                    if (list == job.end() || !list->is_array())
-                        continue;
-                    const nlohmann::json *reports = nullptr;
-                    if (auto r = job.find("summary_reports"); r != job.end() && r->is_object())
-                        reports = &(*r);
-                    size_t index = 0;
-                    for (auto &worker : *list)
+                    auto r = reports->find(name);
+                    if (r != reports->end() && r->is_object())
                     {
-                        std::string name = jstr(worker, "name", std::format("worker_{}", index));
-                        size_t this_index = index++;
-                        if (!worker_filter.empty() && name != worker_filter)
-                            continue;
-                        report_row row;
-                        row.job_id = id;
-                        row.worker = name;
-                        row.created_at = jint(job, "created_at", 0);
-                        row.provider = first_str(jstr(worker, "provider"), jstr(job, "provider"));
-                        row.model = first_str(jstr(worker, "model"), jstr(job, "model"));
-                        if (reports)
-                        {
-                            auto r = reports->find(name);
-                            if (r != reports->end() && r->is_object())
-                            {
-                                row.status = jstr(*r, "status", "?");
-                                row.summary = jstr(*r, "summary");
-                                row.rounds = (size_t)std::max<long long>(0, jint(*r, "rounds", 0));
-                                row.tool_calls = (size_t)std::max<long long>(0, jint(*r, "tool_calls", 0));
-                                row.provider = first_str(jstr(*r, "provider"), row.provider);
-                                row.model = first_str(jstr(*r, "model"), row.model);
-                            }
-                        }
-                        if (row.summary.empty())
-                        {
-                            nlohmann::json messages;
-                            if (read_worker_session(job, p, worker, this_index, messages))
-                                row.summary = last_assistant_text(messages);
-                            if (row.status.empty())
-                                row.status = row.summary.empty() ? "(no report)" : "recovered";
-                        }
-                        if (row.summary.empty() && !include_missing)
-                            continue;
-                        out.push_back(std::move(row));
+                        row.status = jstr(*r, "status", "?");
+                        row.summary = jstr(*r, "summary");
+                        row.rounds = (size_t)std::max<long long>(0, jint(*r, "rounds", 0));
+                        row.tool_calls = (size_t)std::max<long long>(0, jint(*r, "tool_calls", 0));
+                        row.provider = first_str(jstr(*r, "provider"), row.provider);
+                        row.model = first_str(jstr(*r, "model"), row.model);
                     }
                 }
-            }
+                if (row.summary.empty())
+                {
+                    nlohmann::json messages;
+                    if (read_worker_session(job, store_p, worker, worker_index, messages))
+                        row.summary = last_assistant_text(messages);
+                    if (row.status.empty())
+                        row.status = row.summary.empty() ? "(no report)" : "recovered";
+                }
+                if (row.summary.empty() && !include_missing)
+                    return;
+                out.push_back(std::move(row));
+            };
+            for_each_job_worker(all_cwds, job_filter, worker_filter, sid, build_row);
             std::sort(out.begin(), out.end(), [](const report_row &a, const report_row &b)
                       {
                           if (a.created_at != b.created_at)
@@ -13991,13 +14005,7 @@ details{break-inside:avoid}
                 auto content = message.find("content");
                 if (content == message.end())
                     continue;
-                std::string text;
-                if (content->is_string())
-                    text = content->get<std::string>();
-                else if (content->is_array())
-                    for (auto &block : *content)
-                        if (block.is_object() && block.value("type", "") == "text" && block.contains("text") && block["text"].is_string())
-                            text += block["text"].get<std::string>();
+                std::string text = llm::content_text(*content);
                 if (text.empty())
                     continue;
                 context += std::format("[{}] {}\n", role, text);
@@ -14264,14 +14272,7 @@ details{break-inside:avoid}
             }
             std::string answer;
             if (auto c = reply.find("content"); c != reply.end())
-            {
-                if (c->is_string())
-                    answer = c->get<std::string>();
-                else if (c->is_array())
-                    for (auto &b : *c)
-                        if (b.is_object() && b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
-                            answer += b["text"].get<std::string>();
-            }
+                answer = llm::content_text(*c);
             answer = cell::text::trim(answer);
             if (answer.empty())
             {
@@ -14365,7 +14366,7 @@ details{break-inside:avoid}
             if (!f.is_open())
                 return false;
             for (auto &m : messages)
-                f << m.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << "\n";
+                f << dump_safe(m) << "\n";
             f.close();
             if (!f.good())
                 return false;
@@ -14423,14 +14424,7 @@ details{break-inside:avoid}
             std::string text;
             auto it = reply.find("content");
             if (it != reply.end())
-            {
-                if (it->is_string())
-                    text = it->get<std::string>();
-                else if (it->is_array())
-                    for (auto &b : *it)
-                        if (b.is_object() && b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
-                            text += b["text"].get<std::string>();
-            }
+                text = llm::content_text(*it);
             if (text.empty())
                 return "";
             // prompt-injection defence: re-sanitize the summary, like the main compaction
@@ -14923,14 +14917,7 @@ details{break-inside:avoid}
                 {
                     auto content = reply.find("content");
                     if (content != reply.end())
-                    {
-                        if (content->is_string())
-                            result.summary = content->get<std::string>();
-                        else if (content->is_array())
-                            for (auto &block : *content)
-                                if (block.is_object() && block.value("type", "") == "text" && block.contains("text") && block["text"].is_string())
-                                    result.summary += block["text"].get<std::string>();
-                    }
+                        result.summary = llm::content_text(*content);
                     result.status = "ok";
                     break;
                 }
@@ -15157,15 +15144,7 @@ details{break-inside:avoid}
             // the children's edits claim files only while this attempt runs:
             // release every claim the job's loop took when it returns, whatever
             // the outcome (completed / waiting at a gate / stopped / failed)
-            struct claim_guard_t
-            {
-                std::string token;
-                ~claim_guard_t()
-                {
-                    if (size_t n = cell::claims::release_loop(token); n)
-                        cell::sys::logger::instance().debug("claims", std::format("released {} file claim(s) loop={}", n, token));
-                }
-            } claim_guard{"teamwork " + job_id};
+            cell::claim_loop_guard claim_guard{"teamwork " + job_id};
             std::vector<stage_plan_entry> plan = stage_plan(job_snapshot);
             if (plan.empty())
             {
@@ -15616,11 +15595,9 @@ details{break-inside:avoid}
                                   size_t max_children, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!open_job(job_id, sid, ref, out))
-                return false;
             nlohmann::json store;
             nlohmann::json *job = nullptr;
-            if (!reload_job(ref.store, job_id, store, job, out))
+            if (!load_job(job_id, sid, ref, store, job, out))
                 return false;
             if (jstr(*job, "status", "pending") != "pending")
             {
@@ -15698,11 +15675,9 @@ details{break-inside:avoid}
         static bool remove_worker(const std::string &job_id, const std::string &worker, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!open_job(job_id, sid, ref, out))
-                return false;
             nlohmann::json store;
             nlohmann::json *job = nullptr;
-            if (!reload_job(ref.store, job_id, store, job, out))
+            if (!load_job(job_id, sid, ref, store, job, out))
                 return false;
             if (jstr(*job, "status", "pending") == "running")
             {
@@ -19667,17 +19642,7 @@ namespace cell
             auto it = reply.find("content");
             if (it == reply.end())
                 return "";
-            if (it->is_string())
-                return it->get<std::string>();
-            if (it->is_array())
-            {
-                std::string t;
-                for (auto &b : *it)
-                    if (b.value("type", "") == "text" && b.contains("text"))
-                        t += b["text"].get<std::string>();
-                return t;
-            }
-            return "";
+            return llm::content_text(*it);
         }
         static long long reply_text_len(const nlohmann::json &reply)
         {
@@ -20315,15 +20280,7 @@ namespace cell
             // cross-session edit claims taken by this turn release when the
             // agent loop ends, whatever its exit path (natural end, cancel,
             // error): a claim can never outlive its agent
-            struct claim_guard_t
-            {
-                std::string token;
-                ~claim_guard_t()
-                {
-                    if (size_t n = cell::claims::release_loop(token); n)
-                        cell::sys::logger::instance().debug("claims", std::format("released {} file claim(s) loop={}", n, token));
-                }
-            } claim_guard{"session " + h_.now().id()};
+            cell::claim_loop_guard claim_guard{"session " + h_.now().id()};
 
             if (!resume_turn)
             {
@@ -20394,6 +20351,16 @@ namespace cell
                 int attempt = 0;
                 long http_status = 0;
                 bool compacted_this_round = false;
+                // discard the previous attempt's partial output before re-requesting
+                auto reset_stream_state = [&]()
+                {
+                    ui = stream_ui{};
+                    ui.t0 = cell::sys::detail::clock::now();
+                    reply = nlohmann::json{};
+                    tool_calls = nlohmann::json{};
+                    usage = nlohmann::json{};
+                    err.clear();
+                };
                 while (attempt < kMaxRetries)
                 {
                     if (attempt > 0)
@@ -20403,12 +20370,7 @@ namespace cell
                             ev.on_status(std::format("[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries));
                         std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
                         // reset UI state for retry
-                        ui = stream_ui{};
-                        ui.t0 = cell::sys::detail::clock::now();
-                        reply = nlohmann::json{};
-                        tool_calls = nlohmann::json{};
-                        usage = nlohmann::json{};
-                        err.clear();
+                        reset_stream_state();
                     }
                     cell::net::StreamCallback tok_cb = [&ev, &ui](std::span<const char> data)
                     {
@@ -20455,12 +20417,7 @@ namespace cell
                         cell::box::reset_read_log(h_.box_context());
                         h_.now().unload();
                         cell::async_io::flush();
-                        ui = stream_ui{};
-                        ui.t0 = cell::sys::detail::clock::now();
-                        reply = nlohmann::json{};
-                        tool_calls = nlohmann::json{};
-                        usage = nlohmann::json{};
-                        err.clear();
+                        reset_stream_state();
                         compacted_this_round = true;
                         // the transcript just shrank: re-baseline the per-turn
                         // stats, otherwise the delta below underflows size_t
@@ -21161,9 +21118,9 @@ int repl::run()
         {
             std::vector<std::string> hdrs;
             if (anthropic_auth)
-                hdrs = {"x-api-key: " + std::string(key.data(), key.size()), "anthropic-version: 2023-06-01"};
+                hdrs = {cell::llm::xapi_key_header(key), "anthropic-version: 2023-06-01"};
             else
-                hdrs = {"Authorization: Bearer " + std::string(key.data(), key.size())};
+                hdrs = {cell::llm::bearer_header(key)};
             buf.clear();
             code = 0;
             err.clear();
@@ -21283,6 +21240,29 @@ int repl::run()
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
         probe_async(*p); // background: startup never waits on the network
 
+    // the 5 detail lines shared by /provide list ("full" = false) and
+    // /provide add / /provide update ("full" = true, always prints every line
+    // with the verbose proxy/key wording)
+    auto print_provider_details = [](const cell::config::provider_entry &p, bool full)
+    {
+        cell::sys::println("       style:     {}", p.style);
+        cell::sys::println("       api_style: {}", p.api_style);
+        if (full || !p.base.empty())
+            cell::sys::println("       base:      {}", p.base);
+        if (full)
+        {
+            cell::sys::println("       proxy: {}", p.proxy.empty() ? "(system default)" : p.proxy);
+            cell::sys::println("       key:   {}", p.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+        }
+        else
+        {
+            if (!p.proxy.empty())
+                cell::sys::println("       proxy: {}", p.proxy);
+            if (!p.key_id.empty())
+                cell::sys::println("       key:   stored");
+        }
+    };
+
     auto list_providers = [&]()
     {
         if (cfg.providers.empty())
@@ -21295,14 +21275,7 @@ int repl::run()
             auto &p = cfg.providers[i];
             bool cur = (p.name == cfg.current_provider) || (cfg.current_provider.empty() && i == 0);
             cell::sys::println("  [{}] {}{}", i, p.name, cur ? "  <current>" : "");
-            cell::sys::println("       style:     {}", p.style);
-            cell::sys::println("       api_style: {}", p.api_style);
-            if (!p.base.empty())
-                cell::sys::println("       base:      {}", p.base);
-            if (!p.proxy.empty())
-                cell::sys::println("       proxy: {}", p.proxy);
-            if (!p.key_id.empty())
-                cell::sys::println("       key:   stored");
+            print_provider_details(p, false);
             if (cur)
                 cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
@@ -21399,6 +21372,31 @@ int repl::run()
         }
     };
 
+    // start-of-stream bookkeeping shared by on_answer/on_reason: latch the
+    // first-token timestamp and close any pending ticker/counter line so the
+    // streamed text starts clean. Returns whether colour rendering is on.
+    auto stream_prologue = [&](std::string &out) -> bool
+    {
+        if (!tui.got)
+        {
+            tui.got = true;
+            tui.tok0 = cell::sys::detail::clock::now();
+        }
+        if (!cell::sys::detail::color_enabled)
+            return false;
+        if (tui.timer_line)
+        {
+            out += "\r\x1b[2K";
+            tui.timer_line = false;
+        }
+        if (tui.tok_line)
+        {
+            out += "\r\x1b[2K";
+            tui.tok_line = false;
+        }
+        return true;
+    };
+
     // The events the runner reports a turn through. Every callback renders the
     // same console output the inline copy used to print; the ordering is
     // engine-guaranteed (delta events in stream order, tool events in
@@ -21424,27 +21422,9 @@ int repl::run()
     {
         if (data.empty())
             return;
-        if (!tui.got)
-        {
-            tui.got = true;
-            tui.tok0 = cell::sys::detail::clock::now();
-        }
-        bool vt = cell::sys::detail::color_enabled;
         std::string out;
         // end an open reasoning line before the answer text starts
-        if (vt)
-        {
-            if (tui.timer_line)
-            {
-                out += "\r\x1b[2K";
-                tui.timer_line = false;
-            }
-            if (tui.tok_line)
-            {
-                out += "\r\x1b[2K";
-                tui.tok_line = false;
-            }
-        }
+        bool vt = stream_prologue(out);
         out.append(data.data(), data.size());
         tui.toks++;
         if (vt && data.back() == '\n')
@@ -21464,25 +21444,10 @@ int repl::run()
     {
         if (data.empty())
             return;
-        if (!tui.got)
-        {
-            tui.got = true;
-            tui.tok0 = cell::sys::detail::clock::now();
-        }
-        bool vt = cell::sys::detail::color_enabled;
         std::string out;
+        bool vt = stream_prologue(out);
         if (vt)
         {
-            if (tui.timer_line)
-            {
-                out += "\r\x1b[2K";
-                tui.timer_line = false;
-            }
-            if (tui.tok_line)
-            {
-                out += "\r\x1b[2K";
-                tui.tok_line = false;
-            }
             out += "\x1b[2m";
             for (char c : data)
             {
@@ -21905,11 +21870,7 @@ int repl::run()
                                                       reg.proxy.empty() ? "(none)" : reg.proxy,
                                                       reg.key_id.empty() ? "none" : "stored"));
                      cell::sys::println("provider added: {}", reg.name);
-                     cell::sys::println("       style:     {}", reg.style);
-                     cell::sys::println("       api_style: {}", reg.api_style);
-                     cell::sys::println("       base:      {}", reg.base);
-                     cell::sys::println("       proxy: {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
-                     cell::sys::println("       key:   {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                     print_provider_details(reg, true);
                      std::vector<std::string> models;
                      std::string ferr;
                      if (fetch_models(reg, models, ferr))
@@ -22072,11 +22033,7 @@ int repl::run()
                      cell::sys::println("provider updated: {}", p.name);
                      if (p.name != old_name)
                          cell::sys::println("       renamed:  {} -> {}", old_name, p.name);
-                     cell::sys::println("       style:     {}", p.style);
-                     cell::sys::println("       api_style: {}", p.api_style);
-                     cell::sys::println("       base:      {}", p.base);
-                     cell::sys::println("       proxy: {}", p.proxy.empty() ? "(system default)" : p.proxy);
-                     cell::sys::println("       key:   {}", p.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                     print_provider_details(p, true);
                      return cmd_flow::handled;
                  }
                  // select a provider by name (persistent)
@@ -22886,14 +22843,20 @@ int repl::run()
                  const std::string tw_sid = h.now().id();
                  auto arg0 = [&]() -> std::string
                  { return toks.size() > 1 ? toks[1] : ""; };
-                 auto parse_limit = [&](const std::string &s, size_t fallback) -> size_t
+                 auto parse_limit = [&](const std::string &s, size_t fallback, size_t hi, bool *ok) -> size_t
                  {
+                     if (ok)
+                         *ok = true;
                      if (s.empty())
                          return fallback;
                      for (char c : s)
                          if (c < '0' || c > '9')
+                         {
+                             if (ok)
+                                 *ok = false;
                              return fallback;
-                     return std::clamp<size_t>(num_arg(nlohmann::json{{"n", s}}, "n", fallback), (size_t)1, (size_t)200);
+                         }
+                     return std::clamp<size_t>(num_arg(nlohmann::json{{"n", s}}, "n", fallback), (size_t)1, hi);
                  };
                  if (arg0() == "new")
                  {
@@ -22913,15 +22876,12 @@ int repl::run()
                          return cmd_flow::handled;
                      }
                      bool numeric = !toks[2].empty();
-                     for (char c : toks[2])
-                         if (c < '0' || c > '9')
-                             numeric = false;
+                     size_t n = parse_limit(toks[2], 0, (size_t)100, &numeric);
                      if (!numeric)
                      {
                          cell::sys::error("/teamworks max expects a number between 1 and 100");
                          return cmd_flow::handled;
                      }
-                     size_t n = std::clamp<size_t>(num_arg(nlohmann::json{{"n", toks[2]}}, "n", 5), (size_t)1, (size_t)100);
                      cfg.teamwork_max_children = n;
                      cell::async_io::flush();
                      cell::config::save(cfg);
@@ -23024,9 +22984,9 @@ int repl::run()
                          else if (t.rfind("worker:", 0) == 0)
                              worker_filter = t.substr(7);
                          else if (t.rfind("n:", 0) == 0)
-                             limit = parse_limit(t.substr(2), 20);
+                             limit = parse_limit(t.substr(2), 20, (size_t)200, nullptr);
                          else if (t.rfind("limit:", 0) == 0)
-                             limit = parse_limit(t.substr(6), 20);
+                             limit = parse_limit(t.substr(6), 20, (size_t)200, nullptr);
                          else
                              job_filter = t;
                      }
