@@ -7562,6 +7562,16 @@ namespace cell
     namespace llm
     {
         // -------- SSE parsing --------
+        // a base URL carrying a trailing '/' must not meet a path starting with one:
+        // "https://host/v1/" + "/chat/completions" 404s on strict providers
+        static inline std::string normalize_api_base(const std::string &api_base)
+        {
+            std::string s = api_base;
+            while (!s.empty() && s.back() == '/')
+                s.pop_back();
+            return s;
+        }
+
         // scans buf from pos for the next complete "data:" line; zero-copy payload view, returns position after the line
         static inline size_t sse_next_payload(const std::string &buf, size_t pos, std::string_view &payload)
         {
@@ -7862,7 +7872,7 @@ namespace cell
             }
 
         public:
-            OpenAI(const std::string &api_base) : api_base(api_base) {}
+            OpenAI(const std::string &api_base) : api_base(normalize_api_base(api_base)) {}
             ~OpenAI()
             {
                 if (!net::curl_global_is_down())
@@ -8298,7 +8308,7 @@ namespace cell
             }
 
         public:
-            OpenAIResponses(const std::string &api_base) : api_base(api_base) {}
+            OpenAIResponses(const std::string &api_base) : api_base(normalize_api_base(api_base)) {}
             ~OpenAIResponses()
             {
                 if (!net::curl_global_is_down())
@@ -8741,7 +8751,7 @@ namespace cell
                 return b;
             }
 
-            Anthropic(const std::string &api_base) : api_base(api_base) {}
+            Anthropic(const std::string &api_base) : api_base(normalize_api_base(api_base)) {}
             ~Anthropic()
             {
                 if (!net::curl_global_is_down())
