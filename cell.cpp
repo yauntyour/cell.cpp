@@ -5551,7 +5551,7 @@ namespace cell
                 {
                     std::string pem = "-----BEGIN CERTIFICATE-----\n";
                     const std::string b = base64_encode(std::vector<uint8_t>(ctx->pbCertEncoded,
-                                                                     ctx->pbCertEncoded + ctx->cbCertEncoded));
+                                                                             ctx->pbCertEncoded + ctx->cbCertEncoded));
                     for (size_t i = 0; i < b.size(); i += 64)
                     {
                         pem += b.substr(i, 64);
@@ -18301,8 +18301,7 @@ static int run_selftest()
                 std::filesystem::create_directories(nt::seen_path(bsid).parent_path(), bec);
                 {
                     std::ofstream ph(nt::seen_path(bsid));
-                    ph << nlohmann::json{{"id", "nt-x"}, {"from", "user"}, {"topic", ""}, {"body", "keep"},
-                                         {"created_at", 1}, {"state", "delivered"}}
+                    ph << nlohmann::json{{"id", "nt-x"}, {"from", "user"}, {"topic", ""}, {"body", "keep"}, {"created_at", 1}, {"state", "delivered"}}
                               .dump()
                        << "\n";
                 }
