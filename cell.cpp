@@ -2309,6 +2309,21 @@ namespace cell
         index_cache_root() = root;
         async_io::submit(sessions_index_path(), index_cache()->dump(2));
     }
+    // forget_cwd — drop a workspace key from the sessions index (workspace
+    // deleted; cwd_for_key() must stop resolving it). Goes through the same
+    // cache as remember_cwd(). No-op when the key is absent, so this never
+    // creates the file.
+    static void forget_cwd(const std::string &key)
+    {
+        if (key.empty())
+            return;
+        std::lock_guard<std::recursive_mutex> lk(index_mx());
+        sessions_index(); // ensure the cache is loaded for the current root
+        if (!index_cache() || !index_cache()->contains(key))
+            return;
+        index_cache()->erase(key);
+        async_io::submit(sessions_index_path(), index_cache()->dump(2));
+    }
     // =========================================================================
     //  text — display hardening and text utilities
     // =========================================================================
@@ -8125,10 +8140,19 @@ namespace cell
                             !j["choices"][0].contains("delta") || !j["choices"][0]["delta"].is_object())
                             return;
                         auto &delta = j["choices"][0]["delta"];
-                        // chain-of-thought: reasoning models stream delta.reasoning_content
+                        // chain-of-thought: reasoning models stream the deltas
+                        // under vendor-specific keys — DeepSeek & friends use
+                        // `reasoning_content`, OpenRouter normalises to
+                        // `reasoning`. Accept either (prefer reasoning_content
+                        // when both are present, so nothing is counted twice).
+                        const char *rkey = nullptr;
                         if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
+                            rkey = "reasoning_content";
+                        else if (delta.contains("reasoning") && delta["reasoning"].is_string())
+                            rkey = "reasoning";
+                        if (rkey)
                         {
-                            const std::string &t = delta["reasoning_content"].get_ref<const std::string &>();
+                            const std::string &t = delta[rkey].get_ref<const std::string &>();
                             reasoning.append(t);
                             if (on_reason)
                                 on_reason(std::span<const char>(t));
