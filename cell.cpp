@@ -5475,6 +5475,7 @@ namespace cell
         // Result is cached for the process; empty means "use curl's default".
         namespace detail_ca
         {
+#ifdef _WIN32
             // PEM is just base64 in a BEGIN/END envelope, so there is no need to
             // pull in OpenSSL headers just to convert a DER blob (and doing so
             // would break the Linux/macOS builds, whose libcurl is not
@@ -5482,8 +5483,8 @@ namespace cell
             static std::string base64(const unsigned char *d, size_t n)
             {
                 static const char kT[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                          "abcdefghijklmnopqrstuvwxyz"
-                                          "0123456789+/";
+                                         "abcdefghijklmnopqrstuvwxyz"
+                                         "0123456789+/";
                 std::string out;
                 out.reserve(((n + 2) / 3) * 4);
                 for (size_t i = 0; i < n; i += 3)
@@ -5500,8 +5501,6 @@ namespace cell
                 }
                 return out;
             }
-
-#ifdef _WIN32
             // Walk the Windows ROOT store and write every certificate out as PEM.
             // This is the trust list the user's browser and the OS already use,
             // so it needs no shipped file and never goes stale.
@@ -17294,7 +17293,6 @@ static int run_selftest()
         std::filesystem::remove_all(wb, wctx_ec);
     }
 
-
     // rg / find (glob is merged into find)
     R.expect(cell::box::mkdir("rg_dir"), "rg dir");
     R.expect(cell::box::write("rg_dir/a.txt", "hello\nTODO fix\n"), "rg fixture a");
@@ -21758,7 +21756,7 @@ int repl::run()
                      return cmd_flow::handled;
                  long long before = (long long)h.now().msg().size();
                  h.now().msg().clear();
-                 h.now().clear_interrupt();   // the transcript an interrupt could resume is gone
+                 h.now().clear_interrupt();                  // the transcript an interrupt could resume is gone
                  cell::box::reset_read_log(h.box_context()); // context gone: recorded reads no longer apply
                  // clear teamwork: remove all job directories and the store file
                  {
