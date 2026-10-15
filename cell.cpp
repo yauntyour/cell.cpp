@@ -48,6 +48,7 @@
 #include <io.h>
 #include <windows.h>
 #include <aclapi.h>
+#include <wincrypt.h>
 #else
 #include <unistd.h>
 #include <sys/wait.h>
@@ -5456,6 +5457,131 @@ namespace cell
         // never declares a length up front
         constexpr size_t kMaxBufferedResponse = (size_t)128 * 1024 * 1024;
 
+        // ---- TLS trust anchors --------------------------------------------
+        // A statically linked libcurl carries whatever CA path its packager
+        // compiled in. MSYS2 bakes in "/ucrt64/etc/ssl/certs/ca-bundle.crt",
+        // which a NATIVE Windows process resolves against the current drive as
+        // "D:\ucrt64\etc\ssl\certs\ca-bundle.crt" — a path that does not exist.
+        // Every HTTPS request then dies before sending anything, with curl 60:
+        //   "Problem with the SSL CA cert (path? access rights?)"
+        // (visible in the UI as a bare toast, e.g. 拉取模型列表 failing).
+        //
+        // So resolve a bundle we KNOW exists, in this order:
+        //   1. CURL_CA_BUNDLE / SSL_CERT_FILE — the standard curl overrides
+        //   2. <root>/cacert.pem             — shipped alongside, or written
+        //                                      by a previous run
+        //   3. Windows: export the system ROOT store into <root>/cacert.pem
+        // On POSIX the system CA paths already work, so 1-2 suffice there.
+        // Result is cached for the process; empty means "use curl's default".
+        namespace detail_ca
+        {
+            // PEM is just base64 in a BEGIN/END envelope, so there is no need to
+            // pull in OpenSSL headers just to convert a DER blob (and doing so
+            // would break the Linux/macOS builds, whose libcurl is not
+            // necessarily OpenSSL-backed).
+            static std::string base64(const unsigned char *d, size_t n)
+            {
+                static const char kT[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                          "abcdefghijklmnopqrstuvwxyz"
+                                          "0123456789+/";
+                std::string out;
+                out.reserve(((n + 2) / 3) * 4);
+                for (size_t i = 0; i < n; i += 3)
+                {
+                    unsigned v = (unsigned)d[i] << 16;
+                    if (i + 1 < n)
+                        v |= (unsigned)d[i + 1] << 8;
+                    if (i + 2 < n)
+                        v |= (unsigned)d[i + 2];
+                    out += kT[(v >> 18) & 63];
+                    out += kT[(v >> 12) & 63];
+                    out += (i + 1 < n) ? kT[(v >> 6) & 63] : '=';
+                    out += (i + 2 < n) ? kT[v & 63] : '=';
+                }
+                return out;
+            }
+
+#ifdef _WIN32
+            // Walk the Windows ROOT store and write every certificate out as PEM.
+            // This is the trust list the user's browser and the OS already use,
+            // so it needs no shipped file and never goes stale.
+            static bool export_system_roots(const std::filesystem::path &out)
+            {
+                // hProv is an integer HCRYPTPROV_LEGACY, not a pointer
+                HCERTSTORE store = CertOpenSystemStoreA(0, "ROOT");
+                if (!store)
+                    return false;
+                FILE *f = nullptr;
+                if (_wfopen_s(&f, out.wstring().c_str(), L"wb") != 0 || !f)
+                {
+                    CertCloseStore(store, 0);
+                    return false;
+                }
+                size_t n = 0;
+                // CertEnumCertificatesInStore frees the context it is handed and
+                // returns the next one, so `ctx` stays owned by the store until
+                // the call below hands it back — never free it by hand.
+                PCCERT_CONTEXT ctx = CertEnumCertificatesInStore(store, nullptr);
+                while (ctx)
+                {
+                    std::string pem = "-----BEGIN CERTIFICATE-----\n";
+                    const std::string b = base64(ctx->pbCertEncoded, ctx->cbCertEncoded);
+                    for (size_t i = 0; i < b.size(); i += 64)
+                    {
+                        pem += b.substr(i, 64);
+                        pem += '\n';
+                    }
+                    pem += "-----END CERTIFICATE-----\n";
+                    std::fwrite(pem.data(), 1, pem.size(), f);
+                    n++;
+                    ctx = CertEnumCertificatesInStore(store, ctx);
+                }
+                std::fclose(f);
+                CertCloseStore(store, 0);
+                return n > 0;
+            }
+#endif
+
+            static std::string resolve()
+            {
+                std::error_code ec;
+                // 1. the standard curl environment overrides
+                for (const char *env : {"CURL_CA_BUNDLE", "SSL_CERT_FILE"})
+                {
+                    const char *v = std::getenv(env);
+                    if (v && *v && std::filesystem::is_regular_file(v, ec))
+                        return std::string(v);
+                }
+                std::filesystem::path out = root / "cacert.pem";
+                // 2. a bundle shipped next to the app / written by an earlier run
+                if (std::filesystem::is_regular_file(out, ec) &&
+                    std::filesystem::file_size(out, ec) > 4096)
+                    return out.string();
+#ifdef _WIN32
+                // 3. build one from the system ROOT store
+                std::error_code mk;
+                std::filesystem::create_directories(root, mk);
+                if (export_system_roots(out))
+                {
+                    std::error_code sz;
+                    if (std::filesystem::file_size(out, sz) > 4096)
+                        return out.string();
+                }
+                std::filesystem::remove(out, ec); // never leave a truncated file behind
+#endif
+                return std::string();
+            }
+        } // namespace detail_ca
+
+        // public entry point: the CA bundle to hand libcurl, or "" for its default
+        static const char *ca_bundle() noexcept
+        {
+            // resolved once, lazily, on the first request (never at static-init
+            // time: it touches the filesystem and the Windows cert store)
+            static const std::string path = detail_ca::resolve();
+            return path.c_str();
+        }
+
         size_t CURL_WriteCallback(void *contents, size_t size, size_t nmemb, std::string &userp)
         {
             size_t n = size * nmemb;
@@ -5574,6 +5700,12 @@ namespace cell
                 return false;
             curl_easy_reset(curl);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); // never raise SIGPIPE on POSIX
+            // TLS trust anchors: the compiled-in default points at a POSIX path
+            // that does not exist on Windows, so every HTTPS call would fail with
+            // curl 60 "Problem with the SSL CA cert". Empty = keep curl's default
+            // (correct on POSIX, where the system CA paths do resolve).
+            if (const char *ca = ca_bundle(); ca && *ca)
+                curl_easy_setopt(curl, CURLOPT_CAINFO, ca);
             if (timeout_sec > 0)
             {
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
