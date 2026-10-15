@@ -132,6 +132,44 @@ static double dbl_arg(const nlohmann::json &j, const char *key, double fallback)
     return fallback;
 }
 
+// Token-usage extraction from an OpenAI-style or Anthropic/Responses-style
+// `usage` object. Shared by cell::engine (per-round stats) and
+// teamwork::accumulate_usage (worker reports).
+static std::optional<long long> usage_in(const nlohmann::json &u)
+{
+    if (u.is_object())
+    {
+        if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+            return u["prompt_tokens"].get<long long>();
+        if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+            return u["input_tokens"].get<long long>();
+    }
+    return std::nullopt;
+}
+static std::optional<long long> usage_out(const nlohmann::json &u)
+{
+    if (u.is_object())
+    {
+        if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
+            return u["completion_tokens"].get<long long>();
+        if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
+            return u["output_tokens"].get<long long>();
+    }
+    return std::nullopt;
+}
+static std::optional<long long> usage_total(const nlohmann::json &u)
+{
+    if (u.is_object())
+    {
+        if (u.contains("total_tokens") && u["total_tokens"].is_number_integer())
+            return u["total_tokens"].get<long long>();
+        auto in = usage_in(u), out = usage_out(u);
+        if (in && out)
+            return *in + *out;
+    }
+    return std::nullopt;
+}
+
 static const char *__base64_basechars__ = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::string base64_encode(const std::vector<uint8_t> &data)
@@ -309,17 +347,26 @@ namespace cell
                             { return stopping || !pending.empty(); });
                     if (stopping && pending.empty())
                         return;
-                    auto it = pending.begin();
-                    job j = std::move(it->second);
-                    pending.erase(it);
-                    in_flight++;
-                    lk.unlock();
-                    write_file(j);
-                    lk.lock();
-                    if (in_flight > 0)
-                        in_flight--;
-                    cv.notify_all();
+                    run_one(lk);
                 }
+            }
+            // pop one job and write it outside the lock; returns with `lk`
+            // re-acquired. Called with `pending` non-empty and the mutex held —
+            // the single copy of the worker hand-off that run() and flush()
+            // used to keep in sync by hand (in_flight is what makes flush() a
+            // real durability barrier rather than "nothing is queued *yet*").
+            void run_one(std::unique_lock<std::mutex> &lk)
+            {
+                auto it = pending.begin();
+                job j = std::move(it->second);
+                pending.erase(it);
+                in_flight++;
+                lk.unlock();
+                write_file(j);
+                lk.lock();
+                if (in_flight > 0)
+                    in_flight--;
+                cv.notify_all();
             }
 
         public:
@@ -365,16 +412,7 @@ namespace cell
                         cv.wait(lk);
                         continue;
                     }
-                    auto it = pending.begin();
-                    job j = std::move(it->second);
-                    pending.erase(it);
-                    in_flight++;
-                    lk.unlock();
-                    write_file(j);
-                    lk.lock();
-                    if (in_flight > 0)
-                        in_flight--;
-                    cv.notify_all();
+                    run_one(lk);
                 }
             }
         };
@@ -2046,6 +2084,13 @@ namespace cell
             static std::unordered_map<std::string, entry> m;
             return m;
         }
+        // refusal text for a path another session holds (caller already holds mx())
+        inline std::string refusal_text(const std::string &path, const std::string &holder, const char *caller)
+        {
+            return std::format("{} refused: '{}' is occupied by another session ({}) — concurrent sessions edit files "
+                               "first-come, first-served; retry after that session's agent loop ends (reads are unaffected)",
+                               caller, path, holder);
+        }
         // Refusal text when `path` is claimed by a session other than `owner`;
         // empty when the path is free or held by the caller's own session.
         inline std::string refusal(const std::string &path, const std::string &owner, const char *caller)
@@ -2054,9 +2099,7 @@ namespace cell
             auto it = map().find(path);
             if (it == map().end() || it->second.owner == owner)
                 return "";
-            return std::format("{} refused: '{}' is occupied by another session ({}) — concurrent sessions edit files "
-                               "first-come, first-served; retry after that session's agent loop ends (reads are unaffected)",
-                               caller, path, it->second.owner);
+            return refusal_text(path, it->second.owner, caller);
         }
         // Atomic check-and-claim: empty string = taken, otherwise the refusal
         // (another session holds it). A session may re-take its own file.
@@ -2065,9 +2108,7 @@ namespace cell
             std::lock_guard lk(mx());
             auto it = map().find(path);
             if (it != map().end() && it->second.owner != owner)
-                return std::format("{} refused: '{}' is occupied by another session ({}) — concurrent sessions edit files "
-                                   "first-come, first-served; retry after that session's agent loop ends (reads are unaffected)",
-                                   caller, path, it->second.owner);
+                return refusal_text(path, it->second.owner, caller);
             map()[path] = entry{owner, loop};
             return "";
         }
@@ -2111,12 +2152,30 @@ namespace cell
     // UTC wall-clock stamp used in on-disk names (teamwork job ids, compaction
     // archives): "YYYYMMDD-HHMMSS" — human-readable, and without ':' so it is
     // a valid file name on Windows.
-    static std::string utc_stamp()
+    static std::string utc_stamp(std::time_t tt = std::time(nullptr))
     {
-        std::tm tm = utc_tm(std::time(nullptr));
+        std::tm tm = utc_tm(tt);
         char stamp[32];
         std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
         return stamp;
+    }
+    // Fresh archive path inside a saved/ folder: "<prefix>-<stamp>.jsonl", with
+    // a -N suffix when that name is already taken (compaction archives and the
+    // notice-trail archives share this rule). The stamp is passed in by the
+    // caller (utc_stamp()) so the numbering rule stays testable.
+    static std::filesystem::path fresh_archive_path(const std::filesystem::path &saved_dir,
+                                                    const std::string &prefix, const std::string &stamp)
+    {
+        std::string base = std::format("{}-{}", prefix, stamp);
+        std::filesystem::path target = saved_dir / (base + ".jsonl");
+        for (size_t n = 1;; ++n)
+        {
+            std::error_code ec;
+            if (!std::filesystem::exists(target, ec))
+                break;
+            target = saved_dir / (base + "-" + std::to_string(n) + ".jsonl");
+        }
+        return target;
     }
     // A session is a directory under its cwd group holding the JSONL transcript
     // (messages.jsonl), the Teamwork store and job transcripts, and compaction
@@ -2271,7 +2330,8 @@ namespace cell
                 start = nl + 1;
             }
         }
-        static std::string trim(std::string_view s)
+        // leading/trailing blanks of one line, without copying
+        static std::string_view trim_view(std::string_view s)
         {
             // '\n' matters: a model reply of "ALLOW\n" is compared against "allow"
             // by the autoallow gate, and an untrimmed newline read as a refusal
@@ -2280,7 +2340,11 @@ namespace cell
                 b++;
             while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
                 e--;
-            return std::string(s.substr(b, e - b));
+            return s.substr(b, e - b);
+        }
+        static std::string trim(std::string_view s)
+        {
+            return std::string(trim_view(s));
         }
         static std::string_view strip_bom(std::string &s)
         {
@@ -2330,8 +2394,10 @@ namespace cell
             }
             return i;
         }
-        // Strip ANSI/control chars, collapse whitespace to single spaces.
-        static std::string display_safe(const std::string &s)
+        // Strip ANSI/control chars. `collapse_ws` replaces \n \r \t with single
+        // spaces (console line / log rendering); leaving them intact preserves
+        // the line structure (stream rendering).
+        static std::string strip_controls(const std::string &s, bool collapse_ws)
         {
             std::string out;
             out.reserve(s.size());
@@ -2345,31 +2411,12 @@ namespace cell
                 }
                 if (c == '\n' || c == '\r' || c == '\t')
                 {
-                    if (!out.empty() && out.back() != ' ')
-                        out += ' ';
-                    continue;
-                }
-                if (c < 0x20)
-                    continue;
-                out += (char)c;
-            }
-            return out;
-        }
-        // Strip ANSI/control chars, preserving line structure.
-        static std::string console_safe(const std::string &s)
-        {
-            std::string out;
-            out.reserve(s.size());
-            for (size_t i = 0; i < s.size(); i++)
-            {
-                unsigned char c = (unsigned char)s[i];
-                if (c == 0x1B)
-                {
-                    i = skip_escape(s, i);
-                    continue;
-                }
-                if (c == '\n' || c == '\r' || c == '\t')
-                {
+                    if (collapse_ws)
+                    {
+                        if (!out.empty() && out.back() != ' ')
+                            out += ' ';
+                        continue;
+                    }
                     out += (char)c;
                     continue;
                 }
@@ -2379,6 +2426,10 @@ namespace cell
             }
             return out;
         }
+        // Strip ANSI/control chars, collapse whitespace to single spaces.
+        static std::string display_safe(const std::string &s) { return strip_controls(s, true); }
+        // Strip ANSI/control chars, preserving line structure.
+        static std::string console_safe(const std::string &s) { return strip_controls(s, false); }
 
         // Valid UTF-8 for JSON/API; invalid bytes become U+FFFD.
         static std::string utf8_safe(std::string_view s, size_t max_bytes = std::string_view::npos)
@@ -3098,6 +3149,18 @@ namespace cell
                 return "full-access";
             }
             return "full-access";
+        }
+        // inverse of mode_name: the aliases the CLI, config and /sandbox have
+        // always accepted. nullopt = unknown, the caller picks its own default
+        static std::optional<SandboxMode> parse_mode(std::string_view name)
+        {
+            if (name == "read-only" || name == "readonly")
+                return SandboxMode::ReadOnly;
+            if (name == "edit-only" || name == "edit")
+                return SandboxMode::EditOnly;
+            if (name == "full-access" || name == "full")
+                return SandboxMode::FullAccess;
+            return std::nullopt;
         }
         // tool gating by kind lives in cell::tools (ToolKind / is_tool_allowed)
         // check if a path is inside the current working directory (workspace).
@@ -4367,16 +4430,6 @@ namespace cell
                 return false;
             }
         }
-        // forward declaration for glob() which calls find()
-        bool find(std::string_view root_path, std::string_view pattern,
-                  std::string_view name, double newer_hours,
-                  long long larger_bytes, size_t max_results, std::string &output);
-        // recursive filename glob is now handled by find() with the 'pattern' parameter
-        // this wrapper is kept for backward compatibility in tests
-        bool glob(std::string_view pattern, std::string_view root_path, std::string &output)
-        {
-            return find(root_path, pattern, "", 0.0, 0, 500, output);
-        }
         // unified file finder: glob pattern matching + metadata filter (name glob,
         // modification time, size). When only 'pattern' is given, behaves like a
         // recursive glob. When metadata filters are given, they narrow the results.
@@ -4736,6 +4789,19 @@ namespace cell
             file_cache().erase(read_log_key(path));
         }
         // -------- read / write / edit --------
+        // Normalize CRLF to LF in place on all platforms (write may produce
+        // CRLF on Windows): single pass, no second buffer
+        static void crlf_to_lf(std::string &s)
+        {
+            size_t w = 0;
+            for (size_t i = 0; i < s.size(); i++)
+            {
+                if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n')
+                    continue; // skip \r before \n
+                s[w++] = s[i];
+            }
+            s.resize(w);
+        }
         // optional 'reason' out-param receives a human-readable failure reason
         bool read(std::string_view path, std::string &output, size_t start_line = 0, size_t end_line = 0, bool track = false, size_t offset = 0, size_t limit = 0, std::string *reason = nullptr)
         {
@@ -4795,18 +4861,8 @@ namespace cell
                 // Binary file detection: reject files containing NUL bytes
                 if (content.find('\0') != std::string::npos)
                     return fail(std::format("{} looks like a binary file (contains NUL bytes); only text files can be read.", std::string(path)));
-                // Normalize CRLF to LF in place on all platforms (write may
-                // produce CRLF on Windows): single pass, no second buffer
-                {
-                    size_t w = 0;
-                    for (size_t i = 0; i < content.size(); i++)
-                    {
-                        if (content[i] == '\r' && i + 1 < content.size() && content[i + 1] == '\n')
-                            continue; // skip \r before \n
-                        content[w++] = content[i];
-                    }
-                    content.resize(w);
-                }
+                // Normalize CRLF to LF (write may produce CRLF on Windows)
+                crlf_to_lf(content);
                 output = std::move(content);
                 if (track)
                     record_read(path, 1, (size_t)-1);
@@ -4866,18 +4922,8 @@ namespace cell
             }
             if (track)
                 record_read(path, start_line, end_line);
-            // Normalize CRLF to LF in place on all platforms: single pass, no
-            // second buffer (out was built by slicing, so it may carry \r\n)
-            {
-                size_t w = 0;
-                for (size_t i = 0; i < out.size(); i++)
-                {
-                    if (out[i] == '\r' && i + 1 < out.size() && out[i + 1] == '\n')
-                        continue; // skip \r before \n
-                    out[w++] = out[i];
-                }
-                out.resize(w);
-            }
+            // Normalize CRLF to LF (out was built by slicing, so it may carry \r\n)
+            crlf_to_lf(out);
             output = std::move(out);
             return true;
         }
@@ -5112,21 +5158,14 @@ namespace cell
                     output = std::format("write refused: parent directory does not exist: {}. Create it first with exec: mkdir -p {}", parent.string(), parent.string());
                 return false;
             }
-            if (!write(path, input))
+            // write + seed the edit cache (same 8 MB cap as load_file) so a
+            // follow-up edit skips re-reading the disk
+            if (!store_file(path, std::string(input), read_log_key(path)))
             {
                 output = std::format("write failed: {} could not be written (permission denied, disk full, or locked by another process).", std::string(path));
                 return false;
             }
             output = std::format("write ok: created {} ({} chars)", std::string(path), (long long)input.size());
-            // seed the edit cache so a follow-up edit skips re-reading the disk
-            std::error_code ec;
-            auto mtime = std::filesystem::last_write_time(path, ec);
-            auto size = std::filesystem::file_size(path, ec);
-            if (!ec)
-            {
-                std::lock_guard lk(file_cache_mx());
-                file_cache()[read_log_key(path)] = {std::string(input), mtime, size};
-            }
             return true;
         }
         bool remove(std::string_view path)
@@ -5238,9 +5277,27 @@ namespace cell
                 output = coverage_error(fl, ll);
                 return false;
             };
-            auto report_matches = [&](const std::vector<size_t> &pos) -> std::string
+            // one place for the message every write path shares
+            auto write_fail = [&]() -> bool
             {
-                std::string o = std::format("SEARCH block matched {} times — nothing was modified. Make the SEARCH block unique by adding more context lines.\n", pos.size());
+                output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
+                return false;
+            };
+            auto find_positions = [&](const std::string &needle) -> std::vector<size_t>
+            {
+                std::vector<size_t> pos;
+                // advance by one byte, not by the match length: overlapping
+                // occurrences ("aa" in "aaa") would otherwise be missed and an
+                // ambiguous SEARCH accepted as unique
+                for (size_t p = buf.find(needle); p != std::string::npos; p = buf.find(needle, p + 1))
+                    pos.push_back(p);
+                return pos;
+            };
+            // numbered match list with one line of context, shared by the
+            // ambiguity report and by query mode
+            auto format_matches = [&](const std::vector<size_t> &pos) -> std::string
+            {
+                std::string o;
                 for (size_t k = 0; k < pos.size(); k++)
                 {
                     size_t line = line_at(pos[k]);
@@ -5253,14 +5310,13 @@ namespace cell
                 }
                 return o;
             };
+            auto report_matches = [&](const std::vector<size_t> &pos) -> std::string
+            {
+                return std::format("SEARCH block matched {} times — nothing was modified. Make the SEARCH block unique by adding more context lines.\n", pos.size()) + format_matches(pos);
+            };
             auto find_unique = [&](std::vector<size_t> &pos) -> bool
             {
-                pos.clear();
-                // advance by one byte, not by the match length: overlapping
-                // occurrences ("aa" in "aaa") would otherwise be missed and an
-                // ambiguous SEARCH accepted as unique
-                for (size_t p = buf.find(search_buf); p != std::string::npos; p = buf.find(search_buf, p + 1))
-                    pos.push_back(p);
+                pos = find_positions(search_buf);
                 if (pos.empty())
                 {
                     output = "edit failed: SEARCH block not found in file. Provide the exact text as it appears (include surrounding context lines if needed).";
@@ -5281,26 +5337,15 @@ namespace cell
                     output = "edit failed (query): 'search_buf' must not be empty.";
                     return false;
                 }
-                std::vector<size_t> pos;
-                // one-byte step: see find_unique — overlapping matches count too
-                for (size_t p = buf.find(search_buf); p != std::string::npos; p = buf.find(search_buf, p + 1))
-                    pos.push_back(p);
+                // one-byte step: see find_positions — overlapping matches count too
+                std::vector<size_t> pos = find_positions(search_buf);
                 if (pos.empty())
                 {
                     output = "edit (query): SEARCH block not found in file.";
                     return false;
                 }
                 output = std::format("edit (query): {} match(es) for a {}-char SEARCH block:\n", pos.size(), (long long)search_buf.size());
-                for (size_t k = 0; k < pos.size(); k++)
-                {
-                    size_t line = line_at(pos[k]);
-                    output += std::format("match #{} at line {}:\n", k + 1, line);
-                    if (line >= 2)
-                        output += std::format("  {:>6} | {}\n", line - 1, line_view(line - 1));
-                    output += std::format(">>{:>6} | {}\n", line, line_view(line));
-                    if (line < nlines)
-                        output += std::format("  {:>6} | {}\n", line + 1, line_view(line + 1));
-                }
+                output += format_matches(pos);
                 return true;
             }
 
@@ -5317,10 +5362,7 @@ namespace cell
                     return false;
                 buf += content_buf;
                 if (!store_file(path, std::move(buf), file_key))
-                {
-                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
-                    return false;
-                }
+                    return write_fail();
                 output = std::format("edit ok: appended {} chars at end of file", (long long)content_buf.size());
                 return true;
             }
@@ -5368,10 +5410,7 @@ namespace cell
                 }
                 buf.replace(at, search_buf.size(), content_buf);
                 if (!store_file(path, std::move(buf), file_key))
-                {
-                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
-                    return false;
-                }
+                    return write_fail();
                 output = std::format("edit ok: replaced 1 block ({} chars -> {} chars)", (long long)search_buf.size(), (long long)content_buf.size());
                 return true;
             }
@@ -5403,10 +5442,7 @@ namespace cell
                 }
                 buf.insert(ins, content_buf);
                 if (!store_file(path, std::move(buf), file_key))
-                {
-                    output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
-                    return false;
-                }
+                    return write_fail();
                 output = std::format("edit ok: inserted {} chars after line {}", (long long)content_buf.size(), anchor_line);
                 return true;
             }
@@ -5437,10 +5473,7 @@ namespace cell
                 return false;
             buf.erase(del_begin, del_end - del_begin);
             if (!store_file(path, std::move(buf), file_key))
-            {
-                output = std::format("edit failed: could not write the file (permission denied, disk full, or locked by another process): {}.", std::string(path));
-                return false;
-            }
+                return write_fail();
             output = std::format("edit ok: deleted {} chars (lines {}-{})", (long long)(del_end - del_begin), first_line, last_line);
             return true;
         }
@@ -5479,28 +5512,7 @@ namespace cell
             // PEM is just base64 in a BEGIN/END envelope, so there is no need to
             // pull in OpenSSL headers just to convert a DER blob (and doing so
             // would break the Linux/macOS builds, whose libcurl is not
-            // necessarily OpenSSL-backed).
-            static std::string base64(const unsigned char *d, size_t n)
-            {
-                static const char kT[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                         "abcdefghijklmnopqrstuvwxyz"
-                                         "0123456789+/";
-                std::string out;
-                out.reserve(((n + 2) / 3) * 4);
-                for (size_t i = 0; i < n; i += 3)
-                {
-                    unsigned v = (unsigned)d[i] << 16;
-                    if (i + 1 < n)
-                        v |= (unsigned)d[i + 1] << 8;
-                    if (i + 2 < n)
-                        v |= (unsigned)d[i + 2];
-                    out += kT[(v >> 18) & 63];
-                    out += kT[(v >> 12) & 63];
-                    out += (i + 1 < n) ? kT[(v >> 6) & 63] : '=';
-                    out += (i + 2 < n) ? kT[v & 63] : '=';
-                }
-                return out;
-            }
+            // necessarily OpenSSL-backed): the file-wide base64_encode does it.
             // Walk the Windows ROOT store and write every certificate out as PEM.
             // This is the trust list the user's browser and the OS already use,
             // so it needs no shipped file and never goes stale.
@@ -5524,7 +5536,8 @@ namespace cell
                 while (ctx)
                 {
                     std::string pem = "-----BEGIN CERTIFICATE-----\n";
-                    const std::string b = base64(ctx->pbCertEncoded, ctx->cbCertEncoded);
+                    const std::string b = base64_encode(std::vector<uint8_t>(ctx->pbCertEncoded,
+                                                                     ctx->pbCertEncoded + ctx->cbCertEncoded));
                     for (size_t i = 0; i < b.size(); i += 64)
                     {
                         pem += b.substr(i, 64);
@@ -5888,19 +5901,15 @@ namespace cell
             s += '\n';
             std::fwrite(s.data(), 1, s.size(), stdout);
         }
-        inline void println()
-        {
-            std::fputc('\n', stdout);
-        }
-        // elapsed milliseconds since a steady-clock time point
-        inline long long elapsed_ms(detail::clock::time_point t0)
-        {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(detail::clock::now() - t0).count();
-        }
         // milliseconds between two steady-clock time points
         inline long long diff_ms(detail::clock::time_point from, detail::clock::time_point to)
         {
             return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+        }
+        // elapsed milliseconds since a steady-clock time point
+        inline long long elapsed_ms(detail::clock::time_point t0)
+        {
+            return diff_ms(t0, detail::clock::now());
         }
         template <std::formattable<char>... Args>
         void eprintln(color c, std::format_string<Args...> fmt, Args &&...args)
@@ -5923,11 +5932,6 @@ namespace cell
             s += '\n';
             std::fwrite(s.data(), 1, s.size(), stdout);
             // complete line: stays buffered like any other println output
-        }
-        inline void eprintln(color)
-        {
-            std::fputc('\n', stderr);
-            std::fflush(stderr);
         }
         template <std::formattable<char>... Args>
         void error(std::format_string<Args...> fmt, Args &&...args)
@@ -6579,7 +6583,6 @@ namespace cell
             size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
 
-            bool empty() const { return providers.empty(); }
             // An empty current_provider means "the first provider is active"; a
             // non-empty name that matches nothing means the user's selection is
             // stale (renamed/removed provider) and must NOT silently fall back to
@@ -6598,21 +6601,7 @@ namespace cell
             }
             provider_entry *current_provider_entry()
             {
-                if (providers.empty())
-                    return nullptr;
-                if (current_provider.empty())
-                    return &providers[0];
-                for (auto &p : providers)
-                    if (p.name == current_provider)
-                        return &p;
-                return nullptr;
-            }
-            bool has_provider(const std::string &name) const
-            {
-                for (auto &p : providers)
-                    if (p.name == name)
-                        return true;
-                return false;
+                return const_cast<provider_entry *>(static_cast<const settings *>(this)->current_provider_entry());
             }
             // "provider:model" label for stats/log output
             std::string model_label() const
@@ -6986,14 +6975,6 @@ namespace cell
             const char *c_str() const { return data(); }
             std::string str() const { return std::string(data(), size()); }
 
-            bool operator==(const secure_string &o) const
-            {
-                return len_ == o.len_ && (len_ == 0 || sodium_memcmp(buf_, o.buf_, len_) == 0);
-            }
-            bool operator==(const std::string &o) const
-            {
-                return len_ == o.size() && (len_ == 0 || sodium_memcmp(buf_, o.data(), len_) == 0);
-            }
             bool operator==(const char *o) const
             {
                 return o && len_ == std::strlen(o) && (len_ == 0 || sodium_memcmp(buf_, o, len_) == 0);
@@ -7241,10 +7222,6 @@ namespace cell
                 vault[map_key] = e;
                 return save();
             }
-            bool add(const std::string &map_key, const secure_string &raw_value)
-            {
-                return add(map_key, raw_value.str());
-            }
             size_t remove(const std::string &map_key)
             {
                 std::lock_guard<std::mutex> lk(mx);
@@ -7413,21 +7390,6 @@ namespace cell
             { f(args, rt) } -> std::convertible_to<ToolOutput>;
         };
 
-        // Try to parse input as JSON and extract a string field. Returns empty string on failure.
-        [[maybe_unused]] static std::string try_parse_json_field(const std::string &input, const char *field)
-        {
-            try
-            {
-                auto j = nlohmann::json::parse(input, nullptr, false);
-                if (j.is_object() && j.contains(field) && j[field].is_string())
-                    return j[field].get<std::string>();
-            }
-            catch (const std::exception &)
-            {
-            }
-            return "";
-        }
-
         class callable_tool : public tool
         {
         private:
@@ -7439,6 +7401,15 @@ namespace cell
             std::atomic<bool> blocked_{false};
             std::atomic<rejection_reason> rejected_for_{rejection_reason::none};
 
+            // one place for what every refusal does: mark the tool blocked,
+            // remember why, log it, and build the failure output
+            ToolOutput deny(rejection_reason why, std::string fail_msg, std::string log_reason)
+            {
+                blocked_.store(true, std::memory_order_relaxed);
+                rejected_for_.store(why, std::memory_order_relaxed);
+                cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason={}", name(), log_reason));
+                return ToolOutput::fail(std::move(fail_msg));
+            }
             // The sandbox / policy / approval gates, applied before the handler
             // runs. Returns false (with output.ok=false and blocked_ /
             // rejected_for_ set) when the call must not run.
@@ -7448,18 +7419,16 @@ namespace cell
                 // Check if this tool is allowed in the current sandbox mode
                 if (!is_tool_allowed(tool_kind()))
                 {
-                    blocked_.store(true, std::memory_order_relaxed);
-                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                    output = ToolOutput::fail(std::format("[{}] tool is blocked by sandbox mode (mode={})", name(), box::mode_name(box::sandbox_mode())));
-                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox_mode={}", name(), box::mode_name(box::sandbox_mode())));
+                    output = deny(rejection_reason::sandbox,
+                                  std::format("[{}] tool is blocked by sandbox mode (mode={})", name(), box::mode_name(box::sandbox_mode())),
+                                  std::format("sandbox_mode={}", box::mode_name(box::sandbox_mode())));
                     return false;
                 }
                 if (policy() == Policy::Deny)
                 {
-                    blocked_.store(true, std::memory_order_relaxed);
-                    rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                    output = ToolOutput::fail(std::format("[{}] tool is disabled by policy", name()));
-                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=policy_deny", name()));
+                    output = deny(rejection_reason::sandbox,
+                                  std::format("[{}] tool is disabled by policy", name()),
+                                  "policy_deny");
                     return false;
                 }
                 if (policy() == Policy::Ask)
@@ -7494,10 +7463,9 @@ namespace cell
                         bool approved = prompt && prompt(name(), input, reason);
                         if (!approved)
                         {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::user, std::memory_order_relaxed);
-                            output = ToolOutput::fail(std::format("[{}] {}", name(), reason.empty() ? "rejected by user" : reason));
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason={}", name(), reason.empty() ? "rejected_by_user" : reason));
+                            output = deny(rejection_reason::user,
+                                          std::format("[{}] {}", name(), reason.empty() ? "rejected by user" : reason),
+                                          std::format("{}", reason.empty() ? "rejected_by_user" : reason));
                             return false;
                         }
                         cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user", name()));
@@ -7511,10 +7479,9 @@ namespace cell
                         std::string deny_reason = rt.autoallow_validator ? rt.autoallow_validator(name(), action_json) : "";
                         if (!deny_reason.empty())
                         {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::autoallow, std::memory_order_relaxed);
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=autoallow_rejected args={}", name(), input));
-                            output = ToolOutput::fail(std::format("[{}] autoallow rejected: {}", name(), deny_reason));
+                            output = deny(rejection_reason::autoallow,
+                                          std::format("[{}] autoallow rejected: {}", name(), deny_reason),
+                                          std::format("autoallow_rejected args={}", input));
                             return false;
                         }
                         cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={}", name(), cell::text::display_safe(input)));
@@ -7531,10 +7498,9 @@ namespace cell
 
                         if (!box::check_exec(exec_cmd))
                         {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox mode={} args={}", name(), box::mode_name(box::sandbox_mode()), exec_cmd));
-                            output = ToolOutput::fail(std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode())));
+                            output = deny(rejection_reason::sandbox,
+                                          std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode())),
+                                          std::format("sandbox mode={} args={}", box::mode_name(box::sandbox_mode()), exec_cmd));
                             return false;
                         }
                         // also sandbox-check the working directory if provided
@@ -7543,10 +7509,9 @@ namespace cell
                             wd_val = parsed["wd"].get<std::string>();
                         if (!wd_val.empty() && !box::check_path(wd_val))
                         {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                            output = ToolOutput::fail(std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val));
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=wd_sandbox wd={} args={}", name(), wd_val, input));
+                            output = deny(rejection_reason::sandbox,
+                                          std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val),
+                                          std::format("wd_sandbox wd={} args={}", wd_val, input));
                             return false;
                         }
                         if (box::is_high_risk(exec_cmd))
@@ -7558,10 +7523,9 @@ namespace cell
                                 std::getline(std::cin, answer2);
                                 if (answer2 != "y" && answer2 != "Y")
                                 {
-                                    blocked_.store(true, std::memory_order_relaxed);
-                                    rejected_for_.store(rejection_reason::user, std::memory_order_relaxed);
-                                    output = ToolOutput::fail(std::format("[{}] high-risk command rejected by user", name()));
-                                    cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=high_risk_rejected args={}", name(), input));
+                                    output = deny(rejection_reason::user,
+                                                  std::format("[{}] high-risk command rejected by user", name()),
+                                                  std::format("high_risk_rejected args={}", input));
                                     return false;
                                 }
                                 cell::sys::logger::instance().debug("tool", std::format("approved name={} high_risk=yes by=user", name()));
@@ -7583,10 +7547,9 @@ namespace cell
                         bool blocked = path_val.empty() ? !box::check(input) : !box::check_path(path_val);
                         if (blocked)
                         {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                            output = ToolOutput::fail(std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name()));
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=sandbox args={}", name(), input));
+                            output = deny(rejection_reason::sandbox,
+                                          std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name()),
+                                          std::format("sandbox args={}", input));
                             return false;
                         }
                     }
@@ -7611,10 +7574,9 @@ namespace cell
                         blocked = true;
                     if (blocked)
                     {
-                        blocked_.store(true, std::memory_order_relaxed);
-                        rejected_for_.store(rejection_reason::sandbox, std::memory_order_relaxed);
-                        output = ToolOutput::fail(std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name()));
-                        cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=path_traversal args={}", name(), input));
+                        output = deny(rejection_reason::sandbox,
+                                      std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name()),
+                                      std::format("path_traversal args={}", input));
                         return false;
                     }
                 }
@@ -7658,12 +7620,7 @@ namespace cell
                         claim_path = cell::normalize_path(parsed["path"].get<std::string>());
                         // cheap pre-check before any approval prompt is shown
                         if (std::string refuse = cell::claims::refusal(claim_path, claim_owner, name().c_str()); !refuse.empty())
-                        {
-                            blocked_.store(true, std::memory_order_relaxed);
-                            rejected_for_.store(rejection_reason::claim, std::memory_order_relaxed);
-                            cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=claim path={}", name(), claim_path));
-                            return ToolOutput::fail(std::move(refuse));
-                        }
+                            return deny(rejection_reason::claim, std::move(refuse), std::format("claim path={}", claim_path));
                     }
                 }
                 ToolOutput output;
@@ -7675,12 +7632,7 @@ namespace cell
                 // the file while this call waited for approval)
                 if (!claim_path.empty())
                     if (std::string refuse = cell::claims::take(claim_path, claim_owner, claim_loop, name().c_str()); !refuse.empty())
-                    {
-                        blocked_.store(true, std::memory_order_relaxed);
-                        rejected_for_.store(rejection_reason::claim, std::memory_order_relaxed);
-                        cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason=claim_race path={}", name(), claim_path));
-                        return ToolOutput::fail(std::move(refuse));
-                    }
+                        return deny(rejection_reason::claim, std::move(refuse), std::format("claim_race path={}", claim_path));
                 return handler_(parsed, rt);
             }
         };
@@ -7845,6 +7797,38 @@ namespace cell
         }
 
         // -------- API clients --------
+        // The post-flight epilogue every streaming client shares: wipe the auth
+        // headers, publish the status code, then turn an HTTP-level or
+        // mid-stream failure into `err`. Returns false when the round failed.
+        static bool finish_stream(bool ok, long http, const std::string &url,
+                                  std::vector<std::string> &hdrs, long *http_status,
+                                  std::string &sse_buf, size_t &sse_base,
+                                  std::string &stream_err, std::string &err)
+        {
+            for (auto &h : hdrs)
+                encrypt::wipe(h);
+            if (http_status)
+                *http_status = http;
+            if (ok && http >= 400)
+            {
+                ok = false;
+                sse_finish(sse_buf, sse_base);
+                err = net::error_message(sse_buf);
+                if (err.empty())
+                    err = std::format("HTTP error {} (POST {})", http, url);
+            }
+            // a mid-stream error event (anthropic "error", responses
+            // "response.failed", chat error chunks) must fail the round even
+            // though the HTTP status was 200
+            if (ok && !stream_err.empty())
+            {
+                ok = false;
+                err = std::move(stream_err);
+            }
+            if (!ok && err.empty())
+                err = "stream request failed";
+            return ok;
+        }
 
         class OpenAI
         {
@@ -8117,28 +8101,7 @@ namespace cell
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (http_status)
-                    *http_status = http;
-                if (ok && http >= 400)
-                {
-                    ok = false;
-                    sse_finish(sse_buf, sse_base);
-                    err = net::error_message(sse_buf);
-                    if (err.empty())
-                        err = std::format("HTTP error {} (POST {})", http, url);
-                }
-                // a mid-stream error event (anthropic "error", responses
-                // "response.failed", chat error chunks) must fail the round even
-                // though the HTTP status was 200
-                if (ok && !stream_err.empty())
-                {
-                    ok = false;
-                    err = std::move(stream_err);
-                }
-                if (!ok && err.empty())
-                    err = "stream request failed";
+                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 if (text.empty() && reasoning.empty())
@@ -8618,28 +8581,7 @@ namespace cell
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (http_status)
-                    *http_status = http;
-                if (ok && http >= 400)
-                {
-                    ok = false;
-                    sse_finish(sse_buf, sse_base);
-                    err = net::error_message(sse_buf);
-                    if (err.empty())
-                        err = std::format("HTTP error {} (POST {})", http, url);
-                }
-                // a mid-stream error event (anthropic "error", responses
-                // "response.failed", chat error chunks) must fail the round even
-                // though the HTTP status was 200
-                if (ok && !stream_err.empty())
-                {
-                    ok = false;
-                    err = std::move(stream_err);
-                }
-                if (!ok && err.empty())
-                    err = "stream request failed";
+                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply in Chat Completions-compatible format
                 reply["role"] = "assistant";
                 // when the model produced tool calls, content must be null (per the
@@ -9022,28 +8964,7 @@ namespace cell
                 std::vector<std::string> hdrs = headers(api_key);
                 long http = 0;
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
-                for (auto &h : hdrs)
-                    encrypt::wipe(h);
-                if (http_status)
-                    *http_status = http;
-                if (ok && http >= 400)
-                {
-                    ok = false;
-                    sse_finish(sse_buf, sse_base);
-                    err = net::error_message(sse_buf);
-                    if (err.empty())
-                        err = std::format("HTTP error {} (POST {})", http, url);
-                }
-                // a mid-stream error event (anthropic "error", responses
-                // "response.failed", chat error chunks) must fail the round even
-                // though the HTTP status was 200
-                if (ok && !stream_err.empty())
-                {
-                    ok = false;
-                    err = std::move(stream_err);
-                }
-                if (!ok && err.empty())
-                    err = "stream request failed";
+                ok = finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 reply["content"] = nlohmann::json::array();
@@ -9130,15 +9051,7 @@ namespace cell
             std::error_code ec;
             std::filesystem::path saved = session_folder / "saved";
             std::filesystem::create_directories(saved, ec);
-            std::string base = std::format("msg-{}", cell::utc_stamp());
-            std::filesystem::path target = saved / (base + ".jsonl");
-            for (size_t n = 1;; ++n)
-            {
-                std::error_code eec;
-                if (!std::filesystem::exists(target, eec))
-                    break;
-                target = saved / (base + "-" + std::to_string(n) + ".jsonl");
-            }
+            std::filesystem::path target = fresh_archive_path(saved, "msg", cell::utc_stamp());
             std::ofstream f(target, std::ios::trunc);
             if (!f.is_open())
                 return {};
@@ -9230,16 +9143,8 @@ namespace cell
             return out;
         }
 
-        // leading/trailing blanks of one line, without copying
-        static std::string_view trim_view(std::string_view s)
-        {
-            size_t b = 0, e = s.size();
-            while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
-                b++;
-            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
-                e--;
-            return s.substr(b, e - b);
-        }
+        // leading/trailing blanks of one line, without copying (shared with text)
+        using cell::text::trim_view;
 
         // only http(s) / mailto links are turned into anchors
         static bool html_link_ok(std::string_view url)
@@ -11431,13 +11336,6 @@ details{break-inside:avoid}
                 it->second.load();
                 return it->second;
             }
-            session &get()
-            {
-                auto it = session_list.find(current);
-                if (it == session_list.end())
-                    throw std::runtime_error("no active session");
-                return it->second;
-            }
             void use(const std::string &session_id)
             {
                 current = session_id;
@@ -11767,11 +11665,6 @@ details{break-inside:avoid}
         }
     } // namespace stats
 
-    namespace chat
-    {
-        class session;
-    }
-
     // =========================================================================
     //  notice — a message bus for agent sessions. Any writer (the user from
     //  the REPL, a Teamwork child inside this process, or a second cell
@@ -11797,6 +11690,7 @@ details{break-inside:avoid}
             std::string topic; // free-form routing hint, e.g. "progress", "gate"
             std::string body;
             long long created_at = 0;
+            std::string state; // audit trail only: "delivered" / "dropped" (seen.jsonl)
         };
 
         // When a caller does not name a session, notices default to the
@@ -11853,6 +11747,8 @@ details{break-inside:avoid}
             std::string out = std::format("[notice] id={} from={}", text::display_safe(m.id), from);
             if (!m.topic.empty())
                 out += std::format(" topic={}", text::display_safe(m.topic));
+            if (!m.state.empty())
+                out += std::format(" state={}", text::display_safe(m.state));
             out += "\n";
             out += m.body;
             return out;
@@ -12105,6 +12001,139 @@ details{break-inside:avoid}
             return got.size();
         }
 
+        // ---- audit-trail housekeeping ----------------------------------------
+        // seen.jsonl accumulates every delivered/dropped notice and is only
+        // tail-trimmed past 1 MB. The user can clean it up explicitly: list
+        // the entries, delete one by id, or archive the whole file and start
+        // over. The archive mirrors the compaction form —
+        // saved/notice-<UTC time>.jsonl inside the session folder.
+
+        // read the audit trail, oldest first; unparsable lines are skipped
+        static std::vector<message> seen(const std::string &sid)
+        {
+            std::vector<message> out;
+            std::string target = sid.empty() ? default_session_id() : sid;
+            if (!valid_session_id(target))
+                return out;
+            std::ifstream f(seen_path(target));
+            if (!f.is_open())
+                return out;
+            std::string ln;
+            while (std::getline(f, ln))
+            {
+                if (ln.empty())
+                    continue;
+                auto j = nlohmann::json::parse(ln, nullptr, false);
+                if (j.is_discarded() || !j.is_object())
+                    continue;
+                message m;
+                m.id = clean_text(j.value("id", ""), 200);
+                m.from = clean_text(j.value("from", "unknown"), 200);
+                m.topic = clean_text(j.value("topic", ""), kMaxTopicChars);
+                m.body = clean_text(j.value("body", ""), kMaxBodyChars);
+                m.state = clean_text(j.value("state", ""), 40);
+                if (auto it = j.find("created_at"); it != j.end() && it->is_number_integer())
+                    m.created_at = it->get<long long>();
+                out.push_back(std::move(m));
+            }
+            return out;
+        }
+
+        // delete one audit entry by id. Non-matching lines — including
+        // unparsable ones — are preserved verbatim, so a delete can never
+        // edit an entry it did not target. Returns the number removed; 0 also
+        // covers a failed rewrite (logged, file untouched).
+        static size_t delete_seen(const std::string &sid, const std::string &id)
+        {
+            std::lock_guard<std::mutex> lk(drain_mutex());
+            std::string target = sid.empty() ? default_session_id() : sid;
+            if (!valid_session_id(target) || id.empty())
+                return 0;
+            std::error_code ec;
+            std::filesystem::path p = seen_path(target);
+            if (!std::filesystem::exists(p, ec))
+                return 0;
+            std::vector<std::string> lines;
+            std::ifstream in(p);
+            std::string ln;
+            while (std::getline(in, ln))
+                if (!ln.empty())
+                    lines.push_back(std::move(ln));
+            in.close();
+            std::string kept;
+            size_t removed = 0;
+            for (auto &l : lines)
+            {
+                auto j = nlohmann::json::parse(l, nullptr, false);
+                if (!j.is_discarded() && j.is_object() && j.value("id", std::string()) == id)
+                {
+                    removed++;
+                    continue;
+                }
+                kept += l;
+                kept.push_back('\n');
+            }
+            if (removed == 0)
+                return 0;
+            if (!plat::write_file_atomic(p, kept))
+            {
+                cell::sys::logger::instance().warn("notice", std::format("seen.jsonl delete failed sid={} id={}", target, id));
+                return 0;
+            }
+            return removed;
+        }
+
+        // archive the whole audit trail to saved/notice-<UTC time>.jsonl and
+        // remove the live file. The archive is written before the trail is
+        // touched: a failed archive leaves the trail intact. Returns the
+        // number of archived entries and the path via archived; an empty
+        // trail archives nothing (0, no file). err carries the failure reason.
+        static size_t clear_seen(const std::string &sid, std::filesystem::path &archived, std::string &err)
+        {
+            std::lock_guard<std::mutex> lk(drain_mutex());
+            archived.clear();
+            err.clear();
+            std::string target = sid.empty() ? default_session_id() : sid;
+            if (!valid_session_id(target))
+                return 0;
+            std::error_code ec;
+            std::filesystem::path p = seen_path(target);
+            if (!std::filesystem::exists(p, ec))
+                return 0;
+            std::ifstream in(p, std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            in.close();
+            size_t entries = 0;
+            for (std::string_view line : text::lines(text))
+                if (!line.empty())
+                    entries++;
+            if (entries == 0)
+                return 0; // nothing worth archiving; leave the empty file alone
+            std::filesystem::path saved = session_dir(target) / "saved";
+            std::error_code sec;
+            std::filesystem::create_directories(saved, sec);
+            if (sec)
+            {
+                err = std::format("cannot create saved folder: {}", sec.message());
+                return 0;
+            }
+            std::filesystem::path arc = fresh_archive_path(saved, "notice", cell::utc_stamp());
+            if (!plat::write_file_atomic(arc, text))
+            {
+                err = "failed to write the notice archive";
+                return 0;
+            }
+            // the archive is on disk: only now may the live trail go
+            std::error_code rec;
+            std::filesystem::remove(p, rec);
+            if (rec)
+                cell::sys::logger::instance().warn("notice", std::format("seen.jsonl remove failed sid={}", target));
+            archived = arc;
+            cell::sys::logger::instance().info("notice", std::format("seen archived sid={} entries={} file={}",
+                                                                     target, entries, arc.filename().string()));
+            return entries;
+        }
+
         // block until at least one matching notice is pending or the timeout
         // (seconds; <= 0 means wait forever) expires. In-process sends wake the
         // cv immediately; the periodic re-scan (poll_millis, for writers in other
@@ -12151,6 +12180,46 @@ details{break-inside:avoid}
             }
         }
     } // namespace notice
+
+    // shared post-processing for every tool result before it reaches the LLM:
+    // prompt-injection defence — only exec output is scanned for injection
+    // fingerprints (the sole tool with arbitrary shell reach); other tools get a
+    // basic size cap only, their sandboxing happens at call time. the marker is
+    // the path/command attribute carried by the wrapper for reload-time re-scan;
+    // pass out_marker when the caller also wants it for its console echo.
+    static std::string harden_tool_result(std::string_view tool_name, const std::string &args,
+                                          const std::string &output, std::string *out_marker = nullptr)
+    {
+        // the per-tool defaults are deliberate: sanitize_output caps at 128KB, and
+        // passing 512MB here would silently disable that cap
+        std::string body = tool_name == "exec" ? cell::box::sanitize_output(output)
+                                               : cell::box::truncate_output(output);
+        // repair non-UTF-8 bytes here, while the origin is still known: every
+        // serializer the result travels through (request body, transcript) is strict
+        body = cell::text::utf8_safe(body);
+        std::string marker;
+        try
+        {
+            auto ja = nlohmann::json::parse(args, nullptr, false);
+            if (ja.is_object())
+            {
+                for (const char *k : {"path", "dirpath", "cmd", "pattern"})
+                    if (ja.contains(k) && ja[k].is_string())
+                    {
+                        marker = ja[k].get<std::string>();
+                        if (marker.size() > 160)
+                            marker = cell::text::utf8_safe(marker, 157) + "...";
+                        break;
+                    }
+            }
+        }
+        catch (const std::exception &)
+        {
+        }
+        if (out_marker)
+            *out_marker = std::move(marker);
+        return cell::box::wrap_tool_output(tool_name, marker, body);
+    }
 
     // =========================================================================
     //  teamwork — supervised child-agent jobs. The task configs live with the
@@ -12452,18 +12521,10 @@ details{break-inside:avoid}
             notice::send_to(sid, from, topic, body, err, nullptr, droppable);
         }
 
+        // creation stamp of a job record: the shared on-disk stamp format
         static std::string creation_stamp(long long created_at)
         {
-            std::time_t tt = (std::time_t)created_at;
-            std::tm tm{};
-#ifdef _WIN32
-            gmtime_s(&tm, &tt);
-#else
-            gmtime_r(&tt, &tm);
-#endif
-            char stamp[32];
-            std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
-            return stamp;
+            return utc_stamp((std::time_t)created_at);
         }
 
         static bool valid_background(const std::string &bg)
@@ -12581,8 +12642,30 @@ details{break-inside:avoid}
             }
             return false;
         }
-
-        static nlohmann::json *find_job(nlohmann::json &store, const std::string &job_id);
+        // resolve a job id from an argument: current session first, then the
+        // other sessions of this working directory; on failure `out` receives
+        // the canonical "not found" message and the caller returns false
+        static bool open_job(const std::string &job_id, const std::string &sid, job_ref &ref, std::string &out)
+        {
+            if (find_job_anywhere(job_id, ref, sid))
+                return true;
+            out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            return false;
+        }
+        // reload a store file and locate the job in it again: callers that hold
+        // a job_ref but need a live pointer into the current on-disk state
+        static bool reload_job(const std::filesystem::path &path, const std::string &job_id,
+                               nlohmann::json &store, nlohmann::json *&job, std::string &out)
+        {
+            store = load_store_from(path);
+            job = find_job(store, job_id);
+            if (!job)
+            {
+                out = std::format("teamwork {} not found", job_id);
+                return false;
+            }
+            return true;
+        }
 
         // ---- worker spec normalization --------------------------------------
         static bool normalize_worker_item(const nlohmann::json &item, const std::string &default_name,
@@ -13126,18 +13209,12 @@ details{break-inside:avoid}
                              size_t max_children, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
-            nlohmann::json store = load_store_from(ref.store);
-            nlohmann::json *job = find_job(store, job_id);
-            if (!job)
-            {
-                out = std::format("teamwork {} not found", job_id);
+            nlohmann::json store;
+            nlohmann::json *job = nullptr;
+            if (!reload_job(ref.store, job_id, store, job, out))
                 return false;
-            }
             std::string job_status = jstr(*job, "status", "pending");
             if (job_status == "completed")
             {
@@ -13191,18 +13268,12 @@ details{break-inside:avoid}
         static bool remove_job(const std::string &job_id, bool agent_initiated, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
-            nlohmann::json store = load_store_from(ref.store);
-            nlohmann::json *job = find_job(store, job_id);
-            if (!job)
-            {
-                out = std::format("teamwork {} not found", job_id);
+            nlohmann::json store;
+            nlohmann::json *job = nullptr;
+            if (!reload_job(ref.store, job_id, store, job, out))
                 return false;
-            }
             std::string status = jstr(*job, "status", "pending");
             if (agent_initiated && status == "completed")
             {
@@ -13681,11 +13752,8 @@ details{break-inside:avoid}
         static bool get_report(const std::string &job_id, const std::string &worker, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
             auto list = ref.job.find("list");
             if (list == ref.job.end() || !list->is_array())
             {
@@ -14216,24 +14284,13 @@ details{break-inside:avoid}
                                       cell::box::truncate_output(answer, kReviewReasonChars)};
         }
 
-        static std::string child_tool_output(const std::string &name, const std::string &output)
-        {
-            std::string body = name == "exec" ? cell::box::sanitize_output(output)
-                                              : cell::box::truncate_output(output);
-            return cell::box::wrap_tool_output(name, "", body);
-        }
-
         static void accumulate_usage(const nlohmann::json &usage, worker_report &result)
         {
             if (!usage.is_object())
                 return;
-            long long in = 0, out_t = 0, total = 0;
-            has_int(usage, "prompt_tokens", in);
-            has_int(usage, "input_tokens", in);
-            has_int(usage, "completion_tokens", out_t);
-            has_int(usage, "output_tokens", out_t);
-            if (!has_int(usage, "total_tokens", total))
-                total = in + out_t;
+            long long in = usage_in(usage).value_or(0);
+            long long out_t = usage_out(usage).value_or(0);
+            long long total = usage_total(usage).value_or(in + out_t);
             result.input_tokens += in;
             result.output_tokens += out_t;
             result.total_tokens += total;
@@ -14898,6 +14955,26 @@ details{break-inside:avoid}
                     worker_tools_rt.claim_loop = [claim_job]() -> std::string
                     { return "teamwork " + claim_job; };
                 }
+                // one tool call through the registry: unknown tool -> message,
+                // a failed call with no text -> "[tool failed]", an exception ->
+                // its message (shared by the leased write/edit path and the rest)
+                auto run_one_tool = [&](const std::string &tool_name, const std::string &tool_args) -> std::string
+                {
+                    auto tool_it = rt.tool_list->find(tool_name);
+                    if (tool_it == rt.tool_list->end())
+                        return std::format("[unknown tool: {}]", tool_name);
+                    try
+                    {
+                        cell::ToolOutput tool_out = tool_it->second->execute(worker_tools_rt, tool_args);
+                        if (!tool_out.ok && tool_out.text.empty())
+                            return "[tool failed]";
+                        return std::move(tool_out.text);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        return std::format("[tool error: {}]", e.what());
+                    }
+                };
                 for (auto &call : tool_calls)
                 {
                     result.tool_calls++;
@@ -14913,45 +14990,11 @@ details{break-inside:avoid}
                         // the file lease decides: own files run, granted files are
                         // reviewed by the supervisor, everything else is refused
                         if (guard_file_write(name, args, output))
-                        {
-                            auto tool_it = rt.tool_list->find(name);
-                            if (tool_it == rt.tool_list->end())
-                                output = std::format("[unknown tool: {}]", name);
-                            else
-                                try
-                                {
-                                    cell::ToolOutput tool_out = tool_it->second->execute(worker_tools_rt, args);
-                                    output = std::move(tool_out.text);
-                                    if (!tool_out.ok && output.empty())
-                                        output = "[tool failed]";
-                                }
-                                catch (const std::exception &e)
-                                {
-                                    output = std::format("[tool error: {}]", e.what());
-                                }
-                        }
+                            output = run_one_tool(name, args);
                     }
                     else
-                    {
-                        auto tool_it = rt.tool_list->find(name);
-                        if (tool_it == rt.tool_list->end())
-                            output = std::format("[unknown tool: {}]", name);
-                        else
-                        {
-                            try
-                            {
-                                cell::ToolOutput tool_out = tool_it->second->execute(worker_tools_rt, args);
-                                output = std::move(tool_out.text);
-                                if (!tool_out.ok && output.empty())
-                                    output = "[tool failed]";
-                            }
-                            catch (const std::exception &e)
-                            {
-                                output = std::format("[tool error: {}]", e.what());
-                            }
-                        }
-                    }
-                    std::string wrapped = child_tool_output(name, output);
+                        output = run_one_tool(name, args);
+                    std::string wrapped = harden_tool_result(name, "{}", output);
                     if (provider.api_style == "anthropic")
                         messages.push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", call.value("id", "")}, {"content", wrapped}}})}});
                     else if (provider.api_style == "openai-responses")
@@ -15519,11 +15562,8 @@ details{break-inside:avoid}
             const std::string sid = rt.live_session && rt.live_session() ? rt.live_session()->id() : "current";
             rt.session_id = sid;
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
             {
                 std::lock_guard<std::mutex> lk(bg_mutex());
                 if (bg_queue().size() >= kMaxQueuedBgJobs)
@@ -15560,11 +15600,8 @@ details{break-inside:avoid}
             const std::string sid = rt.live_session && rt.live_session() ? rt.live_session()->id() : "current";
             rt.session_id = sid;
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
             nlohmann::json snapshot;
             size_t start_stage = 0;
             if (!begin_run(job_id, ref.store, out, start_stage, snapshot))
@@ -15579,18 +15616,12 @@ details{break-inside:avoid}
                                   size_t max_children, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
-            nlohmann::json store = load_store_from(ref.store);
-            nlohmann::json *job = find_job(store, job_id);
-            if (!job)
-            {
-                out = std::format("teamwork {} not found", job_id);
+            nlohmann::json store;
+            nlohmann::json *job = nullptr;
+            if (!reload_job(ref.store, job_id, store, job, out))
                 return false;
-            }
             if (jstr(*job, "status", "pending") != "pending")
             {
                 out = std::format("teamwork {} is {} and cannot accept new workers", job_id, jstr(*job, "status", "pending"));
@@ -15667,18 +15698,12 @@ details{break-inside:avoid}
         static bool remove_worker(const std::string &job_id, const std::string &worker, std::string &out, const std::string &sid)
         {
             job_ref ref;
-            if (!find_job_anywhere(job_id, ref, sid))
-            {
-                out = std::format("teamwork {} not found (searched this working directory)", job_id);
+            if (!open_job(job_id, sid, ref, out))
                 return false;
-            }
-            nlohmann::json store = load_store_from(ref.store);
-            nlohmann::json *job = find_job(store, job_id);
-            if (!job)
-            {
-                out = std::format("teamwork {} not found", job_id);
+            nlohmann::json store;
+            nlohmann::json *job = nullptr;
+            if (!reload_job(ref.store, job_id, store, job, out))
                 return false;
-            }
             if (jstr(*job, "status", "pending") == "running")
             {
                 out = std::format("teamwork {} is running", job_id);
@@ -15843,6 +15868,9 @@ static void print_help()
     cell::sys::println("  /notices send [SESSION] TEXT   deliver a notice to a session (default: current)");
     cell::sys::println("  /notices drain              consume pending notices into the conversation");
     cell::sys::println("  /notices clear              drop pending notices");
+    cell::sys::println("  /notices seen [list]        list the accumulated notice audit trail (seen.jsonl)");
+    cell::sys::println("  /notices seen clear         archive seen.jsonl to saved/notice-<UTC time>.jsonl and empty it");
+    cell::sys::println("  /notices seen rm ID         delete one accumulated notice by id");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
@@ -15854,46 +15882,6 @@ static void print_help()
     cell::sys::println("    Ctrl+W or Alt+Backspace kill word back   Alt+D kill word forward   Ctrl+U/K kill to start/end");
     cell::sys::println("    Ctrl+Y yank the last kill   Ctrl+T transpose   Ctrl+L clear screen");
     cell::sys::println("    Enter submit   Ctrl+C save & exit   Ctrl+D on an empty line exits   Esc cancels a running stream");
-}
-
-// shared post-processing for every tool result before it reaches the LLM:
-// prompt-injection defence — only exec output is scanned for injection
-// fingerprints (the sole tool with arbitrary shell reach); other tools get a
-// basic size cap only, their sandboxing happens at call time. the marker is
-// the path/command attribute carried by the wrapper for reload-time re-scan;
-// pass out_marker when the caller also wants it for its console echo.
-static std::string harden_tool_result(std::string_view tool_name, const std::string &args,
-                                      const std::string &output, std::string *out_marker = nullptr)
-{
-    // the per-tool defaults are deliberate: sanitize_output caps at 128KB, and
-    // passing 512MB here would silently disable that cap
-    std::string body = tool_name == "exec" ? cell::box::sanitize_output(output)
-                                           : cell::box::truncate_output(output);
-    // repair non-UTF-8 bytes here, while the origin is still known: every
-    // serializer the result travels through (request body, transcript) is strict
-    body = cell::text::utf8_safe(body);
-    std::string marker;
-    try
-    {
-        auto ja = nlohmann::json::parse(args, nullptr, false);
-        if (ja.is_object())
-        {
-            for (const char *k : {"path", "dirpath", "cmd", "pattern"})
-                if (ja.contains(k) && ja[k].is_string())
-                {
-                    marker = ja[k].get<std::string>();
-                    if (marker.size() > 160)
-                        marker = cell::text::utf8_safe(marker, 157) + "...";
-                    break;
-                }
-        }
-    }
-    catch (const std::exception &)
-    {
-    }
-    if (out_marker)
-        *out_marker = std::move(marker);
-    return cell::box::wrap_tool_output(tool_name, marker, body);
 }
 
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false)
@@ -16386,32 +16374,11 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
 // =============================================================================
 namespace selftest
 {
-    // Test result tracking
-    struct TestResult
-    {
-        std::string suite_name;
-        std::string test_name;
-        bool passed;
-        std::string error;
-        std::source_location loc;
-    };
-
-    // Test suite with setup/teardown
-    struct TestSuite
-    {
-        std::string name;
-        std::function<void()> setup;
-        std::function<void()> teardown;
-        std::vector<std::pair<std::string, std::function<void()>>> tests;
-    };
-
     // Test runner with statistics
     class TestRunner
     {
-        std::vector<TestResult> results;
         int total_passed = 0;
         int total_failed = 0;
-        int total_skipped = 0;
 
     public:
         // Enhanced expect macro with source location
@@ -16428,67 +16395,6 @@ namespace selftest
             else
             {
                 total_passed++;
-            }
-        }
-
-        // Run a single test suite
-        void run_suite(TestSuite &suite)
-        {
-            std::cout << "[" << suite.name << "] ";
-            std::cout.flush();
-
-            if (suite.setup)
-                suite.setup();
-
-            int suite_passed = 0;
-            int suite_failed = 0;
-
-            for (auto &[name, test] : suite.tests)
-            {
-                try
-                {
-                    test();
-                    suite_passed++;
-                }
-                catch (const std::exception &e)
-                {
-                    std::cerr << "  EXCEPTION: " << name << " - " << e.what() << std::endl;
-                    suite_failed++;
-                }
-            }
-
-            if (suite.teardown)
-                suite.teardown();
-
-            if (suite_failed == 0)
-            {
-                std::cout << "PASSED (" << suite_passed << " tests)" << std::endl;
-            }
-            else
-            {
-                std::cout << "FAILED (" << suite_failed << "/" << (suite_passed + suite_failed) << " tests)" << std::endl;
-            }
-        }
-
-        // Run multiple suites (with optional parallelism)
-        void run_suites(std::vector<TestSuite *> &suites, bool parallel = false)
-        {
-            if (parallel)
-            {
-                // Run independent suites in parallel
-                std::vector<std::future<void>> futures;
-                for (auto *suite : suites)
-                {
-                    futures.push_back(std::async(std::launch::async, [this, suite]()
-                                                 { run_suite(*suite); }));
-                }
-                for (auto &f : futures)
-                    f.get();
-            }
-            else
-            {
-                for (auto *suite : suites)
-                    run_suite(*suite);
             }
         }
 
@@ -16533,12 +16439,6 @@ namespace selftest
         SandboxGuard(const SandboxGuard &) = delete;
         SandboxGuard &operator=(const SandboxGuard &) = delete;
     };
-
-    // Helper to create test suites
-    TestSuite make_suite(const std::string &name)
-    {
-        return TestSuite{name, nullptr, nullptr, {}};
-    }
 }
 
 // =============================================================================
@@ -18324,6 +18224,103 @@ static int run_selftest()
         R.expect(nt::send_to(nsid, "user", "", "drop me", nerr) && nt::clear(nsid) == 1,
                  "notice: clear drops pending notices");
 
+        // ---- audit-trail housekeeping: seen list / rm / clear-with-archive --
+        {
+            const std::string ssid = "selftest-notice-seen";
+            std::error_code sec;
+            std::filesystem::remove_all(cell::session_dir(ssid), sec);
+            // three delivered notices land in the audit trail
+            R.expect(nt::send_to(ssid, "user", "progress", "first", nerr) &&
+                         nt::send_to(ssid, "teamwork/tw-x/worker_0", "worker", "second", nerr) &&
+                         nt::send_to(ssid, "user", "gate", "third", nerr),
+                     "notice: three notices queued for the seen tests");
+            R.expect(nt::drain(ssid).size() == 3, "notice: drain delivers the three notices");
+            auto trail = nt::seen(ssid);
+            R.expect(trail.size() == 3 && trail[0].body == "first" && trail[2].body == "third" &&
+                         trail[0].state == "delivered" && trail[1].from == "teamwork/tw-x/worker_0",
+                     "notice: seen lists the audit trail oldest first with state");
+
+            // delete a single entry: only the matching id goes, order is kept
+            R.expect(nt::delete_seen(ssid, trail[1].id) == 1, "notice: delete_seen removes one entry by id");
+            trail = nt::seen(ssid);
+            R.expect(trail.size() == 2 && trail[0].body == "first" && trail[1].body == "third",
+                     "notice: delete_seen keeps the other entries in order");
+            R.expect(nt::delete_seen(ssid, "nt-no-such-id") == 0 && nt::seen(ssid).size() == 2,
+                     "notice: delete_seen of an unknown id changes nothing");
+
+            // clear archives the trail msg-style and empties the live file
+            std::filesystem::path arc;
+            std::string serr;
+            R.expect(nt::clear_seen(ssid, arc, serr) == 2 && serr.empty(),
+                     "notice: clear_seen archives the accumulated trail");
+            R.expect(!arc.empty() && arc.parent_path().filename() == "saved" &&
+                         arc.filename().string().rfind("notice-", 0) == 0 && arc.extension() == ".jsonl",
+                     "notice: the trail archive is saved/notice-<UTC time>.jsonl");
+            std::ifstream af(arc);
+            size_t arc_lines = 0;
+            std::string aln;
+            while (std::getline(af, aln))
+                if (!aln.empty())
+                    arc_lines++;
+            R.expect(arc_lines == 2 && cell::box::exist(arc.string()) && nt::seen(ssid).empty(),
+                     "notice: the archive holds the entries and seen.jsonl is emptied");
+
+            // the -N numbering rule of the shared archive naming
+            {
+                std::filesystem::path sd = cell::session_dir(ssid) / "saved";
+                std::error_code nec2;
+                std::filesystem::create_directories(sd, nec2);
+                std::string stamp = cell::utc_stamp();
+                std::ofstream ph(sd / std::format("notice-{}.jsonl", stamp));
+                ph << "{}\n";
+                std::filesystem::path p1 = cell::fresh_archive_path(sd, "notice", stamp);
+                R.expect(p1.filename().string() == std::format("notice-{}-1.jsonl", stamp),
+                         "notice: a taken archive name gets a -1 suffix");
+                std::ofstream ph2(p1);
+                ph2 << "{}\n";
+                std::filesystem::path p2 = cell::fresh_archive_path(sd, "notice", stamp);
+                R.expect(p2.filename().string() == std::format("notice-{}-2.jsonl", stamp),
+                         "notice: the suffix keeps counting up per collision");
+            }
+
+            // an empty or missing trail archives nothing
+            std::filesystem::path arc3;
+            R.expect(nt::clear_seen(ssid, arc3, serr) == 0 && arc3.empty() && serr.empty(),
+                     "notice: clearing a missing trail writes no archive");
+            {
+                std::ofstream ph(nt::seen_path(ssid));
+                ph << ""; // an empty file: nothing worth archiving either
+            }
+            R.expect(nt::clear_seen(ssid, arc3, serr) == 0 && arc3.empty() && serr.empty(),
+                     "notice: clearing an empty trail writes no archive");
+
+            // a broken saved/ folder fails the clear and leaves the trail intact
+            {
+                const std::string bsid = "selftest-notice-seen-fail";
+                std::error_code bec;
+                std::filesystem::remove_all(cell::session_dir(bsid), bec);
+                std::filesystem::create_directories(nt::seen_path(bsid).parent_path(), bec);
+                {
+                    std::ofstream ph(nt::seen_path(bsid));
+                    ph << nlohmann::json{{"id", "nt-x"}, {"from", "user"}, {"topic", ""}, {"body", "keep"},
+                                         {"created_at", 1}, {"state", "delivered"}}
+                              .dump()
+                       << "\n";
+                }
+                {
+                    std::ofstream block(cell::session_dir(bsid) / "saved"); // saved is a file: no archives possible
+                    block << "not a directory";
+                }
+                std::filesystem::path arc4;
+                std::string berr;
+                R.expect(nt::clear_seen(bsid, arc4, berr) == 0 && !berr.empty() &&
+                             nt::seen(bsid).size() == 1,
+                         "notice: a failed archive leaves the trail untouched");
+                std::filesystem::remove_all(cell::session_dir(bsid), bec);
+            }
+            std::filesystem::remove_all(cell::session_dir(ssid), sec);
+        }
+
         // cleanup the selftest notice session folder
         std::error_code nec;
         std::filesystem::remove_all(cell::session_dir("selftest-notice-session"), nec);
@@ -19363,7 +19360,7 @@ static int run_selftest()
     {
         // a single non-UTF-8 byte used to make the strict dump() throw
         // type_error.316 and take the whole turn (and the transcript write) down
-        std::string repaired = harden_tool_result("read", "{\"path\":\"x\"}", std::string("head \xFF\xFE tail"));
+        std::string repaired = cell::harden_tool_result("read", "{\"path\":\"x\"}", std::string("head \xFF\xFE tail"));
         bool strict_ok = true;
         try
         {
@@ -19390,7 +19387,7 @@ static int run_selftest()
         R.expect(dumped, "session serialization survives non-UTF-8 message content");
 
         // the exec cap is sanitize_output's own 128KB default, not 512MB
-        R.expect(harden_tool_result("exec", "{}", std::string(300 * 1024, 'a')).size() < 200 * 1024,
+        R.expect(cell::harden_tool_result("exec", "{}", std::string(300 * 1024, 'a')).size() < 200 * 1024,
                  "harden_tool_result caps exec output at the default size");
     }
 
@@ -19695,40 +19692,6 @@ namespace cell
                     if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
                         n += (long long)b["text"].get_ref<const std::string &>().size();
             return n;
-        }
-        static std::optional<long long> usage_in(const nlohmann::json &u)
-        {
-            if (u.is_object())
-            {
-                if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
-                    return u["prompt_tokens"].get<long long>();
-                if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-                    return u["input_tokens"].get<long long>();
-            }
-            return std::nullopt;
-        }
-        static std::optional<long long> usage_out(const nlohmann::json &u)
-        {
-            if (u.is_object())
-            {
-                if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
-                    return u["completion_tokens"].get<long long>();
-                if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
-                    return u["output_tokens"].get<long long>();
-            }
-            return std::nullopt;
-        }
-        static std::optional<long long> usage_total(const nlohmann::json &u)
-        {
-            if (u.is_object())
-            {
-                if (u.contains("total_tokens") && u["total_tokens"].is_number_integer())
-                    return u["total_tokens"].get<long long>();
-                auto in = usage_in(u), out = usage_out(u);
-                if (in && out)
-                    return *in + *out;
-            }
-            return std::nullopt;
         }
         // cache hit rate = cached prompt tokens / total prompt tokens
         // OpenAI: usage.prompt_tokens_details.cached_tokens within usage.prompt_tokens (total incl. cache)
@@ -20174,20 +20137,18 @@ namespace cell
             std::string model;
             if (!cfg_.compact_provider.empty())
             {
-                for (auto &pe : cfg_.providers)
-                    if (pe.name == cfg_.compact_provider)
-                    {
-                        p = &pe;
-                        break;
-                    }
-                if (!p)
+                int pi = cell::config::find(cfg_, cfg_.compact_provider);
+                if (pi < 0)
                 {
                     log.warn("ctx", std::format("compact provider '{}' not registered, falling back to session model", cfg_.compact_provider));
                     p = cfg_.current_provider_entry();
                     model = cfg_.current_model;
                 }
                 else
+                {
+                    p = &cfg_.providers[(size_t)pi];
                     model = cfg_.compact_model.empty() ? cfg_.current_model : cfg_.compact_model;
+                }
             }
             else
             {
@@ -20614,6 +20575,31 @@ namespace cell
                         tvb.policy = res[i].policy;
                         ev.on_tool_begin(tvb);
                     };
+                    // map one executed tool's outcome onto its result slot:
+                    // status, blocked/rejected state, the surfaced refusal text,
+                    // multimodal blocks and elapsed time (both passes)
+                    auto record = [&](size_t i, cell::tools::tool *t, cell::ToolOutput o, double sec)
+                    {
+                        if (o.ok)
+                        {
+                            res[i].output = std::move(o.text);
+                            res[i].status = "ok";
+                        }
+                        else if (t && t->blocked())
+                        {
+                            res[i].blocked = true;
+                            res[i].rejected_for = t->rejected_for();
+                            res[i].status = "blocked";
+                            if (!o.text.empty())
+                                res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
+                        }
+                        else if (!o.text.empty())
+                        {
+                            res[i].output = std::move(o.text);
+                        }
+                        res[i].multimodal_blocks = std::move(o.blocks);
+                        res[i].sec = sec;
+                    };
                     // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
                     // run concurrently on the shared worker pool (max_threads); Deferred
                     // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
@@ -20650,7 +20636,7 @@ namespace cell
                             res[i].policy = "allow";
                             allow_count++;
                             emit_begin(i);
-                            cell::sys::pool().submit([&res, this, it, i]
+                            cell::sys::pool().submit([&res, &record, this, it, i]
                                                      {
                             auto t0 = cell::sys::detail::clock::now();
                             cell::ToolOutput o;
@@ -20663,25 +20649,7 @@ namespace cell
                                 o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
                                 res[i].status = "exception";
                             }
-                            if (o.ok)
-                            {
-                                res[i].output = std::move(o.text);
-                                res[i].status = "ok";
-                            }
-                            else if (it->second->blocked())
-                            {
-                                res[i].blocked = true;
-                                res[i].rejected_for = it->second->rejected_for();
-                                res[i].status = "blocked";
-                                if (!o.text.empty())
-                                    res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
-                            }
-                            else if (!o.text.empty())
-                            {
-                                res[i].output = std::move(o.text);
-                            }
-                            res[i].multimodal_blocks = std::move(o.blocks);
-                            res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
+                            record(i, it->second.get(), std::move(o), cell::sys::elapsed_ms(t0) / 1000.0); });
                         }
                         else
                         {
@@ -20701,11 +20669,12 @@ namespace cell
                             continue;
                         auto t0 = cell::sys::detail::clock::now();
                         auto it = tool_list_.find(res[i].name);
+                        cell::tools::tool *t = it != tool_list_.end() ? it->second.get() : nullptr;
                         cell::ToolOutput o;
                         try
                         {
-                            if (it != tool_list_.end())
-                                o = it->second->execute(tool_rt_, res[i].args);
+                            if (t)
+                                o = t->execute(tool_rt_, res[i].args);
                             else
                                 o = cell::ToolOutput::fail("[tool failed]");
                         }
@@ -20714,25 +20683,7 @@ namespace cell
                             o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
                             res[i].status = "exception";
                         }
-                        if (o.ok)
-                        {
-                            res[i].output = std::move(o.text);
-                            res[i].status = "ok";
-                        }
-                        else if (it != tool_list_.end() && it->second->blocked())
-                        {
-                            res[i].blocked = true;
-                            res[i].rejected_for = it->second->rejected_for();
-                            res[i].status = "blocked";
-                            if (!o.text.empty())
-                                res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
-                        }
-                        else if (!o.text.empty())
-                        {
-                            res[i].output = std::move(o.text);
-                        }
-                        res[i].multimodal_blocks = std::move(o.blocks);
-                        res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                        record(i, t, std::move(o), cell::sys::elapsed_ms(t0) / 1000.0);
                     }
                     // results are emitted in the original tool_call order
                     size_t tc_seq = 0;
@@ -21041,12 +20992,8 @@ int main(int argc, char const *argv[])
     // apply the exec sandbox mode from config/--sandbox (default: full-access)
     {
         std::string m = cell::text::trim(cfg.sandbox_mode);
-        if (m == "read-only" || m == "readonly")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
-        else if (m == "edit-only" || m == "edit")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::EditOnly;
-        else if (m == "full-access" || m == "full")
-            cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+        if (auto parsed = cell::box::parse_mode(m))
+            cell::box::sandbox_mode() = *parsed;
         else
         {
             cell::sys::warn("unknown sandbox mode '{}' - using full-access", m);
@@ -22287,12 +22234,8 @@ int repl::run()
              {
                  if (toks.size() >= 2)
                  {
-                     if (toks[1] == "read-only" || toks[1] == "readonly")
-                         cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
-                     else if (toks[1] == "edit-only" || toks[1] == "edit")
-                         cell::box::sandbox_mode() = cell::box::SandboxMode::EditOnly;
-                     else if (toks[1] == "full-access" || toks[1] == "full")
-                         cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+                     if (auto parsed = cell::box::parse_mode(toks[1]))
+                         cell::box::sandbox_mode() = *parsed;
                      else
                      {
                          cell::sys::error("usage: /sandbox [read-only|edit-only|full-access]");
@@ -22686,13 +22629,7 @@ int repl::run()
                              }
                              std::string prov = toks[2].substr(0, sep);
                              std::string mdl = toks[2].substr(sep + 1);
-                             bool found = false;
-                             for (auto &pe : cfg.providers)
-                                 if (pe.name == prov)
-                                 {
-                                     found = true;
-                                     break;
-                                 }
+                             bool found = cell::config::find(cfg, prov) >= 0;
                              if (!found)
                              {
                                  cell::sys::error("unknown provider: {} (only registered providers can be set)", prov);
@@ -22890,8 +22827,58 @@ int repl::run()
                      cell::sys::println("dropped {} pending notice(s)", n);
                      return cmd_flow::handled;
                  }
+                 if (sub == "seen")
+                 {
+                     // housekeeping for the accumulated audit trail (seen.jsonl):
+                     // list it, archive + empty it, or delete a single entry
+                     std::string op = toks.size() > 2 ? toks[2] : "list";
+                     if (op == "list")
+                     {
+                         auto got = cell::notice::seen(cur_sid);
+                         if (got.empty())
+                             cell::sys::println("no accumulated notices (seen.jsonl is empty)");
+                         else
+                         {
+                             cell::sys::println("{} accumulated notice(s):", got.size());
+                             for (auto &m : got)
+                                 cell::sys::println("{}", cell::notice::render(m));
+                         }
+                         return cmd_flow::handled;
+                     }
+                     if (op == "clear")
+                     {
+                         std::filesystem::path arc;
+                         std::string err;
+                         size_t n = cell::notice::clear_seen(cur_sid, arc, err);
+                         if (!err.empty())
+                             cell::sys::error("{}", err);
+                         else if (n == 0)
+                             cell::sys::println("no accumulated notices to clear");
+                         else
+                             cell::sys::println("archived {} notice(s) to saved/{}", n, arc.filename().string());
+                         return cmd_flow::handled;
+                     }
+                     if (op == "rm" || op == "del")
+                     {
+                         if (toks.size() < 4)
+                         {
+                             cell::sys::error("usage: /notices seen rm ID (ids: /notices seen)");
+                             return cmd_flow::handled;
+                         }
+                         size_t n = cell::notice::delete_seen(cur_sid, toks[3]);
+                         if (n == 0)
+                             cell::sys::error("no accumulated notice with id {} (see /notices seen)",
+                                              cell::text::display_safe(toks[3]));
+                         else
+                             cell::sys::println("deleted {} accumulated notice(s) with id {}", n,
+                                                cell::text::display_safe(toks[3]));
+                         return cmd_flow::handled;
+                     }
+                     cell::sys::error("usage: /notices seen [list | clear | rm ID]");
+                     return cmd_flow::handled;
+                 }
                  cell::sys::error("usage: /notices [list | wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
-                 cell::sys::error("        | send [SESSION_ID] TEXT | drain | clear]");
+                 cell::sys::error("        | send [SESSION_ID] TEXT | drain | clear | seen [list | clear | rm ID]]");
                  return cmd_flow::handled;
              }},
             {"/teamworks", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
@@ -22948,29 +22935,15 @@ int repl::run()
                      cell::sys::println("{}", out);
                      return cmd_flow::handled;
                  }
-                 if (arg0() == "run" && toks.size() >= 3)
+                 // run a job now, queue it (run_bg), or continue a gated/stopped
+                 // one from its saved stage (resume: run_job handles both)
+                 if ((arg0() == "run" || arg0() == "run_bg" || arg0() == "resume") && toks.size() >= 3)
                  {
                      std::string out;
-                     if (cell::teamwork::run_job(eng.team_rt(), toks[2], out))
-                         cell::sys::println("{}", out);
-                     else
-                         cell::sys::error("{}", out);
-                     return cmd_flow::handled;
-                 }
-                 if (arg0() == "run_bg" && toks.size() >= 3)
-                 {
-                     std::string out;
-                     if (cell::teamwork::run_job_bg(eng.team_rt(), toks[2], out))
-                         cell::sys::println("{}", out);
-                     else
-                         cell::sys::error("{}", out);
-                     return cmd_flow::handled;
-                 }
-                 if (arg0() == "resume" && toks.size() >= 3)
-                 {
-                     // continue a gated/stopped workflow job from its saved stage
-                     std::string out;
-                     if (cell::teamwork::run_job(eng.team_rt(), toks[2], out))
+                     bool ok = arg0() == "run_bg"
+                                   ? cell::teamwork::run_job_bg(eng.team_rt(), toks[2], out)
+                                   : cell::teamwork::run_job(eng.team_rt(), toks[2], out);
+                     if (ok)
                          cell::sys::println("{}", out);
                      else
                          cell::sys::error("{}", out);

@@ -178,11 +178,14 @@ vcpkg install curl nlohmann-json libsodium
 ### Build
 
 ```bash
-# POSIX / MSYS2
+# POSIX
 g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
 
+# Windows / MSYS2 (the CA-bundle export walks the system certificate store: crypt32)
+g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32
+
 # MSVC
-cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib
+cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib
 ```
 
 ### Run
@@ -318,6 +321,9 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/notices send [SESSION] TEXT` | Deliver a notice to a session (the token after `send` is the target only when it resolves to a session id — exact match or unique prefix; otherwise the text goes to the current session) |
 | `/notices drain` | Consume pending notices into the conversation (also happens automatically before every LLM turn) |
 | `/notices clear` | Drop pending notices (archived to `seen.jsonl`) |
+| `/notices seen [list]` | List the accumulated notice audit trail (`seen.jsonl`) with each entry's id and state |
+| `/notices seen clear` | Archive `seen.jsonl` to `saved/notice-<UTC time>.jsonl` and empty it |
+| `/notices seen rm ID` | Delete one accumulated notice by id |
 | `/save` | Persist the current session now (flushes the async writer) |
 | `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
 | `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
@@ -639,6 +645,12 @@ supervisor never has to poll.
 - **Consume**: `/notices drain` (or `notice drain`) delivers pending notices into the conversation
   as context; `wait` delivers what it woke for; `clear` drops them. Delivered = exactly once per
   draining session, thanks to file removal under a drain lock.
+- **Cleanup**: delivered/dropped notices accumulate in `notices/seen.jsonl` (tail-trimmed past
+  1 MB). `/notices seen` lists the trail with each entry's id and state, `/notices seen rm ID`
+  deletes a single entry, and `/notices seen clear` archives the whole file to
+  `saved/notice-<UTC time>.jsonl` — the same naming and `-N` numbering as the `saved/msg-…`
+  compaction archives — before emptying it. The archive is written first, so a failed archive
+  leaves the trail intact.
 
 ## Security model
 
