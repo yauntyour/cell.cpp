@@ -4526,7 +4526,13 @@ namespace cell
                     if (larger_bytes > 0 && (long long)sz < larger_bytes)
                         continue;
                     auto sys_t = std::chrono::file_clock::to_sys(mtime);
-                    std::tm tm = utc_tm(std::chrono::system_clock::to_time_t(sys_t));
+                    // to_sys() hands back a nanosecond-resolution sys_time and
+                    // libc++ backs that count with 128 bits on Apple, while
+                    // to_time_t() only accepts system_clock's own time_point
+                    // (microseconds): narrow first — a no-op where the two
+                    // already coincide
+                    auto sys_tp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(sys_t);
+                    std::tm tm = utc_tm(std::chrono::system_clock::to_time_t(sys_tp));
                     char stamp[32];
                     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
                     output += std::format("{}  {:>10} bytes  {}\n", rel, (long long)sz, stamp);
