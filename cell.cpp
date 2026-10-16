@@ -4121,41 +4121,47 @@ namespace cell
                 sorted.push_back(std::move(entries[i]));
             return sorted;
         }
+        // bookkeeping for walk_entries' explicit DFS stack: one entry per
+        // directory level. It lives outside the coroutine on purpose — a
+        // function-local type stored in a coroutine frame has no linkage and
+        // makes GCC warn with -Wsubobject-linkage.
+        struct walk_frame
+        {
+            std::vector<std::filesystem::directory_entry> entries;
+            size_t i = 0;
+            std::string prefix;
+        };
+        // true when `p`, after resolving links, stays inside the canonical walk
+        // root `root_norm` (also hoisted out of the coroutine, see above)
+        static bool inside_root(const std::filesystem::path &p, const std::string &root_norm)
+        {
+            std::error_code vec;
+            std::filesystem::path canon = std::filesystem::weakly_canonical(p, vec);
+            if (vec)
+                return false;
+            std::string s = canon.generic_string();
+            if (s.size() < root_norm.size() || s.compare(0, root_norm.size(), root_norm) != 0)
+                return false;
+            return s.size() == root_norm.size() || s[root_norm.size()] == '/';
+        }
         // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
         // path, is_directory) for every non-hidden entry, one level at a time, in
         // sorted order. consumers break out of the range-for to stop early.
         static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
         {
-            struct frame
-            {
-                std::vector<std::filesystem::directory_entry> entries;
-                size_t i = 0;
-                std::string prefix;
-            };
             std::error_code ec;
             // canonical walk root: symlinks are only followed when they stay inside it
             std::filesystem::path root_canon = std::filesystem::weakly_canonical(root_path, ec);
             const std::string root_norm = (ec ? root_path : root_canon).generic_string();
-            auto inside_root = [&](const std::filesystem::path &p) -> bool
-            {
-                std::error_code vec;
-                std::filesystem::path canon = std::filesystem::weakly_canonical(p, vec);
-                if (vec)
-                    return false;
-                std::string s = canon.generic_string();
-                if (s.size() < root_norm.size() || s.compare(0, root_norm.size(), root_norm) != 0)
-                    return false;
-                return s.size() == root_norm.size() || s[root_norm.size()] == '/';
-            };
             // canonical directories already visited: a loop (`sub -> .`) or a link to
             // an ancestor would otherwise recurse for ever
             std::unordered_set<std::string> visited;
             visited.insert(root_norm);
-            std::vector<frame> stack;
+            std::vector<walk_frame> stack;
             stack.push_back({collect_entries(root_path, ec), 0, ""});
             while (!stack.empty())
             {
-                frame &top = stack.back();
+                walk_frame &top = stack.back();
                 if (top.i >= top.entries.size())
                 {
                     stack.pop_back();
@@ -4176,7 +4182,7 @@ namespace cell
                     // `is_directory()` follows links, so `sub -> /etc` would let
                     // rg/find read outside the sandbox-bounded directory (check_path
                     // only validates the root argument)
-                    if (!inside_root(e.path()))
+                    if (!inside_root(e.path(), root_norm))
                         continue;
                     if (is_dir)
                     {
