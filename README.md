@@ -317,8 +317,9 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/teamworks reports [JOB] [worker:W] [n:N] [full] [all]` | Print several child reports (newest first) |
 | `/teamworks report JOB:worker` | Print one child's report |
 | `/notices` | Peek pending notices of the current session (see [Notices](#notices)) |
+| `/notices sessions` | List concurrent sessions (id, workspace, pending notices, idle time) so another session can be addressed |
 | `/notices wait [SEC] [from:X] [topic:Y]` | Block token-free until a matching notice arrives, then deliver pending notices into the conversation (default 60s, max 3600s) |
-| `/notices send [SESSION] TEXT` | Deliver a notice to a session (the token after `send` is the target only when it resolves to a session id — exact match or unique prefix; otherwise the text goes to the current session) |
+| `/notices send [SESSION] TEXT` | Deliver a notice to a session — SESSION resolves as an exact id, a unique id prefix, a 16-hex workspace key, a workspace path, `reply` (the newest notice's sender) or `current`; an unresolvable first token is treated as the message body for the current session |
 | `/notices drain` | Consume pending notices into the conversation (also happens automatically before every LLM turn) |
 | `/notices clear` | Drop pending notices (archived to `seen.jsonl`) |
 | `/notices seen [list]` | List the accumulated notice audit trail (`seen.jsonl`) with each entry's id and state |
@@ -627,6 +628,19 @@ JSON file into the target session's `notices/pending/` folder (atomic write, san
 UTF-8 only, control/ANSI bytes stripped, 16 KB body cap, 500 pending-files cap). Delivered notices
 are archived to `notices/seen.jsonl`; a failed archive is logged, but never blocks delivery.
 
+**Addressing is handle-based.** A session can be named by its exact id, a unique id prefix, its
+16-hex workspace key, a workspace path (both land on that workspace's newest session), `current`
+(the default), or `reply`/`@` (the sender of the newest notice *addressed to the caller* whose
+session still exists — pending notices first, then the delivered trail). `/notices sessions` (or
+the tool's `sessions` operation) lists the concurrent sessions with id, workspace, pending count
+and idle time, so discovery never requires copying a full id. A session's folder is materialized
+the moment the session becomes live — even before any transcript is saved — so a running CLI or a
+freshly opened GUI workspace is discoverable while it exists in memory only. Only `/notices send` texts survive
+as a fallback: a first token that resolves to nothing is treated as message body. Every send
+records the sender's session (`from_session`) unless it targets the sender itself; a notice that
+carries one is **answerable** — the receiver answers with `session=reply`, and the injected
+conversation context shows the address plus a reply hint.
+
 **Waiting is token-free.** `/notices wait` (and the `notice` tool's `wait` operation) block on a
 condition variable with a periodic folder re-scan (0.2 s in the REPL, ~0.7 s for the tool) — no LLM
 request is made while idle. In-process sends wake the waiter instantly; cross-process sends arrive
@@ -634,8 +648,13 @@ within a second. Pending notices are also drained automatically before every LLM
 supervisor never has to poll.
 
 - **Send**: `/notices send [SESSION] TEXT`, or the `notice` tool (`from`/`topic` fields give the
-  receiver routing hints). Teamwork children report progress this way — `notice` is the one tool
-  available to them beyond their sandbox, in every job mode.
+  receiver routing hints; results confirm the reply address). Teamwork children report progress
+  this way — `notice` is the one tool available to them beyond their sandbox, in every job mode.
+- **Discover**: `/notices sessions` or the tool's `sessions` operation — id, cwd, pending count and
+  idle time per session, most recently active first (the caller is marked), capped at 50 rows.
+- **Reply**: a delivered notice that names a `session=` can be answered without knowing any id:
+  `session=reply` in the tool, `/notices send reply TEXT` in the REPL — the reply itself carries
+  the replier's address, so conversations route both ways.
 - **Automatic progress**: every Teamwork job posts notices for job start/completion/failure, stage
   start/finish, gate pauses, stops, and each worker start/finish (with status and a summary
   snippet), all `from=teamwork/<job-id>[/<worker>]`.

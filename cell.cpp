@@ -10852,6 +10852,16 @@ details{break-inside:avoid}
                 // maps the id prefix (the cwd key) back to the real directory
                 std::string indexed = cell::cwd_for_key(cell::session_prefix(session_id));
                 cwd = indexed.empty() ? fallback_cwd.string() : indexed;
+                // materialize the session folder the moment the session object
+                // exists on disk: every cross-process discovery path (the notice
+                // handle resolver, sessions.list, latest_session_id_for_cwd)
+                // scans root/sessions, and a session that is live but not yet
+                // saved — a fresh GUI workspace, a running CLI — must be
+                // addressable while it exists in memory only. unload() does the
+                // same mkdir when it saves; the transcript file itself stays
+                // absent until something is actually written.
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
             }
             // a fresh session id bound to an explicit cwd (multi-workspace)
             static session fresh(const std::filesystem::path &cwd_dir, const std::string &cwd_key)
@@ -11739,8 +11749,9 @@ details{break-inside:avoid}
         struct message
         {
             std::string id;
-            std::string from;  // sender label, e.g. "user", "teamwork/tw-X/worker_0"
-            std::string topic; // free-form routing hint, e.g. "progress", "gate"
+            std::string from;         // sender label, e.g. "user", "teamwork/tw-X/worker_0"
+            std::string from_session; // sender's session id when known: the reply address
+            std::string topic;        // free-form routing hint, e.g. "progress", "gate"
             std::string body;
             long long created_at = 0;
             std::string state; // audit trail only: "delivered" / "dropped" (seen.jsonl)
@@ -11798,6 +11809,8 @@ details{break-inside:avoid}
         {
             std::string from = m.from.empty() ? "unknown" : text::display_safe(m.from);
             std::string out = std::format("[notice] id={} from={}", text::display_safe(m.id), from);
+            if (!m.from_session.empty())
+                out += std::format(" session={}", text::display_safe(m.from_session));
             if (!m.topic.empty())
                 out += std::format(" topic={}", text::display_safe(m.topic));
             if (!m.state.empty())
@@ -11810,10 +11823,13 @@ details{break-inside:avoid}
         // ---- send ------------------------------------------------------------
         // droppable marks a sender whose messages may be turned away when the
         // queue is full (teamwork progress): losing a progress note is cheap,
-        // losing a gate notice is not, and a flood must never cause the latter
+        // losing a gate notice is not, and a flood must never cause the latter.
+        // from_session names the sender's session when the receiver may want to
+        // reply ("reply" handle); an invalid or empty value is simply omitted.
         static bool send_to(const std::string &session_id, const std::string &from,
                             const std::string &topic, const std::string &body, std::string &err,
-                            std::string *out_id = nullptr, bool droppable = false)
+                            std::string *out_id = nullptr, bool droppable = false,
+                            const std::string &from_session = "")
         {
             std::string sid = session_id.empty() ? default_session_id() : session_id;
             if (!valid_session_id(sid))
@@ -11834,6 +11850,9 @@ details{break-inside:avoid}
             m.id = std::format("nt-{}-{:x}-{:x}-{:04x}", cell::utc_stamp(), plat::current_process_id(),
                                seq.fetch_add(1), rnd);
             m.from = clean_text(from.empty() ? "unknown" : from, 200);
+            // a malformed reply address must never turn into a path later,
+            // and a session notice that talks to itself needs no address back
+            m.from_session = (from_session != sid && valid_session_id(from_session)) ? from_session : "";
             m.topic = clean_text(topic, kMaxTopicChars);
             m.body = clean_text(body, kMaxBodyChars);
             if (m.body.empty())
@@ -11878,13 +11897,14 @@ details{break-inside:avoid}
                     std::filesystem::remove(existing[i], ec);
             }
             // atomic write: readers never see a partial notice
-            if (!plat::write_file_atomic(dir / (m.id + ".json"),
-                                         nlohmann::json{{"id", m.id},
-                                                        {"from", m.from},
-                                                        {"topic", m.topic},
-                                                        {"body", m.body},
-                                                        {"created_at", m.created_at}}
-                                             .dump(2)))
+            nlohmann::json j{{"id", m.id},
+                             {"from", m.from},
+                             {"topic", m.topic},
+                             {"body", m.body},
+                             {"created_at", m.created_at}};
+            if (!m.from_session.empty())
+                j["from_session"] = m.from_session;
+            if (!plat::write_file_atomic(dir / (m.id + ".json"), j.dump(2)))
             {
                 err = "failed to write the notice file";
                 return false;
@@ -11892,8 +11912,8 @@ details{break-inside:avoid}
             wake_local();
             if (out_id)
                 *out_id = m.id;
-            cell::sys::logger::instance().info("notice", std::format("sent id={} to={} from={} topic={} chars={}",
-                                                                     m.id, sid, m.from, m.topic, m.body.size()));
+            cell::sys::logger::instance().info("notice", std::format("sent id={} to={} from={} from_session={} topic={} chars={}",
+                                                                     m.id, sid, m.from, m.from_session, m.topic, m.body.size()));
             return true;
         }
 
@@ -11931,6 +11951,14 @@ details{break-inside:avoid}
                 // (render() applies display_safe for the console).
                 m.id = p.stem().string();
                 m.from = clean_text(j.value("from", "unknown"), 200);
+                // a foreign writer could store anything here: keep only a
+                // well-formed session id, never a path-shaped value
+                if (auto it = j.find("from_session"); it != j.end() && it->is_string())
+                {
+                    std::string fs = it->get<std::string>();
+                    if (valid_session_id(fs))
+                        m.from_session = std::move(fs);
+                }
                 m.topic = clean_text(j.value("topic", ""), kMaxTopicChars);
                 m.body = clean_text(j.value("body", ""), kMaxBodyChars);
                 if (auto it = j.find("created_at"); it != j.end() && it->is_number_integer())
@@ -11973,13 +12001,15 @@ details{break-inside:avoid}
             std::error_code ec;
             std::filesystem::path p = seen_path(sid);
             std::filesystem::create_directories(p.parent_path(), ec);
-            std::string line = nlohmann::json{{"id", m.id},
-                                              {"from", m.from},
-                                              {"topic", m.topic},
-                                              {"body", m.body},
-                                              {"created_at", m.created_at},
-                                              {"state", state}}
-                                   .dump();
+            nlohmann::json j{{"id", m.id},
+                             {"from", m.from},
+                             {"topic", m.topic},
+                             {"body", m.body},
+                             {"created_at", m.created_at},
+                             {"state", state}};
+            if (!m.from_session.empty())
+                j["from_session"] = m.from_session;
+            std::string line = j.dump();
             if (std::filesystem::exists(p, ec))
             {
                 std::error_code sec;
@@ -12088,6 +12118,12 @@ details{break-inside:avoid}
                 message m;
                 m.id = clean_text(j.value("id", ""), 200);
                 m.from = clean_text(j.value("from", "unknown"), 200);
+                if (auto it = j.find("from_session"); it != j.end() && it->is_string())
+                {
+                    std::string fs = it->get<std::string>();
+                    if (valid_session_id(fs))
+                        m.from_session = std::move(fs);
+                }
                 m.topic = clean_text(j.value("topic", ""), kMaxTopicChars);
                 m.body = clean_text(j.value("body", ""), kMaxBodyChars);
                 m.state = clean_text(j.value("state", ""), 40);
@@ -12185,6 +12221,231 @@ details{break-inside:avoid}
             cell::sys::logger::instance().info("notice", std::format("seen archived sid={} entries={} file={}",
                                                                      target, entries, arc.filename().string()));
             return entries;
+        }
+
+        // ---- session handles -------------------------------------------------
+        // Sessions live under root/sessions/<cwd key>/<session id>. A session
+        // that wants to notice a concurrent one should not have to memorize a
+        // full id, so handles resolve in this order: "current"/"" (the
+        // caller), "reply"/"@" (the sender of the newest notice in the
+        // caller's audit trail), exact id, unique id prefix, 16-hex cwd key
+        // (the newest session in that workspace group), and a workspace path
+        // (hashed to its group key, then the newest session there).
+
+        struct session_info
+        {
+            std::string id;
+            std::string cwd;     // last known workspace path ("" = unknown)
+            std::string cwd_key; // 16-hex group key
+            long long idle_sec = 0;
+            size_t pending = 0;
+            bool current = false;
+        };
+
+        // every session folder under root/sessions, most recently active first
+        static std::vector<session_info> list_sessions(const std::string &current = "")
+        {
+            std::vector<session_info> out;
+            std::error_code ec;
+            std::filesystem::path base = root / "sessions";
+            if (!std::filesystem::is_directory(base, ec))
+                return out;
+            for (auto &g : std::filesystem::directory_iterator(base, ec))
+            {
+                if (ec)
+                    break;
+                std::error_code gec;
+                if (!g.is_directory(gec))
+                    continue;
+                std::string key = g.path().filename().string();
+                std::string cwd = cwd_for_key(key);
+                for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
+                {
+                    if (ec)
+                        break;
+                    std::error_code fec;
+                    if (!f.is_directory(fec))
+                        continue;
+                    session_info e;
+                    e.id = f.path().filename().string();
+                    e.cwd = cwd;
+                    e.cwd_key = key;
+                    // rank by the transcript's mtime, the same rule
+                    // latest_session_id_for_cwd uses, so an archive or a
+                    // teamwork write inside the folder does not skew activity
+                    std::filesystem::path tf = f.path() / "messages.jsonl";
+                    std::error_code tec;
+                    auto mtime = std::filesystem::exists(tf, tec)
+                                     ? std::filesystem::last_write_time(tf, tec)
+                                     : std::filesystem::last_write_time(f.path(), tec);
+                    if (!tec)
+                    {
+                        auto age = std::filesystem::file_time_type::clock::now() - mtime;
+                        e.idle_sec = age > std::filesystem::file_time_type::duration::zero()
+                                         ? (long long)std::chrono::duration_cast<std::chrono::seconds>(age).count()
+                                         : 0;
+                    }
+                    e.pending = pending_count(e.id);
+                    e.current = e.id == current;
+                    out.push_back(std::move(e));
+                }
+            }
+            std::sort(out.begin(), out.end(), [](const session_info &a, const session_info &b)
+                      { return a.idle_sec != b.idle_sec ? a.idle_sec < b.idle_sec : a.id < b.id; });
+            return out;
+        }
+
+        enum class target_state
+        {
+            resolved,  // id names exactly one session
+            current,   // ""/"current": the caller's own session (id may be empty)
+            ambiguous, // an id prefix matches several sessions
+            none       // nothing matched; error explains why
+        };
+        struct session_target
+        {
+            target_state state = target_state::none;
+            std::string id;
+            std::string error;
+        };
+
+        static bool is_hex_key(const std::string &s)
+        {
+            if (s.size() != 16)
+                return false;
+            for (char c : s)
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                    return false;
+            return true;
+        }
+
+        // resolve a session handle; `current` is the caller's own session id
+        // (may be empty for callers without a live session)
+        static session_target resolve_session(const std::string &arg, const std::string &current)
+        {
+            session_target t;
+            if (arg.empty() || arg == "current")
+            {
+                t.state = target_state::current;
+                t.id = current;
+                return t;
+            }
+            std::string shown = text::display_safe(arg);
+            if (shown.size() > 80)
+                shown = shown.substr(0, 77) + "...";
+            if (arg == "reply" || arg == "@")
+            {
+                // the newest notice addressed to this session whose sender
+                // still exists — pending first (freshest arrivals), then the
+                // delivered audit trail
+                auto pick = [&](const std::vector<message> &entries) -> bool
+                {
+                    for (auto it = entries.rbegin(); it != entries.rend(); ++it)
+                    {
+                        if (it->from_session.empty() || it->from_session == current)
+                            continue;
+                        std::error_code ec;
+                        if (std::filesystem::is_directory(session_dir(it->from_session), ec))
+                        {
+                            t.state = target_state::resolved;
+                            t.id = it->from_session;
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!pick(peek(current)) && !pick(seen(current)))
+                {
+                    t.state = target_state::none;
+                    t.error = "no recent notice carries a reply address (nothing has been delivered yet, or the sender is gone)";
+                }
+                return t;
+            }
+            std::vector<std::string> ids;
+            {
+                std::error_code ec;
+                std::filesystem::path base = root / "sessions";
+                for (auto &g : std::filesystem::directory_iterator(base, ec))
+                {
+                    if (ec)
+                        break;
+                    std::error_code gec;
+                    if (!g.is_directory(gec))
+                        continue;
+                    for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
+                    {
+                        if (ec)
+                            break;
+                        std::error_code fec;
+                        if (f.is_directory(fec))
+                            ids.push_back(f.path().filename().string());
+                    }
+                }
+            }
+            for (auto &id : ids)
+                if (id == arg)
+                {
+                    t.state = target_state::resolved;
+                    t.id = id;
+                    return t;
+                }
+            std::vector<std::string> hits;
+            for (auto &id : ids)
+                if (id.rfind(arg, 0) == 0)
+                    hits.push_back(id);
+            if (hits.size() == 1)
+            {
+                t.state = target_state::resolved;
+                t.id = hits[0];
+                return t;
+            }
+            // 16-hex cwd key / cwd path: both address the workspace group;
+            // the handle lands on the group's newest session, matching how
+            // a GUI or a fresh CLI attaches to a workspace. This runs before
+            // the ambiguity verdict: every session id starts with its group
+            // key, so a key that matches several ids is still a valid handle
+            auto newest_in_group = [&](const std::string &key) -> std::string
+            {
+                std::error_code ec;
+                if (!std::filesystem::is_directory(root / "sessions" / key, ec))
+                    return "";
+                return chat::latest_session_id_for_cwd(key);
+            };
+            if (is_hex_key(arg))
+            {
+                std::string latest = newest_in_group(arg);
+                if (!latest.empty())
+                {
+                    t.state = target_state::resolved;
+                    t.id = latest;
+                    return t;
+                }
+            }
+            if (arg.find('/') != std::string::npos || arg.find('\\') != std::string::npos)
+            {
+                std::string latest = newest_in_group(cwd_id_of(std::filesystem::path(arg)));
+                if (!latest.empty())
+                {
+                    t.state = target_state::resolved;
+                    t.id = latest;
+                    return t;
+                }
+            }
+            if (hits.size() > 1)
+            {
+                std::string names;
+                for (size_t i = 0; i < hits.size() && i < 5; i++)
+                    names += (names.empty() ? "" : ", ") + hits[i];
+                if (hits.size() > 5)
+                    names += std::format(", ... (+{})", hits.size() - 5);
+                t.state = target_state::ambiguous;
+                t.error = std::format("session handle \"{}\" matches {} sessions: {}", shown, hits.size(), names);
+                return t;
+            }
+            t.state = target_state::none;
+            t.error = std::format("no session matches \"{}\" ({} known; use operation=sessions to list them)",
+                                  shown, ids.size());
+            return t;
         }
 
         // block until at least one matching notice is pending or the timeout
@@ -16300,8 +16561,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         // zero token cost: wait blocks the calling thread on a condition
         // variable plus a slow folder re-scan, never on an LLM request.
         nlohmann::json props = {
-            {"operation", str_prop("send | list | drain | wait | clear")},
-            {"session", str_prop("send: target session id (default: the current session); list/drain/wait/clear: queue to operate on (default: current)")},
+            {"operation", str_prop("send | list | drain | wait | clear | sessions")},
+            {"session", str_prop("target session handle: exact id, unique id prefix, 16-hex workspace key, workspace path, or 'reply' to answer the newest notice's sender (send default: the current session; list/drain/wait/clear default: the current queue)")},
             {"from", str_prop("sender label (send, default 'agent')")},
             {"topic", str_prop("routing hint such as progress, gate, or a stage name (send)")},
             {"body", str_prop("message text (send, required)")},
@@ -16309,16 +16570,12 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             {"from_filter", str_prop("wait/drain: only notices whose 'from' contains this substring")},
             {"topic_filter", str_prop("wait/drain: only notices whose 'topic' contains this substring")}};
         add("notice",
-            "Message bus for agent sessions. send: deliver a short message to the current or another session — Teamwork children report progress this way, and the receiving session (user or main agent) picks it up without any polling LLM call. list: peek pending notices. drain: consume pending notices and return them. wait: block until a matching notice arrives (default 60s, max 300s) — the process idles during the wait, consuming no tokens; a gated Teamwork job or a finished child wakes the waiter immediately. clear: drop pending notices.",
+            "Message bus for agent sessions. send: deliver a short message to the current or another session — Teamwork children report progress this way, and the receiving session (user or main agent) picks it up without any polling LLM call. The address may be an exact session id, a unique id prefix, a 16-hex workspace key, a workspace path, or 'reply' to answer the sender of the newest delivered notice. list: peek pending notices. drain: consume pending notices and return them. wait: block until a matching notice arrives (default 60s, max 300s) — the process idles during the wait, consuming no tokens; a gated Teamwork job or a finished child wakes the waiter immediately. clear: drop pending notices. sessions: list concurrent sessions (id, workspace, pending notices, idle time) so another session can be addressed.",
             props, {"operation"}, Policy::Allow, ToolKind::Notice, [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
             {
                 cell::ToolOutput out;
                 std::string operation = j.value("operation", "");
-                std::string session = j.value("session", "");
-                // the queue to operate on: an explicit session wins; otherwise
-                // the live session (inside a teamwork worker: the job's session)
-                if (session.empty() && rt.session_id)
-                    session = rt.session_id();
+                std::string cur = rt.session_id ? rt.session_id() : "";
                 std::string from_filter = j.value("from_filter", "");
                 std::string topic_filter = j.value("topic_filter", "");
                 auto render_all = [](const std::vector<cell::notice::message> &got) -> std::string
@@ -16328,15 +16585,51 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                         text += cell::notice::render(m) + "\n";
                     return text;
                 };
+                if (operation == "sessions")
+                {
+                    auto infos = cell::notice::list_sessions(cur);
+                    std::string text = std::format("{} session(s), most recent first\n", infos.size());
+                    size_t shown = 0;
+                    for (auto &e : infos)
+                    {
+                        if (++shown > 50)
+                        {
+                            text += std::format("... and {} more\n", infos.size() - 50);
+                            break;
+                        }
+                        std::string idle = e.idle_sec < 60          ? std::format("{}s", e.idle_sec)
+                                           : e.idle_sec < 3600      ? std::format("{}m", e.idle_sec / 60)
+                                           : e.idle_sec < 86400     ? std::format("{}h", e.idle_sec / 3600)
+                                                                    : std::format("{}d", e.idle_sec / 86400);
+                        std::string where = e.cwd.empty() ? std::format("cwd=? (key={})", e.cwd_key) : "cwd=" + e.cwd;
+                        text += std::format("- {}{}  {}  pending={}  idle={}\n", e.id,
+                                            e.current ? " (current)" : "", where, e.pending, idle);
+                    }
+                    out.text = text;
+                    return out;
+                }
+                // every other operation targets a resolved session handle:
+                // "current" (default), exact id, unique prefix, 16-hex key,
+                // workspace path, or "reply"/"@"
+                auto tgt = cell::notice::resolve_session(j.value("session", ""), cur);
+                if (tgt.state == cell::notice::target_state::ambiguous || tgt.state == cell::notice::target_state::none)
+                    return cell::ToolOutput::fail(tgt.error);
+                const std::string &session = tgt.id;
                 if (operation == "send")
                 {
                     std::string body = j.value("body", "");
                     if (body.empty())
                         return cell::ToolOutput::fail("send requires 'body'");
                     std::string err, id;
-                    if (!cell::notice::send_to(session, j.value("from", "agent"), j.value("topic", ""), body, err, &id))
+                    // from_session makes the notice answerable: the receiver can
+                    // reply with the 'reply' handle
+                    if (!cell::notice::send_to(session, j.value("from", "agent"), j.value("topic", ""), body,
+                                               err, &id, false, cur))
                         return cell::ToolOutput::fail(err);
-                    out.text = std::format("notice {} delivered to session {}", id, session.empty() ? "(current)" : session);
+                    out.text = std::format("notice {} delivered to session {}", id,
+                                           session.empty() ? "(current)" : session);
+                    if (!cur.empty())
+                        out.text += std::format(" (replies are addressed back to {}; the receiver can use session=reply)", cur);
                     return out;
                 }
                 if (operation == "list")
@@ -16375,7 +16668,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out.text = std::format("dropped {} pending notice(s)", n);
                     return out;
                 }
-                return cell::ToolOutput::fail("operation must be send, list, drain, wait, or clear"); });
+                return cell::ToolOutput::fail("operation must be send, list, drain, wait, clear, or sessions"); });
     }
     return {list, defs};
 }
@@ -18331,6 +18624,176 @@ static int run_selftest()
             std::filesystem::remove_all(cell::session_dir(ssid), sec);
         }
 
+        // ---- reply addressing: from_session travels with the notice --------
+        {
+            const std::string rsid = "selftest-notice-reply";
+            const std::string sender = "selftest-notice-reply-sender";
+            std::error_code rec;
+            std::filesystem::remove_all(cell::session_dir(rsid), rec);
+            std::filesystem::remove_all(cell::session_dir(sender), rec);
+            // the reply target must exist as a session for "reply" to resolve
+            std::filesystem::create_directories(cell::session_dir(sender), rec);
+
+            R.expect(nt::send_to(rsid, "agent", "chat", "ping", nerr, nullptr, false, sender),
+                     "notice: send carries a reply address");
+            auto got = nt::peek(rsid);
+            R.expect(got.size() == 1 && got[0].from_session == sender,
+                     "notice: peek returns from_session");
+            R.expect(nt::render(got[0]).find("session=" + sender) != std::string::npos,
+                     "notice: render shows the reply address");
+            nt::drain(rsid);
+            auto trail = nt::seen(rsid);
+            R.expect(trail.size() == 1 && trail[0].from_session == sender,
+                     "notice: the audit trail keeps from_session");
+
+            // malformed reply addresses are dropped, never stored
+            R.expect(nt::send_to(rsid, "agent", "", "noreply", nerr, nullptr, false, "../escape"),
+                     "notice: send accepts a malformed reply address");
+            got = nt::peek(rsid);
+            R.expect(got.size() == 1 && got[0].from_session.empty(),
+                     "notice: a malformed reply address is dropped");
+            nt::drain(rsid);
+            // the historical 5-parameter form stays valid and stores no address
+            R.expect(nt::send_to(rsid, "user", "", "plain", nerr),
+                     "notice: the 5-parameter send form still compiles and works");
+            got = nt::peek(rsid);
+            R.expect(got.size() == 1 && got[0].from_session.empty() && got[0].body == "plain",
+                     "notice: a plain send stores no reply address");
+            nt::drain(rsid);
+
+            // "reply"/"@" resolve to the newest addressable sender
+            auto t = nt::resolve_session("reply", rsid);
+            R.expect(t.state == nt::target_state::resolved && t.id == sender,
+                     "notice: reply resolves the newest sender's session");
+            R.expect(nt::resolve_session("@", rsid).id == sender, "notice: @ is an alias of reply");
+            // a still-pending notice is an answerable notice too
+            nt::send_to(rsid, "agent", "", "pending ping", nerr, nullptr, false, sender);
+            R.expect(nt::resolve_session("reply", rsid).id == sender,
+                     "notice: reply sees a still-pending notice");
+            nt::clear(rsid);
+            // no trail, no reply
+            auto empty = nt::resolve_session("reply", "selftest-notice-reply-empty");
+            R.expect(empty.state == nt::target_state::none && !empty.error.empty(),
+                     "notice: reply fails cleanly without an address");
+            // a sender whose session was deleted is skipped
+            const std::string dead = "selftest-notice-reply-dead";
+            const std::string rsid2 = "selftest-notice-reply-2";
+            std::filesystem::remove_all(cell::session_dir(rsid2), rec);
+            nt::send_to(rsid2, "agent", "", "ghost", nerr, nullptr, false, dead);
+            nt::drain(rsid2);
+            R.expect(nt::resolve_session("reply", rsid2).state == nt::target_state::none,
+                     "notice: a deleted sender falls out of the reply chain");
+            std::filesystem::remove_all(cell::session_dir(rsid2), rec);
+            std::filesystem::remove_all(cell::session_dir(rsid), rec);
+            std::filesystem::remove_all(cell::session_dir(sender), rec);
+        }
+
+        // ---- session handles: discovery and resolution ----------------------
+        {
+            const std::string sid_a = "selftest-rz-alpha";
+            const std::string sid_b = "selftest-rz-beta";
+            std::error_code hec;
+            std::filesystem::remove_all(cell::session_dir(sid_a), hec);
+            std::filesystem::remove_all(cell::session_dir(sid_b), hec);
+            std::filesystem::create_directories(cell::session_dir(sid_a), hec);
+            std::filesystem::create_directories(cell::session_dir(sid_b), hec);
+
+            // current handle
+            auto cur = nt::resolve_session("", sid_a);
+            R.expect(cur.state == nt::target_state::current && cur.id == sid_a,
+                     "notice: an empty handle means the current session");
+            R.expect(nt::resolve_session("current", sid_a).id == sid_a, "notice: 'current' resolves to the caller");
+
+            // exact id, then unique prefix
+            R.expect(nt::resolve_session(sid_b, sid_a).state == nt::target_state::resolved &&
+                         nt::resolve_session(sid_b, sid_a).id == sid_b,
+                     "notice: an exact id resolves");
+            auto uniq = nt::resolve_session("selftest-rz-alph", sid_a);
+            R.expect(uniq.state == nt::target_state::resolved && uniq.id == sid_a,
+                     "notice: a unique id prefix resolves");
+            auto amb = nt::resolve_session("selftest-rz-", sid_a);
+            R.expect(amb.state == nt::target_state::ambiguous && !amb.error.empty(),
+                     "notice: an ambiguous prefix is rejected with its candidates");
+            auto nope = nt::resolve_session("selftest-rz-none", sid_a);
+            R.expect(nope.state == nt::target_state::none && !nope.error.empty(),
+                     "notice: an unknown handle fails cleanly");
+
+            // 16-hex workspace key and workspace path: both land on the
+            // group's newest session (with two sessions in the group, the
+            // key itself is an ambiguous id prefix — exactly the real-world
+            // shape where a session id starts with its group key)
+            std::filesystem::path fixdir = std::filesystem::absolute("selftest-rz-workspace");
+            std::string key = cell::cwd_id_of(fixdir);
+            R.expect(key.size() == 16 && nt::is_hex_key(key), "notice: a cwd key is 16 hex chars");
+            const std::string k1 = key + "-1-rz";
+            const std::string k2 = key + "-2-rz";
+            std::filesystem::remove_all(cell::root / "sessions" / key, hec);
+            for (auto &[sid, age] : {std::pair{k1, 600}, std::pair{k2, 0}})
+            {
+                std::filesystem::path sd = cell::session_dir(sid);
+                std::filesystem::create_directories(sd, hec);
+                std::ofstream tf(sd / "messages.jsonl");
+                tf << "{\"role\":\"user\",\"content\":\"hi\"}\n";
+                tf.close();
+                std::filesystem::last_write_time(sd / "messages.jsonl",
+                                                 std::filesystem::file_time_type::clock::now() -
+                                                     std::chrono::seconds(age));
+            }
+            auto bykey = nt::resolve_session(key, sid_a);
+            R.expect(bykey.state == nt::target_state::resolved && bykey.id == k2,
+                     "notice: a 16-hex cwd key resolves to the newest session in that group");
+            auto bypath = nt::resolve_session(fixdir.string(), sid_a);
+            R.expect(bypath.state == nt::target_state::resolved && bypath.id == k2,
+                     "notice: a workspace path resolves to the newest session in that group");
+
+            // discovery: the fixture shows up, flagged when current, with its
+            // pending count and group key
+            nt::send_to(k2, "user", "", "queued", nerr);
+            auto infos = nt::list_sessions(k2);
+            bool found = false;
+            for (auto &e : infos)
+                if (e.id == k2)
+                    found = e.current && e.pending == 1 && e.cwd_key == key;
+            R.expect(found, "notice: list_sessions reports id, pending count, key, and current flag");
+            R.expect(!infos.empty() && infos.front().idle_sec <= infos.back().idle_sec,
+                     "notice: list_sessions is sorted by activity");
+            nt::clear(k2);
+
+            // the notice tool itself: handles all the way through
+            auto [ntools, ndefs] = build_tools(false);
+            cell::tools::runtime t_rt;
+            t_rt.session_id = [&]() -> std::string
+            { return sid_a; };
+            auto sent = ntools.at("notice")->execute(
+                t_rt, nlohmann::json{{"operation", "send"}, {"session", "selftest-rz-bet"}, {"body", "tool ping"}}.dump());
+            R.expect(sent.ok, "notice tool: send accepts a unique id prefix and remains compatible");
+            auto in_b = nt::peek(sid_b);
+            R.expect(in_b.size() == 1 && in_b[0].from_session == sid_a && in_b[0].body == "tool ping",
+                     "notice tool: the delivered notice carries the caller's session");
+            // the receiver answers with the reply handle
+            t_rt.session_id = [&]() -> std::string
+            { return sid_b; };
+            auto replied = ntools.at("notice")->execute(
+                t_rt, nlohmann::json{{"operation", "send"}, {"session", "reply"}, {"body", "tool pong"}}.dump());
+            R.expect(replied.ok, "notice tool: reply resolves without an explicit id");
+            auto back = nt::peek(sid_a);
+            R.expect(back.size() == 1 && back[0].body == "tool pong" && back[0].from_session == sid_b,
+                     "notice tool: the reply lands in the original sender's queue");
+            auto bad = ntools.at("notice")->execute(t_rt, nlohmann::json{{"operation", "send"}, {"session", "selftest-rz-"}, {"body", "x"}}.dump());
+            R.expect(!bad.ok && bad.text.find("matches") != std::string::npos,
+                     "notice tool: an ambiguous handle fails with its candidates");
+            auto listing = ntools.at("notice")->execute(t_rt, nlohmann::json{{"operation", "sessions"}}.dump());
+            R.expect(listing.ok && listing.text.find("(current)") != std::string::npos &&
+                         listing.text.find(sid_a) != std::string::npos && listing.text.find(sid_b) != std::string::npos,
+                     "notice tool: sessions lists the concurrent sessions and marks the caller");
+
+            std::filesystem::remove_all(cell::session_dir(sid_a), hec);
+            std::filesystem::remove_all(cell::session_dir(sid_b), hec);
+            std::filesystem::remove_all(cell::root / "sessions" / key, hec);
+            std::filesystem::remove_all(cell::session_dir(k1), hec);
+            std::filesystem::remove_all(cell::session_dir(k2), hec);
+        }
+
         // cleanup the selftest notice session folder
         std::error_code nec;
         std::filesystem::remove_all(cell::session_dir("selftest-notice-session"), nec);
@@ -20115,9 +20578,20 @@ namespace cell
                     ev.on_notice_msg(m);
                 if (ev.on_notice)
                     ev.on_notice(cell::notice::render(m));
+                // the reply address is part of the notice's meaning: it is
+                // shown (when the sender is a different session) together with
+                // the handle that answers it
+                std::string meta = std::format("from={}", m.from);
+                if (!m.topic.empty())
+                    meta += " topic=" + m.topic;
+                bool answerable = !m.from_session.empty() && m.from_session != h_.now().id();
+                if (answerable)
+                    meta += " session=" + m.from_session;
                 h_.now().msg().push_back({{"role", "system"},
-                                          {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
-                                                                  m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
+                                          {"content", std::format("A notice was delivered to this session ({}). Treat it as context from the user or a supervised agent.{}\n{}",
+                                                                  meta,
+                                                                  answerable ? " You can answer its sender with the notice tool (operation=send, session=reply)." : "",
+                                                                  m.body)}});
             }
             // notices arrive mid-conversation: lift them into the leading system
             // block so a chat template never sees a system message behind a user turn
@@ -21314,42 +21788,6 @@ int repl::run()
             if (cur)
                 cell::sys::println("       model: {}", cfg.current_model.empty() ? "(none - use /models to pick one)" : cfg.current_model);
         }
-    };
-
-    // resolve a /notices argument against known session folders: exact id wins,
-    // then a unique prefix; "" means the current session
-    auto resolve_session_arg = [&](const std::string &arg) -> std::string
-    {
-        if (arg.empty() || arg == "current")
-            return "";
-        std::error_code ec;
-        std::filesystem::path base = cell::root / "sessions";
-        std::vector<std::string> ids;
-        for (auto &g : std::filesystem::directory_iterator(base, ec))
-        {
-            if (ec)
-                break;
-            if (!g.is_directory(ec))
-                continue;
-            for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
-            {
-                std::error_code fec;
-                if (f.is_directory(fec))
-                    ids.push_back(f.path().filename().string());
-            }
-        }
-        for (auto &id : ids)
-            if (id == arg)
-                return arg;
-        std::string hit;
-        for (auto &id : ids)
-            if (id.rfind(arg, 0) == 0)
-            {
-                if (!hit.empty())
-                    return "\x01"; // ambiguous
-                hit = id;
-            }
-        return hit.empty() ? "\x02" : hit; // not found
     };
 
     bool interactive = cell::plat::is_tty(stdin);
@@ -22707,6 +23145,30 @@ int repl::run()
                          cell::sys::println("{}", cell::notice::render(m));
                      return cmd_flow::handled;
                  }
+                 if (sub == "sessions")
+                 {
+                     // discovery: who else is out there, and how to address
+                     // them (id, workspace, pending, idle)
+                     auto infos = cell::notice::list_sessions(cur_sid);
+                     if (infos.empty())
+                     {
+                         cell::sys::println("no sessions found");
+                         return cmd_flow::handled;
+                     }
+                     cell::sys::println("{} session(s), most recent first:", infos.size());
+                     for (auto &e : infos)
+                     {
+                         std::string idle = e.idle_sec < 60      ? std::format("{}s", e.idle_sec)
+                                            : e.idle_sec < 3600  ? std::format("{}m", e.idle_sec / 60)
+                                            : e.idle_sec < 86400 ? std::format("{}h", e.idle_sec / 3600)
+                                                                 : std::format("{}d", e.idle_sec / 86400);
+                         cell::sys::println("  {}{}  {}  pending={}  idle={}",
+                                            e.current ? "* " : "- ", e.id,
+                                            e.cwd.empty() ? std::format("cwd=? (key={})", e.cwd_key) : "cwd=" + e.cwd,
+                                            e.pending, idle);
+                     }
+                     return cmd_flow::handled;
+                 }
                  if (sub == "wait")
                  {
                      // block WITHOUT any LLM call: the process idles on a
@@ -22764,27 +23226,30 @@ int repl::run()
                      // 3 is what distinguishes "no body" from a target id
                      if (toks.size() < 3)
                      {
-                         cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
+                         cell::sys::error("usage: /notices send [SESSION] TEXT...");
                          return cmd_flow::handled;
                      }
                      // the token after "send" is the target only when it
-                     // resolves to a session id; otherwise everything after
-                     // "send" is the message body for the current session
-                     std::string target = "";
-                     size_t text_start = toks.size() >= 3 ? 2 : 1;
-                     if (toks.size() >= 3)
+                     // resolves to a session (id, unique prefix, "current",
+                     // workspace key/path, or the explicit reply handle);
+                     // otherwise everything after "send" is the message body
+                     // for the current session
+                     std::string target = cur_sid;
+                     bool named = false;
+                     size_t text_start = 2;
+                     auto t = cell::notice::resolve_session(toks[2], cur_sid);
+                     bool explicit_reply = toks[2] == "reply" || toks[2] == "@";
+                     if (t.state == cell::notice::target_state::resolved || t.state == cell::notice::target_state::ambiguous ||
+                         explicit_reply || toks[2] == "current")
                      {
-                         std::string resolved = resolve_session_arg(toks[2]);
-                         if (resolved == "\x01")
+                         if (t.state != cell::notice::target_state::resolved)
                          {
-                             cell::sys::error("session id prefix \"{}\" is ambiguous - be more specific (see /sessions)", toks[2]);
+                             cell::sys::error("{}", t.error);
                              return cmd_flow::handled;
                          }
-                         if (resolved != "\x02")
-                         {
-                             target = resolved;
-                             text_start = 3;
-                         }
+                         target = t.id;
+                         named = t.state == cell::notice::target_state::resolved;
+                         text_start = 3;
                      }
                      std::string text;
                      for (size_t i = text_start; i < toks.size(); i++)
@@ -22795,13 +23260,13 @@ int repl::run()
                      }
                      if (text.empty())
                      {
-                         cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
+                         cell::sys::error("usage: /notices send [SESSION] TEXT...");
                          return cmd_flow::handled;
                      }
                      std::string err, id;
-                     if (cell::notice::send_to(target.empty() ? cur_sid : target, "user", "", text, err, &id))
+                     if (cell::notice::send_to(target, "user", "", text, err, &id, false, cur_sid))
                          cell::sys::println("notice {} delivered to session {}", id,
-                                            target.empty() ? "(current)" : target);
+                                            named ? target : "(current)");
                      else
                          cell::sys::error("{}", err);
                      return cmd_flow::handled;
@@ -22869,8 +23334,9 @@ int repl::run()
                      cell::sys::error("usage: /notices seen [list | clear | rm ID]");
                      return cmd_flow::handled;
                  }
-                 cell::sys::error("usage: /notices [list | wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
-                 cell::sys::error("        | send [SESSION_ID] TEXT | drain | clear | seen [list | clear | rm ID]]");
+                 cell::sys::error("usage: /notices [list | sessions | wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
+                 cell::sys::error("        | send [SESSION] TEXT | drain | clear | seen [list | clear | rm ID]]");
+                 cell::sys::error("  SESSION: id | unique id prefix | workspace key or path | reply | current");
                  return cmd_flow::handled;
              }},
             {"/teamworks", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
