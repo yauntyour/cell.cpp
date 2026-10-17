@@ -300,8 +300,15 @@ namespace cell
     }
 
     // =========================================================================
-    //  async_io — coalescing background file writer (submit / flush)
+    //  async_io — coalescing background file writer (submit / submit_append /
+    //  flush)
     // =========================================================================
+    // submit() replaces the whole file (latest content wins per path);
+    // submit_append() extends it and accumulates instead of clobbering, so a
+    // transcript that only grew between two unloads is written as a tail
+    // append — O(delta) — rather than re-serializing the whole session. A
+    // rewrite supersedes queued appends for the same path: its bytes were
+    // computed from the caller's state, which already includes them.
     // Durability helpers live in cell::plat (defined further down, so the OS
     // specifics stay in one place); declared here because the writer below —
     // which appears earlier in the file — needs them.
@@ -309,20 +316,28 @@ namespace cell
     {
         bool write_file_durable(const std::filesystem::path &path, const std::string &content);
         bool write_file_atomic(const std::filesystem::path &path, const std::string &content);
+        bool write_file_append(const std::filesystem::path &path, const std::string &content);
     }
     namespace async_io
     {
         class file_writer
         {
         private:
+            // one pending unit per path: an optional full rewrite (atomic
+            // replace) followed by bytes to append. submit() installs the
+            // rewrite and clears previously queued appends (they are a prefix
+            // of what the rewrite carries); submit_append() accumulates bytes
+            // in submission order, keeping the writer O(delta).
             struct job
             {
                 std::filesystem::path path;
-                std::string content;
+                std::string rewrite;      // full replacement payload
+                bool has_rewrite = false; // an empty rewrite is meaningful: create/truncate
+                std::string appends;      // bytes appended once the rewrite (if any) has landed
             };
             std::mutex mx;
             std::condition_variable cv;
-            std::unordered_map<std::string, job> pending; // path -> latest job
+            std::unordered_map<std::string, job> pending; // path -> pending rewrite + accumulated appends
             // writes running outside the lock. a plain bool cannot express this:
             // the worker and a flush() caller both write, and whichever finished
             // first used to clear it and let flush() return with work still in
@@ -336,8 +351,13 @@ namespace cell
                 // crash-safe replace: temp file -> flush to device -> atomic rename.
                 // the previous truncate-in-place write could leave a half-written
                 // JSON behind, which the next start would read as "no sessions" /
-                // "no usage" / "no providers".
-                plat::write_file_atomic(j.path, to_platform_newline(j.content));
+                // "no usage" / "no providers". Appended bytes go through the
+                // durable append helper, which also closes a torn tail line a
+                // previous interrupted append may have left behind.
+                if (j.has_rewrite)
+                    plat::write_file_atomic(j.path, to_platform_newline(j.rewrite));
+                if (!j.appends.empty())
+                    plat::write_file_append(j.path, to_platform_newline(j.appends));
             }
             void run()
             {
@@ -399,7 +419,31 @@ namespace cell
                 std::string key = path.string();
                 {
                     std::lock_guard lk(mx);
-                    pending[key] = job{std::move(path), std::move(content)};
+                    job &j = pending[key];
+                    j.path = std::move(path);
+                    j.rewrite = std::move(content);
+                    j.has_rewrite = true;
+                    // the rewrite carries the file as the caller sees it now:
+                    // queued appends are a prefix of it and must not be
+                    // replayed on top after it lands
+                    j.appends.clear();
+                }
+                cv.notify_one();
+            }
+            void submit_append(std::filesystem::path path, std::string content)
+            {
+                if (content.empty())
+                    return;
+                // the key rule from submit() applies here too
+                std::string key = path.string();
+                {
+                    std::lock_guard lk(mx);
+                    job &j = pending[key];
+                    j.path = std::move(path);
+                    // ordered after a pending rewrite (if any): the caller
+                    // computed these bytes against the state that rewrite
+                    // reflects, so they extend it rather than replace it
+                    j.appends += content;
                 }
                 cv.notify_one();
             }
@@ -425,6 +469,12 @@ namespace cell
         inline void submit(std::filesystem::path path, std::string content)
         {
             writer().submit(std::move(path), std::move(content));
+        }
+        // extend an existing file instead of replacing it; bytes accumulate in
+        // submission order per path (see file_writer::submit_append)
+        inline void submit_append(std::filesystem::path path, std::string content)
+        {
+            writer().submit_append(std::move(path), std::move(content));
         }
         inline void flush()
         {
@@ -877,6 +927,82 @@ namespace cell
                 }
             }
             return true;
+        }
+
+        // Durable append for transcript-style files: the bytes go to the
+        // current end and are flushed to the device, so a queued tail survives
+        // a crash the same way a rewrite does. A previous append that died
+        // mid-line must not glue its partial record onto the next one: the
+        // tail is closed with a newline first (the reader skips the
+        // unparseable remainder, so the torn line is never merged into — or
+        // masked by — the record after it). No fsync of the directory: a
+        // brand-new file that loses its plain directory entry to a power cut
+        // is the same exposure the atomic replace path already accepts.
+        inline bool write_file_append(const std::filesystem::path &path, const std::string &content)
+        {
+            bool need_newline = false;
+            {
+                std::error_code ec;
+                auto size = std::filesystem::file_size(path, ec);
+                if (!ec && size > 0)
+                {
+                    std::ifstream f(path, std::ios::binary);
+                    if (f && f.seekg((std::streamoff)size - 1))
+                    {
+                        char last = 0;
+                        if (f.get(last) && last != '\n')
+                            need_newline = true;
+                    }
+                }
+            }
+            std::string patched;
+            const std::string *payload = &content;
+            if (need_newline)
+            {
+                patched = to_platform_newline("\n");
+                patched += content;
+                payload = &patched;
+            }
+#ifdef _WIN32
+            {
+                std::ofstream f(path, std::ios::binary | std::ios::app);
+                if (!f.is_open())
+                    return false;
+                f.write(payload->data(), (std::streamsize)payload->size());
+                f.flush();
+                if (!f.good())
+                    return false;
+            }
+            HANDLE h = CreateFileW(path.wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE)
+                return true; // the bytes are in the page cache; best effort is enough here
+            FlushFileBuffers(h);
+            CloseHandle(h);
+            return true;
+#else
+            int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0)
+                return false;
+            const char *p = payload->data();
+            size_t left = payload->size();
+            while (left > 0)
+            {
+                ssize_t n = ::write(fd, p, left);
+                if (n <= 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    ::close(fd);
+                    return false;
+                }
+                p += n;
+                left -= (size_t)n;
+            }
+            ::fsync(fd);
+            ::close(fd);
+            return true;
+#endif
         }
 
         // Best-effort: make a secret file readable by its owner only. The vault key
@@ -8221,6 +8347,7 @@ namespace cell
                     }
 
                     nlohmann::json item = m;
+                    item.erase("model"); // the per-message /export model tag: session metadata, never wire data
                     bool has_tool_calls = item.contains("tool_calls") && item["tool_calls"].is_array() &&
                                           !item["tool_calls"].empty();
                     // Anthropic-format assistant turns keep tool calls as content
@@ -9121,7 +9248,17 @@ namespace cell
                             msgs.back()["content"].push_back(blk);
                         continue;
                     }
-                    msgs.push_back(*cur);
+                    // the per-message /export model tag is session metadata: the
+                    // native wire rejects unknown message fields, so it is stripped
+                    // from the few messages that carry it
+                    if (cur->contains("model"))
+                    {
+                        nlohmann::json clean = *cur;
+                        clean.erase("model");
+                        msgs.push_back(std::move(clean));
+                    }
+                    else
+                        msgs.push_back(*cur);
                 }
                 if (!sys.empty())
                     b["system"] = sys;
@@ -9317,16 +9454,18 @@ namespace cell
     namespace chat
     {
         // ---- transcript JSONL helpers ---------------------------------------
-        // one message object per line: the standard agent log shape
-        static std::string dump_messages_jsonl(const nlohmann::json &messages)
+        // one message object per line: the standard agent log shape. `from`
+        // dumps only the tail, so the append fast path in session::unload
+        // serializes the delta instead of re-serializing the whole session.
+        static std::string dump_messages_jsonl(const nlohmann::json &messages, size_t from = 0)
         {
             std::string out;
             if (messages.is_array())
-                for (const auto &m : messages)
+                for (size_t i = from; i < messages.size(); i++)
                 {
                     // strict dump() throws type_error.316 on a non-UTF-8 byte and
                     // would take the whole turn (and the transcript write) with it
-                    out += dump_safe(m);
+                    out += dump_safe(messages[i]);
                     out.push_back('\n');
                 }
             return out;
@@ -9627,11 +9766,35 @@ namespace cell
             return out;
         }
 
+        // a markdown horizontal rule: three or more of the same marker (-, * or
+        // _) with only blanks between them ("---", "- - -", "***", "___")
+        static bool hr_line(std::string_view s)
+        {
+            char marker = 0;
+            size_t count = 0;
+            for (char c : s)
+            {
+                if (c == ' ' || c == '\t')
+                    continue;
+                if (c != '-' && c != '*' && c != '_')
+                    return false;
+                if (marker == 0)
+                    marker = c;
+                else if (c != marker)
+                    return false;
+                ++count;
+            }
+            return count >= 3;
+        }
+
         // transcript text → HTML blocks: ``` fences become code blocks (the info
         // string becomes the language label), "#" headings / lists / quotes /
         // rules / pipe tables become real elements, and consecutive plain lines
-        // stay one pre-wrapped paragraph. Everything taken from the transcript is
-        // escaped in html_inline; an unterminated fence is flushed as a code block.
+        // stay one pre-wrapped paragraph. Lists nest by indentation, keep one
+        // continuous list across blank lines (a loose list) and carry the first
+        // number of an ordered list as its start attribute. Everything taken
+        // from the transcript is escaped in html_inline; an unterminated fence
+        // is flushed as a code block.
         static std::string html_render_text(std::string_view text)
         {
             std::vector<std::string_view> lines;
@@ -9650,8 +9813,18 @@ namespace cell
 
             std::string out;
             out.reserve(text.size() + text.size() / 4);
-            std::string para, quote, code, lang, list;
+            std::string para, quote, code, lang;
             bool in_fence = false;
+            // open list levels, innermost last. The indent keeps indented items
+            // nested under their parent; li_open defers "</li>" so a nested list
+            // lands inside the item it belongs to instead of behind it.
+            struct list_level
+            {
+                std::string tag; // "ul" or "ol"
+                size_t indent = 0;
+                bool li_open = false;
+            };
+            std::vector<list_level> lists;
 
             auto flush_para = [&]
             {
@@ -9677,12 +9850,15 @@ namespace cell
             };
             auto close_list = [&]
             {
-                if (list.empty())
-                    return;
-                out += "</";
-                out += list;
-                out += ">";
-                list.clear();
+                while (!lists.empty())
+                {
+                    if (lists.back().li_open)
+                        out += "</li>";
+                    out += "</";
+                    out += lists.back().tag;
+                    out += ">";
+                    lists.pop_back();
+                }
             };
             auto flush_code = [&]
             {
@@ -9723,7 +9899,10 @@ namespace cell
                 {
                     flush_para();
                     flush_quote();
-                    close_list();
+                    // a blank line does NOT close a list: markdown keeps one
+                    // list across blank lines (a loose list), so an ordered
+                    // list continues its numbering instead of restarting at 1
+                    // for every item
                     continue;
                 }
                 // pipe table (checked before the other block rules, so "|" text
@@ -9747,9 +9926,7 @@ namespace cell
                     continue;
                 }
                 // horizontal rule / heading
-                if (line.size() >= 3 && (line.find_first_not_of('-') == std::string_view::npos ||
-                                         line.find_first_not_of('*') == std::string_view::npos ||
-                                         line.find_first_not_of('_') == std::string_view::npos))
+                if (hr_line(line))
                 {
                     flush_para();
                     flush_quote();
@@ -9779,27 +9956,76 @@ namespace cell
                     quote.push_back('\n');
                     continue;
                 }
-                bool bullet = line.size() >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') &&
-                              (line[1] == ' ' || line[1] == '\t');
+                // a list item: the raw line's leading blanks decide the nesting
+                // level (the trimmed `line` still drives every other block rule)
+                std::string_view raw = lines[i];
+                size_t lead = 0, indent = 0;
+                while (lead < raw.size() && (raw[lead] == ' ' || raw[lead] == '\t'))
+                {
+                    indent += raw[lead] == '\t' ? 4 : 1;
+                    ++lead;
+                }
+                std::string_view body = raw.substr(lead);
+                bool bullet = body.size() >= 2 && (body[0] == '-' || body[0] == '*' || body[0] == '+') &&
+                              (body[1] == ' ' || body[1] == '\t');
                 size_t digits = 0;
-                while (digits < line.size() && line[digits] >= '0' && line[digits] <= '9')
+                while (digits < body.size() && body[digits] >= '0' && body[digits] <= '9')
                     ++digits;
-                bool numbered = digits > 0 && digits + 1 < line.size() && (line[digits] == '.' || line[digits] == ')') &&
-                                (line[digits + 1] == ' ' || line[digits + 1] == '\t');
+                bool numbered = digits > 0 && digits + 1 < body.size() && (body[digits] == '.' || body[digits] == ')') &&
+                                (body[digits + 1] == ' ' || body[digits + 1] == '\t');
                 if (bullet || numbered)
                 {
                     flush_para();
                     flush_quote();
-                    std::string want = bullet ? "ul" : "ol";
-                    if (list != want)
+                    std::string tag = bullet ? "ul" : "ol";
+                    // deeper lists close first (their parent item stays open)
+                    while (!lists.empty() && indent < lists.back().indent)
                     {
-                        close_list();
-                        out += "<" + want + " class=\"md-list\">";
-                        list = want;
+                        if (lists.back().li_open)
+                            out += "</li>";
+                        out += "</";
+                        out += lists.back().tag;
+                        out += ">";
+                        lists.pop_back();
+                    }
+                    if (!lists.empty() && indent == lists.back().indent)
+                    {
+                        if (lists.back().li_open)
+                            out += "</li>"; // the previous sibling item ends here
+                        if (tag != lists.back().tag)
+                        {
+                            // same indent, other marker: a fresh list starts
+                            out += "</";
+                            out += lists.back().tag;
+                            out += ">";
+                            lists.pop_back();
+                        }
+                    }
+                    if (lists.empty() || indent > lists.back().indent)
+                    {
+                        // markdown honours only the first number of an ordered
+                        // list; carry it so "3." does not restart at 1
+                        long long start = 1;
+                        if (numbered)
+                        {
+                            start = 0;
+                            if (digits <= 9)
+                                for (size_t k = 0; k < digits; ++k)
+                                    start = start * 10 + (body[k] - '0');
+                            else
+                                start = 1; // absurd marker width: let <ol> count
+                        }
+                        out += "<";
+                        out += tag;
+                        out += " class=\"md-list\"";
+                        if (numbered && start != 1)
+                            out += std::format(" start=\"{}\"", start);
+                        out += ">";
+                        lists.push_back({tag, indent, false});
                     }
                     out += "<li>";
-                    out += html_inline(trim_view(line.substr(bullet ? 1 : digits + 1)));
-                    out += "</li>";
+                    out += html_inline(trim_view(raw.substr(lead + (bullet ? 1 : digits + 1))));
+                    lists.back().li_open = true;
                     continue;
                 }
                 flush_quote();
@@ -10340,7 +10566,21 @@ namespace cell
                 out += kind;
                 out += "\" aria-hidden=\"true\"></span><span class=\"role\">";
                 out += html_escape(role.empty() ? "(unknown)" : role);
-                out += "</span></div><div class=\"body\">";
+                out += "</span>";
+                // the model that produced this message (sessions written by
+                // older builds carry no tag and simply show none)
+                auto model_it = m.find("model");
+                if (model_it != m.end() && model_it->is_string())
+                {
+                    const std::string &model = model_it->get_ref<const std::string &>();
+                    if (!model.empty())
+                    {
+                        out += "<span class=\"kind\">";
+                        out += html_escape(model);
+                        out += "</span>";
+                    }
+                }
+                out += "</div><div class=\"body\">";
                 std::string inner = message_export_html(m);
                 if (inner.empty())
                     inner = "<p class=\"p muted\">(empty)</p>";
@@ -11058,6 +11298,16 @@ details{break-inside:avoid}
             std::filesystem::path interrupt_file;              // dir / "interrupt.json"
             std::string interrupt_reason;                      // non-empty while the last turn is interrupted
             bool loaded = false;
+            // transcript persistence bookkeeping: the file holds
+            // messages[0..flushed) in order, so a turn that only pushed new
+            // messages at the end is written as an append (O(delta) instead of
+            // O(session)). `needs_rewrite` starts true — the file must be
+            // materialised/rebuilt by the first unload (load() may have
+            // re-sanitized exec results in memory, an empty session still gets
+            // its file) — and is set again by every in-place rewrite of the
+            // transcript via note_rewrite().
+            size_t flushed = 0;
+            bool needs_rewrite = true;
 
             // the interrupt state is a small file next to the transcript: a
             // resumed session must still know its last turn was cut short,
@@ -11188,8 +11438,30 @@ details{break-inside:avoid}
                 std::filesystem::create_directories(dir, ec);
                 // serialize on this thread, hand the bytes to the background writer;
                 // call async_io::flush() before reading session files back
-                // JSONL transcript, one message per line: written compactly per round
-                async_io::submit(file, dump_messages_jsonl(messages));
+                // JSONL transcript, one message per line: written compactly per round.
+                // Pure growth since the last unload goes down as a tail append
+                // (O(delta)); a rewrite is only needed when memory diverged from
+                // the on-disk prefix (fold/repair/compact/clear -> note_rewrite)
+                // or shrank below it. The size guard is the safety net: any
+                // erase/replace that forgets to mark would otherwise turn a
+                // tail append into a silently inconsistent file.
+                if (needs_rewrite || messages.size() < flushed)
+                {
+                    std::string bytes = dump_messages_jsonl(messages);
+                    cell::sys::logger::instance().debug("sess", std::format("unload id={} mode=rewrite msgs={} bytes={}",
+                                                                            session_id, messages.size(), bytes.size()));
+                    flushed = messages.size();
+                    needs_rewrite = false;
+                    async_io::submit(file, std::move(bytes));
+                }
+                else if (messages.size() > flushed)
+                {
+                    std::string bytes = dump_messages_jsonl(messages, flushed);
+                    cell::sys::logger::instance().debug("sess", std::format("unload id={} mode=append msgs={} new={} bytes={}",
+                                                                            session_id, messages.size(), messages.size() - flushed, bytes.size()));
+                    flushed = messages.size();
+                    async_io::submit_append(file, std::move(bytes));
+                }
                 remember_cwd(session_prefix(session_id), cwd);
             }
             const std::string &id() const { return session_id; }
@@ -11212,6 +11484,12 @@ details{break-inside:avoid}
                 interrupt_reason.clear();
                 persist_interrupt();
             }
+            // the in-memory transcript was rewritten in place (system-message
+            // folding, tool-pairing repair, compaction, /clear): the next unload
+            // must replace the file wholesale — appending the tail would leave
+            // the on-disk prefix disagreeing with memory. Call sites that mutate
+            // msg() beyond push_back() must announce it here.
+            void note_rewrite() { needs_rewrite = true; }
             void append(const std::string &role, const nlohmann::json &content)
             {
                 messages.push_back({{"role", role}, {"content", content}});
@@ -11543,7 +11821,8 @@ details{break-inside:avoid}
                 sess.msg().push_back(std::move(reply));
             }
             sess.msg().push_back({{"role", "system"}, {"content", interrupt_notice(reason)}});
-            fold_system_messages(sess.msg()); // the notice must not land behind the conversation
+            if (fold_system_messages(sess.msg())) // the notice must not land behind the conversation
+                sess.note_rewrite();
             sess.set_interrupt(reason);
             cell::sys::logger::instance().warn("llm", std::format("interrupted id={} reason={} partial_chars={}",
                                                                   sess.id(), reason, kept));
@@ -15467,6 +15746,10 @@ details{break-inside:avoid}
                 }
                 compacted_this_round = false; // the next round gets a fresh budget
                 accumulate_usage(usage, result);
+                // record the child's model on its output like the main loop
+                // does, so exported child transcripts carry the same label
+                if (reply.is_object())
+                    reply["model"] = result.provider.empty() ? model : result.provider + ":" + model;
                 messages.push_back(reply);
                 persist();
                 if (tool_calls.empty())
@@ -19400,6 +19683,35 @@ static int run_selftest()
                      chat3_msgs[1].value("content", "") == "tool says",
                  "openai chat converts Responses function_call_output items to tool messages");
 
+        // the per-message model tag (written so /export can name the model behind
+        // each output) is session metadata and must never reach any wire format
+        nlohmann::json tagged = nlohmann::json::array({
+            {{"role", "user"}, {"content", "hi"}},
+            {{"role", "assistant"}, {"content", "hello"}, {"model", "prov:model"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "text"}, {"text", "blocks"}}})},
+             {"model", "prov:model"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "tool_use"}, {"id", "tu_m"}, {"name", "ls"}, {"input", nlohmann::json::object()}}})},
+             {"model", "prov:model"}},
+        });
+        auto tagged_chat = cell::llm::OpenAI::body("m", tagged, nlohmann::json::array(), false);
+        bool chat_model_leak = false;
+        for (auto &m : tagged_chat["messages"])
+            chat_model_leak |= m.contains("model");
+        R.expect(!chat_model_leak && tagged_chat["messages"][1].value("content", "") == "hello",
+                 "openai chat strips the per-message model tag");
+        auto tagged_anthropic = cell::llm::Anthropic::body("m", tagged, nlohmann::json::array(), false);
+        bool anthropic_model_leak = false;
+        for (auto &m : tagged_anthropic["messages"])
+            anthropic_model_leak |= m.contains("model");
+        R.expect(!anthropic_model_leak, "anthropic strips the per-message model tag");
+        auto tagged_responses = cell::llm::OpenAIResponses::body("m", tagged, nlohmann::json::array(), false);
+        bool responses_model_leak = false;
+        for (auto &it : tagged_responses["input"])
+            responses_model_leak |= it.contains("model");
+        R.expect(!responses_model_leak, "responses strips the per-message model tag");
+
         // Chat Completions tool messages accept text parts only: a tool-produced
         // image must ride in a follow-up user message
         nlohmann::json media_tool = nlohmann::json::array({
@@ -19659,6 +19971,133 @@ static int run_selftest()
         std::filesystem::remove_all(cell::session_dir(sid3), remec);
     }
 
+    // session persistence: the append fast path extends the JSONL in place,
+    // every in-place transcript rewrite falls back to a full replace, and a
+    // torn trailing line (crash mid-append) is skipped and repaired
+    {
+        auto append_sid = [](const char *tag)
+        {
+            return std::format("selftest-append-{}-{}", tag,
+                               std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+        };
+        // a fresh session's first unload materialises the file (rewrite path)
+        std::string semp = append_sid("empty");
+        {
+            cell::chat::history hs;
+            hs.use(semp);
+            hs.now().unload();
+            cell::async_io::flush();
+            std::string raw;
+            R.expect(cell::box::exist(hs.now().path().string()) &&
+                         cell::box::read(hs.now().path().string(), raw) && raw.empty(),
+                     "unload materialises an empty transcript file");
+        }
+        // pure growth appends: earlier records stay byte-identical (box::read
+        // normalises CRLF, so the prefix comparison is platform-neutral)
+        std::string sapp = append_sid("grow");
+        std::string first;
+        {
+            cell::chat::history hg;
+            hg.use(sapp);
+            hg.now().append("user", "first");
+            hg.now().unload();
+            cell::async_io::flush();
+            R.expect(cell::box::read(hg.now().path().string(), first) && !first.empty(),
+                     "first unload writes the transcript");
+            hg.now().append("assistant", "second");
+            hg.now().unload();
+            // two more unloads with no flush in between: the queued appends must
+            // accumulate in order instead of clobbering each other
+            hg.now().append("user", "third");
+            hg.now().unload();
+            hg.now().append("assistant", "fourth");
+            hg.now().unload();
+            cell::async_io::flush();
+            std::string grown;
+            R.expect(cell::box::read(hg.now().path().string(), grown) && grown.size() > first.size() &&
+                         grown.compare(0, first.size(), first) == 0,
+                     "later unloads append without rewriting the existing records");
+        }
+        {
+            cell::chat::history hg2;
+            hg2.use(sapp);
+            R.expect(hg2.now().msg().size() == 4 &&
+                         hg2.now().msg()[0].value("content", "") == "first" &&
+                         hg2.now().msg()[3].value("content", "") == "fourth",
+                     "queued appends round-trip in order through load");
+        }
+        // an in-place rewrite (system message folded to the front) must replace
+        // the file: the reloaded order proves it was not appended to
+        std::string sfol = append_sid("fold");
+        {
+            cell::chat::history hf;
+            hf.use(sfol);
+            hf.now().append("user", "hello");
+            hf.now().append("assistant", "world");
+            hf.now().unload();
+            cell::async_io::flush();
+            hf.now().msg().push_back({{"role", "system"}, {"content", "injected mid-conversation"}});
+            R.expect(cell::chat::fold_system_messages(hf.now().msg()),
+                     "fold detects the injected system message");
+            hf.now().note_rewrite();
+            hf.now().unload();
+            cell::async_io::flush();
+        }
+        {
+            cell::chat::history hf2;
+            hf2.use(sfol);
+            R.expect(hf2.now().msg().size() == 3 && hf2.now().msg()[0].value("role", "") == "system" &&
+                         hf2.now().msg()[1].value("role", "") == "user",
+                     "rewrite fallback persists the folded order, not a tail append");
+        }
+        // a shrink without an explicit mark is still caught by the size guard
+        std::string sclr = append_sid("clear");
+        {
+            cell::chat::history hc;
+            hc.use(sclr);
+            hc.now().append("user", "gone soon");
+            hc.now().unload();
+            cell::async_io::flush();
+            hc.now().msg().clear(); // no note_rewrite(): the shrink itself must force a replace
+            hc.now().unload();
+            cell::async_io::flush();
+        }
+        {
+            cell::chat::history hc2;
+            hc2.use(sclr);
+            R.expect(hc2.now().msg().empty(), "a shrunk transcript is rewritten, not appended to");
+        }
+        // a torn trailing line (crash mid-append) is skipped on load; the next
+        // unload's rewrite drops it and leaves a clean transcript behind
+        std::string storn = append_sid("torn");
+        {
+            cell::chat::history ht;
+            ht.use(storn);
+            {
+                std::ofstream raw(ht.now().path(), std::ios::trunc);
+                raw << "{\"role\":\"user\",\"content\":\"kept\"}\n{\"role\":\"assistant\",\"cont";
+            }
+            cell::chat::history ht2;
+            ht2.use(storn);
+            R.expect(ht2.now().msg().size() == 1 && ht2.now().msg()[0].value("content", "") == "kept",
+                     "load skips a torn trailing line");
+            ht2.now().append("assistant", "done");
+            ht2.now().unload();
+            cell::async_io::flush();
+        }
+        {
+            cell::chat::history ht3;
+            ht3.use(storn);
+            R.expect(ht3.now().msg().size() == 2 && ht3.now().msg()[1].value("content", "") == "done",
+                     "the rewrite after a torn tail restores a clean transcript");
+        }
+        std::error_code append_ec;
+        for (const std::string &sid : {semp, sapp, sfol, sclr, storn})
+            std::filesystem::remove_all(cell::session_dir(sid), append_ec);
+    }
+
     // an interrupted turn: the partial reply survives (tool calls do not), a
     // system notice records the reason, and the state lives until it is cleared
     {
@@ -19829,11 +20268,14 @@ static int run_selftest()
                             })}},
             {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "<tool_output tool=\"exec\" path=\"probe\">\n<h1>injected</h1>\n</tool_output>"}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "call_2"}, {"content", "<tool_output tool=\"read\">\nfile body\n</tool_output>"}}})}},
-            {{"role", "assistant"},
+            {{"role", "assistant"}, {"model", "test-provider:test-model"},
              {"content", "## Plan\n\n1. read\n2. write\n\n- alpha\n- [docs](https://example.com/x)\n\n"
                          "| key | val |\n| --- | --- |\n| a | 1 |\n\n> quoted note\n\n"
                          "**bold** *em* ~~old~~ `code` [bad](javascript:alert(1))\n\n"
-                         "```python\nprint(1)\n```\n"}},
+                         "```python\nprint(1)\n```\n\n"
+                         "- parent\n  - child one\n  - child two\n- sibling\n\n"
+                         "3. third\n\n4. fourth\n\n"
+                         "- - -\n"}},
         });
         std::filesystem::path out = cell::root / "selftest-export.html";
         R.expect(cell::chat::export_transcript_html(ex_msgs, "selftest-sid", out, xerr), "HTML export writes the transcript");
@@ -19853,6 +20295,15 @@ static int run_selftest()
             R.expect(html.find("<h3 class=\"md-h\">Plan</h3>") != std::string::npos, "HTML export renders markdown headings");
             R.expect(html.find("<ol class=\"md-list\"><li>read</li><li>write</li></ol>") != std::string::npos, "HTML export renders ordered lists");
             R.expect(html.find("<ul class=\"md-list\"><li>alpha</li>") != std::string::npos, "HTML export renders bullet lists");
+            R.expect(html.find("<ul class=\"md-list\"><li>parent<ul class=\"md-list\"><li>child one</li>"
+                               "<li>child two</li></ul></li><li>sibling</li>") != std::string::npos,
+                     "HTML export nests indented list items inside their parent item");
+            R.expect(html.find("<ol class=\"md-list\" start=\"3\"><li>third</li><li>fourth</li></ol>") != std::string::npos,
+                     "HTML export keeps one list across blank lines and honours its start number");
+            R.expect(html.find("<hr class=\"md-hr\">") != std::string::npos,
+                     "HTML export reads a spaced marker line as a horizontal rule");
+            R.expect(html.find("<span class=\"kind\">test-provider:test-model</span>") != std::string::npos,
+                     "HTML export labels each message with the model that produced it");
             R.expect(html.find("<blockquote class=\"md-q\">quoted note</blockquote>") != std::string::npos, "HTML export renders blockquotes");
             R.expect(html.find("<table class=\"md-tab\">") != std::string::npos && html.find("<td>1</td>") != std::string::npos,
                      "HTML export renders pipe tables");
@@ -20719,10 +21170,11 @@ namespace cell
             // the runner-owned tool runtime (approval / safety channels, the
             // live session, the teamwork machinery)
             void install_runtime();
-            // one summarization request for compaction (streams via ev.on_summary)
+            // one summarization request for compaction (streams via ev.on_summary);
+            // `used_model` receives the "provider:model" that produced the text
             std::string summarize_part(const std::string &instruction, const std::string &body,
                                        const std::string &label, const std::string &stream_header,
-                                       const events &ev);
+                                       const events &ev, std::string *used_model = nullptr);
             // context compaction: archive the transcript, summarize conversation
             // and thinking separately, rebuild the tail (the full rationale is
             // attached to the definition below)
@@ -20905,16 +21357,18 @@ namespace cell
             }
             // notices arrive mid-conversation: lift them into the leading system
             // block so a chat template never sees a system message behind a user turn
-            cell::chat::fold_system_messages(h_.now().msg());
+            if (cell::chat::fold_system_messages(h_.now().msg()))
+                h_.now().note_rewrite();
             cell::sys::logger::instance().info("notice", std::format("injected count={} session={}", got.size(), h_.now().id()));
             return got.size();
         }
 
         // run one summarization request via the compression model (or session
         // model) and return the summary text; empty on failure (caller falls back).
+        // `used_model` (optional) receives the "provider:model" that answered.
         std::string runner::summarize_part(const std::string &instruction, const std::string &body,
                                            const std::string &label, const std::string &stream_header,
-                                           const events &ev)
+                                           const events &ev, std::string *used_model)
         {
             auto &log = cell::sys::logger::instance();
             const cell::config::provider_entry *p = nullptr;
@@ -20972,6 +21426,8 @@ namespace cell
             // prompt-injection defence: re-sanitize the summary so a re-stated
             // malicious instruction cannot survive into the new system message
             summary = cell::text::utf8_safe(cell::box::sanitize_output(summary));
+            if (used_model)
+                *used_model = std::format("{}:{}", p->name, model);
             log.info("ctx", std::format("summary {} chars={} time={:.2f}s tok_in={} tok_out={}",
                                         label, summary.size(), sec,
                                         usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
@@ -21011,16 +21467,17 @@ namespace cell
                 return std::format("context already small ({} messages to aggregate)", rest.size());
             std::string conv_text, think_text;
             cell::chat::extract_parts(rest, conv_text, think_text);
+            std::string summary_model;
             std::string conv_summary = summarize_part(
                 "Summarize the conversation content as the memory, preserving key decisions, facts, file paths and unfinished tasks. Output only the memory.",
-                conv_text, "conversation", "Context Summary", ev);
+                conv_text, "conversation", "Context Summary", ev, &summary_model);
             if (conv_summary.empty())
                 return "compaction aborted: summarization failed, context left unchanged";
             std::string think_summary;
             if (!think_text.empty())
                 think_summary = summarize_part(
                     "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
-                    think_text, "reasoning", "Thinking Summary", ev);
+                    think_text, "reasoning", "Thinking Summary", ev, &summary_model);
             // a chat template also needs at least one real turn left: replacing the
             // whole conversation with system messages alone is rejected ("No user
             // query found in messages"), and a caller that compacted on a context
@@ -21058,9 +21515,17 @@ namespace cell
             // standalone assistant message directly behind the surviving user turn
             // (the transcript ends on a turn boundary; the retry after an overflow
             // continues from the summary, like /reload continues a partial reply)
-            new_msgs.push_back({{"role", "assistant"}, {"content", content}});
+            {
+                nlohmann::json summary_msg = {{"role", "assistant"}, {"content", content}};
+                if (!summary_model.empty())
+                    summary_msg["model"] = summary_model;
+                new_msgs.push_back(std::move(summary_msg));
+            }
             size_t removed = rest.size() - (tail_user ? 1 : 0);
             msgs = std::move(new_msgs);
+            // the transcript was rebuilt (and shrank): the append baseline no
+            // longer holds, the next unload must replace the file wholesale
+            sess.note_rewrite();
             return std::format("context compacted: archived to {}, aggregated {} message(s) into 1 summary, {} message(s) remain",
                                archive.filename().string(), removed, msgs.size());
         }
@@ -21180,6 +21645,13 @@ namespace cell
                     usage = nlohmann::json{};
                     err.clear();
                 };
+                // record which model produced the round's output: it survives in
+                // the transcript and /export renders it per message
+                auto tag_reply = [&]()
+                {
+                    if (reply.is_object())
+                        reply["model"] = cfg_.model_label();
+                };
                 while (attempt < kMaxRetries)
                 {
                     if (attempt > 0)
@@ -21222,9 +21694,13 @@ namespace cell
                     // last line of defence: whatever injected a system message
                     // (a notice, a skill, an interrupt, an old transcript read
                     // back from disk) must not leave it behind the conversation
-                    cell::chat::fold_system_messages(h_.now().msg());
+                    if (cell::chat::fold_system_messages(h_.now().msg()))
+                        h_.now().note_rewrite();
                     http_status = 0;
                     ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools, cfg_.think_level, &xfer_poll, &xc, &http_status);
+                    // the reply now exists on every path (success, cancel, error):
+                    // stamp it before the overflow retry below may reset it
+                    tag_reply();
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
                     if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
@@ -21910,7 +22386,10 @@ int repl::run()
         cell::sys::disarm_exit_hook();
         try
         {
+            // repair may insert synthesised results anywhere in the transcript:
+            // the append baseline no longer holds, rewrite on the way out
             cell::chat::repair_tool_pairing(h.now().msg());
+            h.now().note_rewrite();
             h.now().unload();
         }
         catch (const std::exception &)
@@ -22373,8 +22852,10 @@ int repl::run()
         cell::sys::arm_exit_hook([&]()
                                  {
                                      // an interrupt can land between an assistant's tool_calls and their
-                                     // results: repair the transcript before it is persisted
+                                     // results: repair the transcript before it is persisted (the
+                                     // repair may rewrite the middle, so persist it wholesale)
                                      cell::chat::repair_tool_pairing(h.now().msg());
+                                     h.now().note_rewrite();
                                      h.now().unload();
                                      cfg.session_id = h.now().id();
                                      cell::config::save(cfg);
@@ -22461,6 +22942,7 @@ int repl::run()
                      return cmd_flow::handled;
                  long long before = (long long)h.now().msg().size();
                  h.now().msg().clear();
+                 h.now().note_rewrite();                     // the file must be truncated, not appended to
                  h.now().clear_interrupt();                  // the transcript an interrupt could resume is gone
                  cell::box::reset_read_log(h.box_context()); // context gone: recorded reads no longer apply
                  // clear teamwork: remove all job directories and the store file
@@ -23447,6 +23929,7 @@ int repl::run()
                  h.now().msg().push_back({{"role", "system"},
                                           {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
                  cell::chat::fold_system_messages(h.now().msg()); // a skill loaded mid-conversation joins the leading block
+                 h.now().note_rewrite(); // the fold reordered the transcript: replace the file, do not append
                  h.now().unload();
                  log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), h.now().msg().size()));
                  cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), h.now().msg().size());

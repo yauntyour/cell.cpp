@@ -291,7 +291,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/saved [list]` | List the compaction archives of the current session (`saved/msg-<UTC time>.jsonl` in the session folder) |
 | `/saved show NAME` | Display an archived transcript (exact name or unique substring of one) |
 | `/saved rm NAME` | Delete an archived transcript |
-| `/export [PATH]` | Export the current session as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; full-width two-pane layout — a sticky left rail with the execution chain that links 1:1 to the messages on the right, **draggable at its bottom-right corner** to widen it; markdown-lite rendering — headings, lists, quotes, rules, pipe tables, `code`, **bold**, *italic*, links — with tool calls, tool results and reasoning as collapsed sections; Teamwork jobs get an **agent-list pane**: the rail is a clickable list of jobs/stages/child agents that jumps straight to each agent's report + full transcript, wrapping labels instead of scrolling; workflow jobs get a **flowchart sub-page** with its own rail — start/stage/terminator nodes on a vertical rail, parallel stages forking into per-agent branch boxes, gates drawn as dashed diamonds; **phone-friendly**: the header and type tighten, the view tabs become a thumb-reachable bottom bar, every rail folds into a tap-to-open drawer (a hidden checkbox — still no script) and a parallel fan that cannot fit its column folds to one; default `cell-export-<UTC time>.html` in the working directory) |
+| `/export [PATH]` | Export the current session as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; full-width two-pane layout — a sticky left rail with the execution chain that links 1:1 to the messages on the right, **draggable at its bottom-right corner** to widen it; markdown-lite rendering — headings, indentation-aware nested lists (a loose list keeps one continuous numbering; an ordered list honours its start number), quotes, rules, pipe tables, `code`, **bold**, *italic*, links — each message is labelled with the model that produced it, and tool calls, tool results and reasoning come as collapsed sections; Teamwork jobs get an **agent-list pane**: the rail is a clickable list of jobs/stages/child agents that jumps straight to each agent's report + full transcript, wrapping labels instead of scrolling; workflow jobs get a **flowchart sub-page** with its own rail — start/stage/terminator nodes on a vertical rail, parallel stages forking into per-agent branch boxes, gates drawn as dashed diamonds; **phone-friendly**: the header and type tighten, the view tabs become a thumb-reachable bottom bar, every rail folds into a tap-to-open drawer (a hidden checkbox — still no script) and a parallel fan that cannot fit its column folds to one; default `cell-export-<UTC time>.html` in the working directory) |
 | `/export saved NAME [PATH]` | Export one compaction archive to HTML (name resolved like `/saved show`) |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
 | `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one summary message, backfilled as a standalone assistant reply directly behind the last user turn; refuses while the context is small (≤ 12 messages) |
@@ -792,9 +792,14 @@ never appears in the vault file — the self-test asserts this.
   the context is left untouched. `/saved list`, `/saved show NAME` and `/saved rm NAME` access the
   archives of the current session.
 - Session, config and index writes go through `cell::async_io::file_writer` (coalesced per path, one
-  background thread). Every write is an **atomic replace**: the content is written to a sibling
-  `<name>.tmp`, flushed to the storage device, then renamed over the target, so a crash can never
-  leave a truncated file that the next start silently reads as empty. Commands that read those files back (`/save`, `/sessions`, `/session`,
+  background thread). Config-style files are written as an **atomic replace**: the content goes to a
+  sibling `<name>.tmp`, is flushed to the storage device, then renamed over the target, so a crash can
+  never leave a truncated file that the next start silently reads as empty. The transcript additionally
+  has an **append fast path**: a turn that only added messages to the end of the session appends just
+  those records (`messages.jsonl` is one line per message), so a long session costs O(new messages) per
+  turn instead of re-writing the whole file; in-place transcript rewrites (compaction, system-message
+  folding, tool-pairing repair, `/clear`) still replace the file atomically, and a torn trailing line
+  from an interrupted append is skipped on load and cleaned up by the next rewrite. Commands that read those files back (`/save`, `/sessions`, `/session`,
   `/compact`, exit) call `flush()` first as a durability barrier; the signal handler and the RAII
   exit guard do the same.
 
