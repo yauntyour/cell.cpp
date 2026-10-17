@@ -5928,29 +5928,160 @@ namespace cell
             return n;
         }
 
-        // extract a human-readable message from an OpenAI-compatible error body
+        // the first non-empty string under one of `keys` in a JSON object
+        static std::string json_string_field(const nlohmann::json &j, std::initializer_list<const char *> keys)
+        {
+            for (const char *k : keys)
+            {
+                auto it = j.find(k);
+                if (it != j.end() && it->is_string())
+                {
+                    std::string s = it->get<std::string>();
+                    if (!s.empty())
+                        return s;
+                }
+            }
+            return "";
+        }
+
+        // walk a JSON value (string / array / object) looking for the first
+        // human-readable message. Bounded on purpose: a hostile or broken
+        // gateway must not turn the detail/errors scan into unbounded work.
+        static std::string json_leaf_message(const nlohmann::json &v, int depth = 4)
+        {
+            if (depth <= 0)
+                return "";
+            if (v.is_string())
+                return v.get<std::string>();
+            if (v.is_array())
+            {
+                size_t seen = 0;
+                for (const auto &e : v)
+                {
+                    if (++seen > 16)
+                        break;
+                    std::string s = json_leaf_message(e, depth - 1);
+                    if (!s.empty())
+                        return s;
+                }
+            }
+            else if (v.is_object())
+                return json_string_field(v, {"message", "msg", "error_message", "error_msg", "errmsg", "description", "detail", "error"});
+            return "";
+        }
+
+        // extract a human-readable message from a failed response body. The
+        // client talks to more than one provider family, so the envelope varies:
+        //   {"error":{"message":…}}     OpenAI, Azure, Anthropic, Gemini/Vertex
+        //   {"message":…}               vLLM, Cohere, DashScope, Spring
+        //   {"detail":…}                FastAPI maps (LiteLLM proxy auth/validation)
+        //   {"errors":[{"message":…}]}  Cloudflare, GraphQL-style gateways
+        //   {"error_description":…}     OAuth2 (its "error" field is just a code)
+        //   {"error":"…"}               Ollama, TGI, HuggingFace
+        //   {"msg"/"errmsg"/"error_msg"} Chinese-style APIs, WeChat, Baidu
+        //   {"Message":…}               AWS-style
         static std::string error_message(const std::string &body)
         {
             try
             {
                 auto j = nlohmann::json::parse(body, nullptr, false);
-                if (!j.is_object())
-                    return "";
-                if (j.contains("error"))
+                if (j.is_object())
                 {
-                    auto &e = j["error"];
-                    if (e.is_object() && e.contains("message") && e["message"].is_string())
-                        return e["message"].get<std::string>();
-                    if (e.is_string())
-                        return e.get<std::string>();
+                    // 1. the structured envelopes first
+                    if (j.contains("error") && j["error"].is_object())
+                    {
+                        std::string s = json_leaf_message(j["error"], 3);
+                        if (!s.empty())
+                            return s;
+                    }
+                    // 2. top-level "message" beats a bare "error" string: on
+                    //    Spring-style bodies "error" is only the HTTP reason
+                    //    phrase while "message" carries the actual detail
+                    std::string s = json_string_field(j, {"message"});
+                    if (!s.empty())
+                        return s;
+                    // 3. FastAPI / LiteLLM-proxy style "detail" (a string, or a
+                    //    validation array of {"loc":…, "msg":…} entries)
+                    if (j.contains("detail"))
+                    {
+                        s = json_leaf_message(j["detail"]);
+                        if (!s.empty())
+                            return s;
+                    }
+                    // 4. Cloudflare / GraphQL style "errors" arrays
+                    if (j.contains("errors"))
+                    {
+                        s = json_leaf_message(j["errors"]);
+                        if (!s.empty())
+                            return s;
+                    }
+                    // 5. the remaining scalar styles
+                    s = json_string_field(j, {"error_description", "error", "error_msg", "errmsg", "msg", "Message"});
+                    if (!s.empty())
+                        return s;
                 }
-                if (j.contains("message") && j["message"].is_string())
-                    return j["message"].get<std::string>();
+                else if (j.is_array())
+                    return json_leaf_message(j); // e.g. [{"message": …}]
             }
             catch (const std::exception &)
             {
             }
             return "";
+        }
+
+        // last-resort text for non-JSON failures (nginx/Envoy HTML pages, plain
+        // text from a gateway): collapse whitespace and keep a short prefix, so
+        // "HTTP error 502" also shows "502 Bad Gateway" instead of nothing.
+        // Multibyte sequences are kept whole — a cut in the middle of a UTF-8
+        // character would print as mojibake on the console.
+        static std::string error_body_snippet(const std::string &body, size_t max_len = 160)
+        {
+            std::string out;
+            out.reserve(max_len + 4);
+            bool pending_space = false, cut = false;
+            for (size_t i = 0; i < body.size();)
+            {
+                const unsigned char u = (unsigned char)body[i];
+                if (u == ' ' || u == '\t' || u == '\r' || u == '\n')
+                {
+                    pending_space = !out.empty();
+                    ++i;
+                    continue;
+                }
+                if (u < 0x20 || u == 0x7f) // other control bytes carry no text
+                {
+                    ++i;
+                    continue;
+                }
+                size_t seq = 1; // ASCII and stray continuation bytes
+                if (u >= 0xC0)
+                    seq = u < 0xE0 ? 2 : (u < 0xF0 ? 3 : 4);
+                if (i + seq > body.size()) // the body itself ends mid-sequence
+                {
+                    cut = true;
+                    break;
+                }
+                if (pending_space)
+                {
+                    if (out.size() + 1 + seq > max_len)
+                    {
+                        cut = true;
+                        break;
+                    }
+                    out += ' ';
+                    pending_space = false;
+                }
+                if (out.size() + seq > max_len)
+                {
+                    cut = true;
+                    break;
+                }
+                for (size_t k = 0; k < seq; ++k, ++i)
+                    out += body[i];
+            }
+            if (cut)
+                out += "...";
+            return out;
         }
 
         // RAII wrapper that owns a curl_slist header list (built from spans/containers)
@@ -6118,7 +6249,13 @@ namespace cell
                     {
                         *err = error_message(buf);
                         if (err->empty())
-                            *err = std::format("HTTP error {} (POST {})", code, url);
+                        {
+                            const std::string snippet = error_body_snippet(buf);
+                            if (snippet.empty())
+                                *err = std::format("HTTP error {} (POST {})", code, url);
+                            else
+                                *err = std::format("HTTP error {} (POST {}): {}", code, url, snippet);
+                        }
                     }
                 }
             }
@@ -6134,12 +6271,36 @@ namespace cell
                            nullptr, std::move(on_token), on_xfer, xfer_data, http_code, nullptr);
         }
 
-        // lightweight GET (used for connectivity probes); timeout_sec defaults to a short 5s
+        // lightweight GET (used for connectivity probes); timeout_sec defaults to a short 5s.
+        // A transport-level success keeps `ok` true even on an HTTP error, but the
+        // server's own message lands in `err`: a rejected /v1/models call is far
+        // more useful as "Incorrect API key provided" than as a bare "HTTP 401".
         bool CURL_get(CURL *curl, const char *url, const std::vector<std::string> &headers, std::string &buf,
                       long *http_code = nullptr, std::string *err = nullptr, const char *proxy = nullptr,
                       long timeout_sec = 5)
         {
-            return perform(curl, url, nullptr, 0, proxy, headers, &buf, nullptr, nullptr, nullptr, http_code, err, timeout_sec);
+            long code = 0;
+            bool ok = perform(curl, url, nullptr, 0, proxy, headers, &buf, nullptr, nullptr, nullptr, &code, err, timeout_sec);
+            if (http_code)
+                *http_code = code;
+            if (ok && err && code >= 300)
+            {
+                if (code < 400)
+                    *err = std::format("HTTP {} (redirected — no redirect is followed here; check the provider base URL, a missing or extra trailing slash is the usual cause) [{}]", code, url);
+                else
+                {
+                    *err = error_message(buf);
+                    if (err->empty())
+                    {
+                        const std::string snippet = error_body_snippet(buf);
+                        if (snippet.empty())
+                            *err = std::format("HTTP error {} (GET {})", code, url);
+                        else
+                            *err = std::format("HTTP error {} (GET {}): {}", code, url, snippet);
+                    }
+                }
+            }
+            return ok;
         }
     } // namespace net
     // =========================================================================
@@ -8174,7 +8335,13 @@ namespace cell
                 sse_finish(sse_buf, sse_base);
                 err = net::error_message(sse_buf);
                 if (err.empty())
-                    err = std::format("HTTP error {} (POST {})", http, url);
+                {
+                    const std::string snippet = net::error_body_snippet(sse_buf);
+                    if (snippet.empty())
+                        err = std::format("HTTP error {} (POST {})", http, url);
+                    else
+                        err = std::format("HTTP error {} (POST {}): {}", http, url, snippet);
+                }
             }
             // a mid-stream error event (anthropic "error", responses
             // "response.failed", chat error chunks) must fail the round even
