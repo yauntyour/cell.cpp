@@ -444,6 +444,16 @@ namespace cell
     }
     namespace plat
     {
+        // defined further down (platform shims); declared here for spawn_cmd's
+        // wide-character CreateProcess call
+        inline std::wstring utf8_to_wide(std::string_view s);
+
+        // Capture cap for a spawned command's stdout/stderr. A command that
+        // floods its output (yes, cat /dev/zero, a runaway build log) would
+        // otherwise grow the process until it dies; reading continues after the
+        // cap (so the child never blocks on a full pipe), the bytes are dropped.
+        constexpr size_t kMaxCapturedOutput = (size_t)16 * 1024 * 1024;
+
         // Spawn a command with timeout; captures stdout/stderr; exit_code=124 on timeout.
         //
         // Two guarantees the previous implementation did not provide:
@@ -492,20 +502,36 @@ namespace cell
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
             jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             SetInformationJobObject(hjob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-            STARTUPINFOA si{};
+            // A windowed process (the desktop shell) has no console: its std
+            // input handle is NULL, and CreateProcess with STARTF_USESTDHANDLES
+            // and a NULL stdin handle can fail outright. Give the child a real
+            // (inheritable) NUL handle instead.
+            HANDLE hstdin = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        &sa, OPEN_EXISTING, 0, nullptr);
+            bool own_stdin = hstdin != INVALID_HANDLE_VALUE;
+            if (!own_stdin)
+                hstdin = GetStdHandle(STD_INPUT_HANDLE);
+            STARTUPINFOW si{};
             si.cb = sizeof(si);
             si.dwFlags = STARTF_USESTDHANDLES;
             si.hStdOutput = hwrite_out;
             si.hStdError = hwrite_err;
-            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            si.hStdInput = hstdin;
             PROCESS_INFORMATION pi{};
-            std::string cmdline = "cmd.exe /c " + cmd;
-            std::vector<char> buf(cmdline.begin(), cmdline.end());
-            buf.push_back('\0');
-            std::string cwd_s = cwd.empty() ? std::string() : cwd.string();
-            if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
-                                cwd_s.empty() ? nullptr : cwd_s.c_str(), &si, &pi))
+            // Wide-character command line + working directory: the ANSI variants
+            // mangle any non-ASCII path (a Chinese workspace directory, for one).
+            std::wstring wcmdline = utf8_to_wide("cmd.exe /c " + cmd);
+            std::vector<wchar_t> buf(wcmdline.begin(), wcmdline.end());
+            buf.push_back(L'\0');
+            std::wstring wcwd = cwd.empty() ? std::wstring() : cwd.wstring();
+            // CREATE_SUSPENDED: assign the job object before the child can spawn
+            // a grandchild, so KILL_ON_JOB_CLOSE really owns the whole tree
+            if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE,
+                                CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+                                wcwd.empty() ? nullptr : wcwd.c_str(), &si, &pi))
             {
+                if (own_stdin)
+                    CloseHandle(hstdin);
                 CloseHandle(hread_out);
                 CloseHandle(hwrite_out);
                 CloseHandle(hread_err);
@@ -513,22 +539,59 @@ namespace cell
                 CloseHandle(hjob);
                 return false;
             }
-            AssignProcessToJobObject(hjob, pi.hProcess);
+            bool job_ok = AssignProcessToJobObject(hjob, pi.hProcess) != 0;
+            if (!job_ok)
+                std::fputs("[exec] warning: cannot assign the child process to a job object; "
+                           "grandchildren of a timed-out command may survive\n",
+                           stderr);
+            if (ResumeThread(pi.hThread) == (DWORD)-1)
+            {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                CloseHandle(hjob);
+                if (own_stdin)
+                    CloseHandle(hstdin);
+                CloseHandle(hwrite_out);
+                CloseHandle(hwrite_err);
+                CloseHandle(hread_out);
+                CloseHandle(hread_err);
+                return false;
+            }
             CloseHandle(pi.hThread);
+            if (own_stdin)
+                CloseHandle(hstdin);
             CloseHandle(hwrite_out);
             CloseHandle(hwrite_err);
+            output.reserve(64 * 1024);
+            std::atomic<bool> output_capped{false}, stderr_capped{false};
+            auto append_capped = [](std::string &dst, const char *p, size_t n, std::atomic<bool> &capped)
+            {
+                if (dst.size() >= kMaxCapturedOutput)
+                {
+                    capped.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                size_t room = kMaxCapturedOutput - dst.size();
+                if (n > room)
+                {
+                    n = room;
+                    capped.store(true, std::memory_order_relaxed);
+                }
+                dst.append(p, n);
+            };
             std::thread reader_out([&]
                                    {
                 char tmp[4096];
                 DWORD n = 0;
                 while (ReadFile(hread_out, tmp, sizeof(tmp), &n, nullptr) && n > 0)
-                    output.append(tmp, n); });
+                    append_capped(output, tmp, (size_t)n, output_capped); });
             std::thread reader_err([&]
                                    {
                 char tmp[4096];
                 DWORD n = 0;
                 while (ReadFile(hread_err, tmp, sizeof(tmp), &n, nullptr) && n > 0)
-                    stderr_output.append(tmp, n); });
+                    append_capped(stderr_output, tmp, (size_t)n, stderr_capped); });
             DWORD wait_ms = timeout_s > 0 ? (DWORD)(timeout_s * 1000.0) : INFINITE;
             DWORD wr = WaitForSingleObject(pi.hProcess, wait_ms);
             bool timed_out = wr == WAIT_TIMEOUT;
@@ -537,7 +600,17 @@ namespace cell
             // tear the job tree down before joining the readers: a grandchild that
             // inherited the pipe write ends would otherwise keep them from ever
             // seeing EOF (and would previously hang the join forever)
-            TerminateJobObject(hjob, 1);
+            if (job_ok)
+                TerminateJobObject(hjob, 1);
+            else if (timed_out)
+                TerminateProcess(pi.hProcess, 1);
+            // Without a job object a surviving grandchild can hold the pipe
+            // write ends open forever: cancel the blocking reads after the kill
+            if (!job_ok && timed_out)
+            {
+                CancelSynchronousIo((HANDLE)reader_out.native_handle());
+                CancelSynchronousIo((HANDLE)reader_err.native_handle());
+            }
             CloseHandle(pi.hProcess);
             CloseHandle(hjob);
             reader_out.join();
@@ -545,6 +618,10 @@ namespace cell
             CloseHandle(hread_out);
             CloseHandle(hread_err);
             exit_code = (int)code;
+            if (output_capped.load(std::memory_order_relaxed))
+                output += std::format("\n[output truncated at {} bytes]", kMaxCapturedOutput);
+            if (stderr_capped.load(std::memory_order_relaxed))
+                stderr_output += std::format("\n[stderr truncated at {} bytes]", kMaxCapturedOutput);
             if (timed_out)
             {
                 output += std::format("\n[tool timed out after {}s, process tree killed]", (long long)timeout_s);
@@ -613,7 +690,7 @@ namespace cell
                     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
             }
             // drain one pipe completely; true once every write end is closed
-            auto drain = [](int fd, std::string &sink)
+            auto drain = [](int fd, std::string &sink, bool &capped)
             {
                 char tmp[8192];
                 for (;;)
@@ -621,21 +698,34 @@ namespace cell
                     ssize_t n = ::read(fd, tmp, sizeof tmp);
                     if (n > 0)
                     {
-                        sink.append(tmp, (size_t)n);
+                        if (sink.size() < kMaxCapturedOutput)
+                        {
+                            size_t room = kMaxCapturedOutput - sink.size();
+                            if ((size_t)n > room)
+                            {
+                                sink.append(tmp, room);
+                                capped = true;
+                            }
+                            else
+                                sink.append(tmp, (size_t)n);
+                        }
+                        else
+                            capped = true;
                         continue;
                     }
                     return n == 0;
                 }
             };
+            bool out_capped = false, err_capped = false;
             bool eof_out = false, eof_err = false, timed_out = false, reaped = false;
             int status = 0;
             auto start = std::chrono::steady_clock::now();
             for (;;)
             {
                 if (!eof_out)
-                    eof_out = drain(fds_out[0], output);
+                    eof_out = drain(fds_out[0], output, out_capped);
                 if (!eof_err)
-                    eof_err = drain(fds_err[0], stderr_output);
+                    eof_err = drain(fds_err[0], stderr_output, err_capped);
                 if (waitpid(pid, &status, WNOHANG) == pid)
                 {
                     reaped = true;
@@ -684,8 +774,12 @@ namespace cell
                 else
                     exit_code = 1;
             }
-            drain(fds_out[0], output);
-            drain(fds_err[0], stderr_output);
+            drain(fds_out[0], output, out_capped);
+            drain(fds_err[0], stderr_output, err_capped);
+            if (out_capped)
+                output += std::format("\n[output truncated at {} bytes]", kMaxCapturedOutput);
+            if (err_capped)
+                stderr_output += std::format("\n[stderr truncated at {} bytes]", kMaxCapturedOutput);
             close(fds_out[0]);
             close(fds_err[0]);
             return true;
@@ -2300,8 +2394,12 @@ namespace cell
         std::filesystem::create_directories(root / "sessions", ec);
         // Ensure cache is loaded
         sessions_index();
-        if (index_cache() && index_cache()->value(key, "") == path)
-            return;
+        if (index_cache())
+        {
+            auto it = index_cache()->find(key);
+            if (it != index_cache()->end() && it->is_string() && it->get<std::string>() == path)
+                return;
+        }
         // Mutate the cache directly (avoiding const_cast)
         if (!index_cache())
             index_cache() = nlohmann::json::object();
@@ -2602,6 +2700,11 @@ namespace cell
         std::string text;
         std::vector<ContentBlock> blocks;
         bool ok = true; // false: the call failed, `text` carries the reason
+        // Per-call refusal state. A tool INSTANCE can serve several calls at
+        // once (pass-1 read tools run on the worker pool), so the verdict must
+        // travel with the result instead of living on the tool object.
+        bool blocked = false;
+        unsigned char reject_reason = 0; // cell::tools::rejection_reason value
 
         bool is_multimodal() const { return !blocks.empty(); }
         static ToolOutput fail(std::string reason)
@@ -3095,6 +3198,36 @@ namespace cell
 #endif
         }
 
+        // Windows silently strips trailing dots and spaces from a path
+        // component, so "<root>./.key" opens the real "<root>/.key" while every
+        // normalized-path check sees a harmless-looking name. Reject such
+        // components for read-only paths AND for write/edit inputs (a write must
+        // not be able to reach a runtime-root file through that reinterpretation).
+        static bool has_windows_trailing_dot_or_space(std::string_view path)
+        {
+#ifndef _WIN32
+            (void)path;
+            return false;
+#else
+            std::string_view s = path;
+            size_t start = 0;
+            while (start <= s.size())
+            {
+                size_t end = s.find_first_of("\\/", start);
+                if (end == std::string_view::npos)
+                    end = s.size();
+                std::string_view comp = s.substr(start, end - start);
+                if (comp.size() >= 2 && comp != ".." && comp != "." &&
+                    (comp.back() == '.' || comp.back() == ' '))
+                    return true;
+                if (end == s.size())
+                    break;
+                start = end + 1;
+            }
+            return false;
+#endif
+        }
+
         // Sensitive path substrings for exec command checking.
         // These are checked against the lowercased command string to prevent
         // data exfiltration via exec (e.g., "cat .key", "cat .crypt").
@@ -3205,6 +3338,8 @@ namespace cell
                 return false;
             if (has_reserved_device_or_ads(call))
                 return false; // device name / alternate data stream (Windows)
+            if (has_windows_trailing_dot_or_space(call))
+                return false; // "name." / "name " would be reinterpreted by Windows
             // ReadOnly: only allow reading from workspace
             if (sandbox_mode() == SandboxMode::ReadOnly && !is_in_workspace(call))
                 return false;
@@ -3222,6 +3357,8 @@ namespace cell
             std::string lower = to_lower(call);
             if (is_sensitive_path(lower))
                 return false;
+            if (has_windows_trailing_dot_or_space(call))
+                return false; // Windows strips the dot/space: ".cell." -> ".cell"
             return true;
         }
         // Split on whitespace, honouring double quotes so an argument can contain
@@ -3814,7 +3951,7 @@ namespace cell
         }
         // basic size cap for non-exec tool results: keeps one result from
         // blowing up the context window, without the injection scan
-        static std::string truncate_output(const std::string &raw, size_t max_bytes = 1024 * 1024 * 512)
+        static std::string truncate_output(const std::string &raw, size_t max_bytes = 2 * 1024 * 1024)
         {
             if (raw.size() > max_bytes)
             {
@@ -6203,15 +6340,54 @@ namespace cell
             return scoped_exit<F>(std::move(fn));
         }
 
+        // Completion group for one caller's submissions. The pool is shared by
+        // every workspace, so waiting for the whole pool (wait_all) made one
+        // turn wait for unrelated work; a batch lets a caller wait for exactly
+        // the jobs it submitted.
+        class pool_batch
+        {
+        private:
+            std::mutex mx;
+            std::condition_variable cv;
+            size_t pending = 0;
+
+        public:
+            void add()
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                ++pending;
+            }
+            void done()
+            {
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    if (pending > 0)
+                        --pending;
+                }
+                cv.notify_all();
+            }
+            void wait()
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait(lk, [&]
+                        { return pending == 0; });
+            }
+        };
+
         // dynamically-scaling worker pool: no workers at rest, spawns one whenever
         // the queue depth exceeds the live worker count, up to max_workers
         // (configured via config.json "thread_pool_size", default 16, hard cap 16).
         class thread_pool
         {
         private:
+            struct queued_job
+            {
+                std::move_only_function<void()> fn;
+                std::shared_ptr<pool_batch> batch;
+            };
             std::mutex mx;
             std::condition_variable cv;
-            std::deque<std::move_only_function<void()>> jobs;
+            std::deque<queued_job> jobs;
             size_t active = 0; // submitted jobs not yet finished
             size_t max_workers = 16;
             bool stopping = false;
@@ -6228,19 +6404,19 @@ namespace cell
             {
                 for (;;)
                 {
-                    std::move_only_function<void()> job;
+                    queued_job task;
                     {
                         std::unique_lock lk(mx);
                         cv.wait(lk, [&]
                                 { return stopping || !jobs.empty(); });
                         if (stopping && jobs.empty())
                             return;
-                        job = std::move(jobs.front());
+                        task = std::move(jobs.front());
                         jobs.pop_front();
                     }
                     try
                     {
-                        job();
+                        task.fn();
                     }
                     catch (const std::exception &e)
                     {
@@ -6252,6 +6428,8 @@ namespace cell
                     {
                         logger::instance().error("core", "thread_pool job threw an unknown exception");
                     }
+                    if (task.batch)
+                        task.batch->done();
                     bool idle = false;
                     {
                         std::lock_guard lk(mx);
@@ -6271,12 +6449,18 @@ namespace cell
             thread_pool(const thread_pool &) = delete;
             thread_pool &operator=(const thread_pool &) = delete;
 
-            void submit(std::move_only_function<void()> job)
+            // `batch` (optional) receives one completion per submitted job, so a
+            // caller can wait for exactly its own work instead of the whole pool.
+            void submit(std::move_only_function<void()> job, std::shared_ptr<pool_batch> batch = nullptr)
             {
                 {
                     std::lock_guard lk(mx);
+                    if (stopping)
+                        return; // never queue work that would never run
                     active++;
-                    jobs.push_back(std::move(job));
+                    if (batch)
+                        batch->add();
+                    jobs.push_back(queued_job{std::move(job), std::move(batch)});
                     if (active > workers.size()) // more work than workers: scale up
                         spawn_locked();
                 }
@@ -7447,7 +7631,10 @@ namespace cell
                 blocked_.store(true, std::memory_order_relaxed);
                 rejected_for_.store(why, std::memory_order_relaxed);
                 cell::sys::logger::instance().warn("tool", std::format("blocked name={} reason={}", name(), log_reason));
-                return ToolOutput::fail(std::move(fail_msg));
+                ToolOutput out = ToolOutput::fail(std::move(fail_msg));
+                out.blocked = true;
+                out.reject_reason = (unsigned char)why;
+                return out;
             }
             // The sandbox / policy / approval gates, applied before the handler
             // runs. Returns false (with output.ok=false and blocked_ /
@@ -7925,6 +8112,46 @@ namespace cell
             bool ok = net::CURL_stream_post(curl, url.c_str(), dump_safe(payload), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy.c_str());
             return finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
         }
+        // Provider tool_calls are untrusted input. Normalize them into the shape
+        // the turn loop expects (an object, an object "function", string
+        // name/arguments, string id) and drop entries that cannot be dispatched;
+        // a malformed entry used to throw a JSON type_error mid-turn.
+        static nlohmann::json normalize_tool_calls(const nlohmann::json &raw)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            if (!raw.is_array())
+                return out;
+            for (size_t i = 0; i < raw.size() && i < kMaxStreamSlots; i++)
+            {
+                const auto &c = raw[i];
+                if (!c.is_object())
+                    continue;
+                nlohmann::json fn = nlohmann::json::object();
+                if (c.contains("function") && c["function"].is_object())
+                {
+                    const auto &f = c["function"];
+                    if (f.contains("name") && f["name"].is_string())
+                        fn["name"] = f["name"];
+                    if (f.contains("arguments"))
+                    {
+                        if (f["arguments"].is_string())
+                            fn["arguments"] = f["arguments"];
+                        else if (!f["arguments"].is_null())
+                            fn["arguments"] = dump_safe(f["arguments"]);
+                    }
+                }
+                if (!fn.contains("name") || fn["name"].get<std::string>().empty())
+                    continue; // no name -> nothing to dispatch
+                if (!fn.contains("arguments"))
+                    fn["arguments"] = "";
+                nlohmann::json tc;
+                tc["id"] = (c.contains("id") && c["id"].is_string()) ? c["id"] : nlohmann::json("");
+                tc["type"] = "function";
+                tc["function"] = std::move(fn);
+                out.push_back(std::move(tc));
+            }
+            return out;
+        }
         // persisted reply content: streamed reasoning and answer text as blocks
         static nlohmann::json reasoning_content_array(const std::string &text, const std::string &reasoning)
         {
@@ -8107,11 +8334,26 @@ namespace cell
                 try
                 {
                     auto j = nlohmann::json::parse(buf);
-                    if (!j.contains("choices") || j["choices"].empty())
+                    if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
+                    {
+                        err = "response has no choices";
                         return false;
-                    reply = j["choices"][0]["message"];
+                    }
+                    const auto &choice = j["choices"][0];
+                    if (!choice.is_object() || !choice.contains("message") || !choice["message"].is_object())
+                    {
+                        err = "response has no message object";
+                        return false;
+                    }
+                    reply = choice["message"];
                     if (reply.contains("tool_calls"))
-                        tool_calls = reply["tool_calls"];
+                    {
+                        tool_calls = normalize_tool_calls(reply["tool_calls"]);
+                        if (tool_calls.empty())
+                            reply.erase("tool_calls");
+                        else
+                            reply["tool_calls"] = tool_calls;
+                    }
                     if (j.contains("usage") && j["usage"].is_object())
                         usage = j["usage"];
                     return true;
@@ -8215,6 +8457,7 @@ namespace cell
                     reply["content"] = reasoning_content_array(text, reasoning);
                 else
                     reply["content"] = text;
+                tool_calls = normalize_tool_calls(tool_calls);
                 if (!tool_calls.empty())
                     reply["tool_calls"] = tool_calls;
                 if (!reasoning.empty())
@@ -12640,6 +12883,10 @@ details{break-inside:avoid}
         struct runtime_context
         {
             config::settings *settings = nullptr;
+            // A run owns its settings copy (see own_settings below): child agents
+            // run on background threads and must never read the live config, which
+            // the multi-workspace shell mutates from its command thread.
+            std::shared_ptr<config::settings> owned_settings;
             const std::unordered_map<std::string, std::shared_ptr<tools::tool>> *tool_list = nullptr;
             const nlohmann::json *tool_defs_openai = nullptr;
             const nlohmann::json *tool_defs_anthropic = nullptr;
@@ -12663,6 +12910,18 @@ details{break-inside:avoid}
             // worker tool calls go through the same gates as the main loop's
             const tools::runtime *tools_rt = nullptr;
         };
+
+        // Give this runtime its own settings copy. Called on the CALLING thread
+        // while a run is prepared, so the background runner never reads the live
+        // settings object. The pointer stays valid across moves because the copy
+        // lives on the heap.
+        static void own_settings(runtime_context &rt)
+        {
+            if (!rt.settings || rt.owned_settings)
+                return;
+            rt.owned_settings = std::make_shared<config::settings>(*rt.settings);
+            rt.settings = rt.owned_settings.get();
+        }
 
         // Tool schemas are stored separately for each wire format. Recursion is
         // removed (`tw`) and parallel children lose `exec` (shell commands stay
@@ -15832,6 +16091,7 @@ details{break-inside:avoid}
 
         static bool run_job_bg(runtime_context rt, const std::string &job_id, std::string &out)
         {
+            own_settings(rt); // background threads never touch the live config
             snapshot_foreground_context(rt);
             // resolve the session on the CALLING thread — background workers must
             // never reach into the live session
@@ -15871,6 +16131,7 @@ details{break-inside:avoid}
 
         static bool run_job(runtime_context rt, const std::string &job_id, std::string &out)
         {
+            own_settings(rt);
             snapshot_foreground_context(rt);
             // resolve the session on the CALLING thread (see run_job_bg)
             const std::string sid = rt.live_session && rt.live_session() ? rt.live_session()->id() : "current";
@@ -16878,6 +17139,24 @@ static int run_selftest()
             }
             std::filesystem::remove("cell_junction", jec);
         }
+        // wide-character spawn: a non-ASCII working directory and command line
+        // must reach the child intact (the ANSI CreateProcess variants mangle it)
+        {
+            std::error_code wec;
+            std::filesystem::path wdir = cell::root / "wide_目录";
+            std::filesystem::remove_all(wdir, wec);
+            std::filesystem::create_directories(wdir, wec);
+            {
+                std::ofstream f(wdir / "marker.txt");
+                f << "x";
+            }
+            std::string wout, werr;
+            int wrc = -1;
+            bool wok = cell::plat::spawn_cmd("cmd /c dir /b", 10.0, wout, wrc, werr, wdir);
+            R.expect(wok && wrc == 0 && wout.find("marker.txt") != std::string::npos,
+                     "spawn: a non-ASCII working directory works");
+            std::filesystem::remove_all(wdir, wec);
+        }
 #endif
     }
 
@@ -17839,6 +18118,12 @@ static int run_selftest()
         R.expect(!cell::box::check_path("NUL") && !cell::box::check_path("CON.txt"), "sandbox: reserved device name blocked");
         R.expect(!cell::box::check_path("report.txt:secret"), "sandbox: alternate data stream blocked");
         R.expect(cell::box::check_path("C:\\proj\\src\\main.cpp"), "sandbox: normal absolute path allowed");
+        // Windows silently strips trailing dots/spaces, so "<root>./x" opens
+        // "<root>/x": both read and write paths must refuse that form
+        R.expect(!cell::box::check_path((cell::root / "theme.").string() + "/x"),
+                 "sandbox: trailing-dot path component blocked");
+        R.expect(!cell::box::check((cell::root / "theme.").string() + "/x"),
+                 "sandbox: trailing-dot write target blocked");
 #endif
 
         // a SEARCH block copied from the numbered read output always ends with a
@@ -19873,6 +20158,24 @@ static int run_selftest()
                  "sse: ordinary payloads still parse");
     }
 
+    // malformed provider tool_calls are normalized instead of throwing a
+    // type_error in the middle of the turn
+    {
+        nlohmann::json raw = nlohmann::json::array({
+            {{"id", "a"}, {"function", {{"name", "read"}, {"arguments", "{\"path\":\"x\"}"}}}},
+            {{"function", {{"name", "write"}, {"arguments", nlohmann::json{{"path", "y"}}}}}},
+            {{"id", "c"}, {"function", "not-an-object"}},
+            "not-an-object",
+            {{"id", "d"}, {"function", {{"arguments", "{}"}}}},
+        });
+        nlohmann::json norm = cell::llm::normalize_tool_calls(raw);
+        R.expect(norm.is_array() && norm.size() == 2, "tool_calls: malformed entries are dropped");
+        R.expect(norm[0]["function"]["name"] == "read" && norm[0]["function"]["arguments"] == "{\"path\":\"x\"}",
+                 "tool_calls: string arguments are kept");
+        R.expect(norm[1]["function"]["arguments"] == "{\"path\":\"y\"}", "tool_calls: object arguments are serialized");
+        R.expect(cell::llm::normalize_tool_calls(nlohmann::json::object()).empty(), "tool_calls: non-array input yields none");
+    }
+
     // a numeric JSON string with an embedded NUL used to be truncated at the
     // NUL and accepted as a valid number ("12\0 999" -> 12)
     {
@@ -20231,8 +20534,14 @@ namespace cell
         class runner
         {
         public:
-            runner(cell::config::settings &cfg, cell::encrypt::crypt &vault, cell::chat::history &h)
-                : cfg_(cfg), vault_(vault), h_(h)
+            // `persist_turn_config`: the CLI remembers the active session in
+            // config.json after every turn. A multi-workspace frontend owns that
+            // map itself and passes false - a turn runs on its own thread, and
+            // rewriting shared config there races the command thread (and makes
+            // each workspace save the whole file after every turn).
+            runner(cell::config::settings &cfg, cell::encrypt::crypt &vault, cell::chat::history &h,
+                   bool persist_turn_config = true)
+                : cfg_(cfg), vault_(vault), h_(h), persist_turn_config_(persist_turn_config)
             {
                 auto tools_o = build_tools(false);
                 auto tools_a = build_tools(true);
@@ -20422,6 +20731,7 @@ namespace cell
             cell::config::settings &cfg_;
             cell::encrypt::crypt &vault_;
             cell::chat::history &h_;
+            bool persist_turn_config_ = true;
             std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> tool_list_;
             nlohmann::json tool_defs_openai_, tool_defs_anthropic_, tool_defs_responses_;
             cell::tools::runtime tool_rt_;
@@ -21046,15 +21356,18 @@ namespace cell
                     // multimodal blocks and elapsed time (both passes)
                     auto record = [&](size_t i, cell::tools::tool *t, cell::ToolOutput o, double sec)
                     {
+                        (void)t;
                         if (o.ok)
                         {
                             res[i].output = std::move(o.text);
                             res[i].status = "ok";
                         }
-                        else if (t && t->blocked())
+                        else if (o.blocked)
                         {
+                            // pass-1 tools run concurrently on one shared tool
+                            // instance: the verdict has to come from THIS result
                             res[i].blocked = true;
-                            res[i].rejected_for = t->rejected_for();
+                            res[i].rejected_for = (cell::tools::rejection_reason)o.reject_reason;
                             res[i].status = "blocked";
                             if (!o.text.empty())
                                 res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
@@ -21069,6 +21382,7 @@ namespace cell
                     // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
                     // run concurrently on the shared worker pool (max_threads); Deferred
                     // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
+                    auto allow_batch = std::make_shared<cell::sys::pool_batch>();
                     size_t allow_count = 0;
                     for (size_t i = 0; i < tool_calls.size(); i++)
                     {
@@ -21115,7 +21429,7 @@ namespace cell
                                 o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
                                 res[i].status = "exception";
                             }
-                            record(i, it->second.get(), std::move(o), cell::sys::elapsed_ms(t0) / 1000.0); });
+                            record(i, it->second.get(), std::move(o), cell::sys::elapsed_ms(t0) / 1000.0); }, allow_batch);
                         }
                         else
                         {
@@ -21124,7 +21438,7 @@ namespace cell
                         }
                     }
                     if (allow_count)
-                        cell::sys::pool().wait_all();
+                        allow_batch->wait();
                     // pass 2: Phase::Deferred tools (write/edit — no prompt) and
                     // confirm-required tools (exec) run sequentially, in order
                     for (size_t i = 0; i < tool_calls.size(); i++)
@@ -21337,8 +21651,14 @@ namespace cell
             }
             h_.now().unload();
             log.debug("sess", std::format("persisted id={} msgs={}", h_.now().id(), h_.now().msg().size()));
-            cfg_.session_id = h_.now().id();
-            cell::config::save(cfg_);
+            if (persist_turn_config_)
+            {
+                // CLI only (see the constructor): record the active session. The
+                // multi-workspace shell passes false and saves from its command
+                // thread instead.
+                cfg_.session_id = h_.now().id();
+                cell::config::save(cfg_);
+            }
             tv.natural_end = natural_end;
             tv.rounds = rounds;
             tv.tool_calls = turn_tool_calls;

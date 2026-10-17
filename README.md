@@ -411,7 +411,7 @@ schemas emitted for the active API style
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op; a `search` that ends with a newline the file does not have is retried without it (and the replacement drops its own trailing newline) |
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; follows a symlink only when it resolves inside the walk root; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines (overlapping context is printed once), file extension filtering, and count-only mode; 8M-line scan budget; exponential-backtracking shapes (`(a+)+`, `(a | b){3}`,`a{2}{3}`) and patterns over 200 chars are rejected |
-| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
+| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately and bounded at 16 MiB each (further output is drained and dropped, never buffered); the child gets a NUL stdin handle (a windowed shell has no console stdin); wide-character `CreateProcess` keeps non-ASCII paths intact; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata (a symlink is followed only when it resolves inside `path`; `name` is case-insensitive on Windows; a future `mtime` is never "recent"). When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Returns `path  size bytes  mtime (UTC)` per match |
 | `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `editable`, `edit_rules`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
 | `notice` | Allow | `operation` (send/list/drain/wait/clear), `session`, `from`, `topic`, `body`, `timeout`, `from_filter`, `topic_filter` | Cross-session message bus — see [Notices](#notices) |
@@ -737,7 +737,7 @@ the model as normal feedback.
 ### 5. Output hardening
 
 - **`sanitize_output`** (applied to `exec` results, and to `exec`-tagged results reloaded from disk):
-  truncates to a byte cap (default 128 KiB; the agent loop passes 512 MiB), then redacts
+  truncates to a byte cap (128 KiB; the agent loop uses that default for exec results), then redacts
   line-by-line against ~50 command-override
   fingerprints plus three regex families (verb + filler + `instructions|rules|system prompt|sandbox|
   safety`, `you are now …`, `no longer bound …`). Matching runs on a flattened form of each line:
@@ -749,7 +749,7 @@ the model as normal feedback.
   carries the tool name and a path/command marker, with the attributes sanitized and any occurrence
   of that closing tag inside the body escaped, so injected content cannot forge a nested "authorized"
   tool block or break out of the wrapper.
-- **`truncate_output`**: non-exec results get a size cap (512 MiB) without the injection scan.
+- **`truncate_output`**: non-exec results get a size cap (2 MiB default) without the injection scan. The spawned-command capture itself is bounded at 16 MiB before any of this, so a flooding command cannot exhaust memory.
 - **`display_safe`** (single-line, ANSI-stripped) for confirmation prompts and skill metadata;
   **`console_safe`** (multi-line, ANSI-stripped) for the cyan console echo of tool output, which is
   additionally capped at 16 KiB.
