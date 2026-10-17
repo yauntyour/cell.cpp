@@ -4894,6 +4894,18 @@ namespace cell
             for (const char *k : {"path", "dirpath"})
                 if (args.contains(k) && args[k].is_string() && !args[k].get_ref<const std::string &>().empty())
                     args[k] = abs(args[k].get<std::string>());
+            // ls / rg / find: an omitted path keeps the handlers' "." default,
+            // which std::filesystem resolves against the process cwd — the
+            // directory the application happened to be launched from, never
+            // the workspace. materialize the workspace so the default means
+            // the same thing an explicit relative path does
+            if (tool == "ls" || tool == "rg" || tool == "find")
+            {
+                auto path_it = args.find("path");
+                if (path_it == args.end() ||
+                    (path_it->is_string() && path_it->get_ref<const std::string &>().empty()))
+                    args["path"] = cwd.lexically_normal().string();
+            }
             // exec: an unspecified working directory means "the workspace"
             if (tool == "exec" &&
                 (!args.contains("wd") || !args["wd"].is_string() || args["wd"].get_ref<const std::string &>().empty()))
@@ -13758,7 +13770,11 @@ details{break-inside:avoid}
                         err = std::format("{} path '{}' is blocked by the sandbox", key, raw);
                         return false;
                     }
-                    editable.push_back(normalize_path(raw));
+                    // resolved against the engine's workspace, never the process
+                    // cwd: the child's own write path is resolved the same way
+                    // (guard_file_write / absolutize_path_args), and the lease
+                    // check compares the two strings
+                    editable.push_back(normalize_path((cell::exec_cwd() / std::filesystem::path(raw)).lexically_normal().string()));
                 }
                 break;
             }
@@ -18163,6 +18179,47 @@ static int run_selftest()
 #endif
             R.expect(run.ok && run.text.find("ctx_ws_a") != std::string::npos && run.text.find("exitcode=0") != std::string::npos,
                      "exec defaults to the context workspace directory");
+        }
+
+        // ls / rg / find: an omitted (or empty) path means the context's
+        // workspace, not the process cwd the application was launched from
+        {
+            std::ofstream probe(wa / "ctx_ws_probe.txt", std::ios::binary);
+            probe << "ctx_ws_probe_marker_5f2c\n";
+            probe.close();
+            cell::tools::runtime wrt;
+            wrt.cwd = wa;
+            wrt.box_ctx = &cta;
+            const std::string wa_s = wa.lexically_normal().string();
+            auto ls = wtools.at("ls")->execute(wrt, "{}");
+            R.expect(ls.ok && ls.text.rfind("path: " + wa_s, 0) == 0,
+                     "ls defaults its path to the context workspace");
+            auto ls_empty = wtools.at("ls")->execute(wrt, R"({"path":""})");
+            R.expect(ls_empty.ok && ls_empty.text.rfind("path: " + wa_s, 0) == 0,
+                     "ls treats an empty path like an omitted one");
+            auto rg = wtools.at("rg")->execute(wrt, R"({"pattern":"ctx_ws_probe_marker_5f2c"})");
+            R.expect(rg.ok && rg.text.find("=== ctx_ws_probe.txt ===") != std::string::npos &&
+                         rg.text.find("ctx_ws_a/") == std::string::npos,
+                     "rg defaults its path to the context workspace");
+            auto fd = wtools.at("find")->execute(wrt, R"({"pattern":"ctx_ws_probe*"})");
+            R.expect(fd.ok && fd.text.find("ctx_ws_probe.txt") != std::string::npos &&
+                         fd.text.find("ctx_ws_a/") == std::string::npos,
+                     "find defaults its path to the context workspace");
+        }
+
+        // tw file grants resolve against the engine workspace as well: the
+        // lease check compares them with the child's workspace-resolved writes
+        {
+            cell::exec_context_guard gctx(wa, &cta);
+            nlohmann::json grant;
+            grant["list"] = nlohmann::json::array({nlohmann::json{{"works", "x"},
+                                                                  {"editable", nlohmann::json::array({"story.md"})},
+                                                                  {"edit_rules", "append"}}});
+            nlohmann::json gj;
+            std::string gerr;
+            R.expect(cell::teamwork::normalize_job(grant, "tw-ctx-lease", 4, gj, gerr) &&
+                         gj["list"][0]["editable"][0] == cell::normalize_path((wa / "story.md").string()),
+                     "tw editable grants resolve against the context workspace");
         }
 
         // the read-only boundary follows each context's own workspace
