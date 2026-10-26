@@ -30,6 +30,7 @@
 #include <version>
 #include <format>
 #include <optional>
+#include <any>
 #include <concepts>
 #include <csignal>
 #include <generator>
@@ -6210,6 +6211,14 @@ namespace cell
             {
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CURL_WriteCallback);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, out_buf);
+                // 非流式调用也可能需要中途放弃（比如轮询线程要退出）：没有 on_token
+                // 时以前没人装进度回调，abort 只能等超时
+                if (on_xfer)
+                {
+                    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xfer);
+                    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, xfer_data);
+                }
             }
             header_list list(headers);
             if (list.get())
@@ -6996,6 +7005,10 @@ namespace cell
             std::string base;             // api base url
             std::string key_id;           // vault map key for the api key (optional)
             std::string proxy;            // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+            // 请求体透传：原样合并进请求体（核心不理解里面的键）。给本地推理服务的
+            // chat 模板变量、非标准采样参数之类留的通用口子 —— 核心不认识「本地服务」，
+            // 也就不必为每个服务端的怪癖改一次核心。只对 openai-chat 方言生效。
+            nlohmann::json extra_body = nlohmann::json::object();
 
             // derive api_style from legacy style field; called after construction when api_style is not set
             void normalize_api_style()
@@ -7069,6 +7082,8 @@ namespace cell
                     j["key"] = key_id;
                 if (!proxy.empty())
                     j["proxy"] = proxy;
+                if (!extra_body.empty())
+                    j["extra_body"] = extra_body;
                 return j;
             }
             static provider_entry from_json(const nlohmann::json &j)
@@ -7080,6 +7095,8 @@ namespace cell
                 e.base = json_str(j, "base", "");
                 e.key_id = json_str(j, "key", "");
                 e.proxy = json_str(j, "proxy", "");
+                if (j.contains("extra_body") && j["extra_body"].is_object())
+                    e.extra_body = j["extra_body"];
                 if (e.api_style.empty())
                     e.normalize_api_style();
                 return e;
@@ -7843,6 +7860,10 @@ namespace cell
         // a test can build one directly.
         struct runtime
         {
+            // 宿主私有上下文：核心从不读它，只负责原样交给宿主工具。工具可能跑在
+            // 工作池线程上，所以不能靠 thread_local 传 —— 每回合开始时由宿主放进去
+            // （std::any），宿主工具自己 any_cast 取回。核心不认识里面的任何语义。
+            std::any host_ctx;
             // returns empty string = allow; non-empty = deny reason (fail-closed
             // while unset); args: (tool_name, arguments_json)
             std::function<std::string(const std::string &, const std::string &)> autoallow_validator;
@@ -7880,6 +7901,32 @@ namespace cell
             std::function<std::string()> claim_owner;
             std::function<std::string()> claim_loop;
         };
+        // 宿主自定义工具：核心不认识、由前端自己实现的能力（舞台动作、设备控制、
+        // 自家的业务接口……）。宿主用 runner::set_host_tools() 注册一个提供者，
+        // build_tools 会把返回的每一条都当成普通工具挂进工具表 —— 名字、参数、
+        // schema、执行全在宿主那边，核心只负责把它发给模型、把调用转回来。
+        //
+        // 每次建工具表时调用一次（引擎构造时、以及宿主 mark_tools_dirty() 之后的
+        // 下一回合开头），所以可以按当前上下文生成不同的参数表 —— 比如舞台工具的
+        // enum 就是「这个模型此刻有哪些动作」。
+        struct host_tool
+        {
+            std::string name;
+            std::string description;
+            nlohmann::json properties = nlohmann::json::object(); // JSON Schema properties
+            std::vector<std::string> required;
+            Policy policy = Policy::Allow;
+            ToolKind kind = ToolKind::Notice;
+            Phase phase = Phase::Deferred;
+            // 执行端：拿到和内置工具一样的 runtime（宿主上下文 host_ctx、审批通道……）。
+            // 直接填 out：正文、多模态 blocks、失败原因都由宿主决定；返回 false 表示
+            // 没做成（out.text 原样回给模型）。
+            std::function<bool(const nlohmann::json &, const runtime &, cell::ToolOutput &)> run;
+        };
+        // 宿主工具提供者：每次重建工具表时调用一次，返回这一轮要挂的工具。
+        // 每个 runner 各自注册一个（不是一个进程一个）—— 多角色并发时互不干扰。
+        using host_tools_provider = std::function<std::vector<host_tool>()>;
+
         class tool
         {
         private:
@@ -8473,6 +8520,7 @@ namespace cell
         private:
             const std::string api_base;
             std::string proxy_;
+            nlohmann::json extra_body_ = nlohmann::json::object();
             CURL *curl = curl_easy_init();
 
             // Flatten our internal transcript into the subset that all
@@ -8606,7 +8654,11 @@ namespace cell
             }
 
         public:
-            static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream)
+            // 请求体透传：provider_entry.extra_body 原样合并进来（后写覆盖先写）。
+            // 本地推理服务的 chat 模板变量、非标准采样参数都走这条路 —— 核心不认识
+            // 它们，也就不必为每个服务端的怪癖改一次核心。
+            static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream,
+                                       const nlohmann::json &extra = nlohmann::json::object())
             {
                 nlohmann::json b;
                 b["model"] = model;
@@ -8616,6 +8668,9 @@ namespace cell
                 b["stream"] = stream;
                 if (stream)
                     b["stream_options"] = {{"include_usage", true}};
+                if (extra.is_object())
+                    for (auto &[k, v] : extra.items())
+                        b[k] = v;
                 return b;
             }
 
@@ -8627,6 +8682,7 @@ namespace cell
                     curl_easy_cleanup(curl);
             }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
+            void set_extra_body(nlohmann::json x) { extra_body_ = std::move(x); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
             {
@@ -8635,7 +8691,7 @@ namespace cell
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
                 std::vector<std::string> hdrs = bearer_headers(api_key);
-                if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false), buf, err, http_status))
+                if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false, extra_body_), buf, err, http_status))
                     return false;
                 try
                 {
@@ -8753,7 +8809,7 @@ namespace cell
                     sse_feed(sse_buf, sse_base, data, handle);
                 };
                 std::vector<std::string> hdrs = bearer_headers(api_key);
-                bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
+                bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true, extra_body_), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 if (text.empty() && reasoning.empty())
@@ -13345,7 +13401,8 @@ details{break-inside:avoid}
             // run on background threads and must never read the live config, which
             // the multi-workspace shell mutates from its command thread.
             std::shared_ptr<config::settings> owned_settings;
-            const std::unordered_map<std::string, std::shared_ptr<tools::tool>> *tool_list = nullptr;
+            // 工具表是只读快照：后台作业与下一回合的重建可以并存，旧快照不会被提前释放
+            std::shared_ptr<const std::unordered_map<std::string, std::shared_ptr<tools::tool>>> tool_list;
             const nlohmann::json *tool_defs_openai = nullptr;
             const nlohmann::json *tool_defs_anthropic = nullptr;
             const nlohmann::json *tool_defs_responses = nullptr;
@@ -16883,7 +16940,11 @@ static void print_help()
     cell::sys::println("    Enter submit   Ctrl+C save & exit   Ctrl+D on an empty line exits   Esc cancels a running stream");
 }
 
-static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false)
+// hosts: 宿主工具清单。nullptr = 这个引擎没有宿主工具（CLI / 测试的默认路径）；
+// runner 会先问一次它的 host_tools_provider 再传进来，同一份定义不用为三种
+// schema 方言各生成一遍。
+static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false,
+                                                                                                                    const std::vector<cell::tools::host_tool> *hosts = nullptr)
 {
     using cell::tools::Phase;
     using cell::tools::Policy;
@@ -17396,6 +17457,46 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     return out;
                 }
                 return cell::ToolOutput::fail("operation must be send, list, drain, wait, clear, or sessions"); });
+    }
+
+    // 宿主自定义工具：核心只做「挂上去 + 转调用」，不认识它们具体做什么。
+    if (hosts)
+    {
+        // 重名的宿主工具覆盖内置的（宿主比核心更清楚自己要什么）：执行表由 add 里的
+        // list[name] = ... 覆盖，定义表得自己剔除同名项 —— 否则同一个名字会发两份
+        // schema 给模型。
+        auto drop_def = [&](const std::string &name)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            for (auto &d : defs)
+            {
+                const nlohmann::json *fn = d.contains("function") ? &d["function"] : &d;
+                if (!fn->is_object() || fn->value("name", "") != name)
+                    out.push_back(d);
+            }
+            defs = std::move(out);
+        };
+        for (auto &t : *hosts)
+        {
+            if (t.name.empty() || !t.run)
+                continue;
+            drop_def(t.name);
+            add(t.name, t.description, t.properties, t.required, t.policy, t.kind,
+                [name = t.name, run = t.run](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
+                {
+                    cell::ToolOutput out;
+                    if (!run(j, rt, out))
+                    {
+                        if (out.text.empty())
+                            out.text = "[" + name + "] failed";
+                        out.ok = false;
+                    }
+                    else if (out.text.empty())
+                        out.text = "done";
+                    return out;
+                },
+                t.phase);
+        }
     }
     return {list, defs};
 }
@@ -21215,17 +21316,43 @@ namespace cell
             // rewriting shared config there races the command thread (and makes
             // each workspace save the whole file after every turn).
             runner(cell::config::settings &cfg, cell::encrypt::crypt &vault, cell::chat::history &h,
-                   bool persist_turn_config = true)
-                : cfg_(cfg), vault_(vault), h_(h), persist_turn_config_(persist_turn_config)
+                   bool persist_turn_config = true,
+                   cell::tools::host_tools_provider host_tools = {})
+                : cfg_(cfg), vault_(vault), h_(h), persist_turn_config_(persist_turn_config),
+                  host_tools_(std::move(host_tools))
             {
-                auto tools_o = build_tools(false);
-                auto tools_a = build_tools(true);
-                auto tools_r = build_tools(false, true); // Responses API format
-                tool_list_ = std::move(tools_o.first);
+                rebuild_tools();
+                install_runtime();
+            }
+
+            // 宿主工具可以整体换掉（比如前端切换能力集）：换完下一回合开头重建工具表。
+            void set_host_tools(cell::tools::host_tools_provider p)
+            {
+                host_tools_ = std::move(p);
+                mark_tools_dirty();
+            }
+
+            // 工具表是可以重建的：act 的参数表跟着当前模型的动作组 / 表情名走，
+            // 宿主换模型或模型报回新清单时调 mark_tools_dirty()，下一回合开头
+            // 在 turn 线程上重建一次（换的是 shared_ptr 快照，不原地改 map，后台作业
+            // 手里的旧表仍然有效）。
+            void mark_tools_dirty() { tools_dirty_.store(true, std::memory_order_release); }
+
+            void rebuild_tools()
+            {
+                // 宿主工具只问一次：三种 schema 方言共用同一份定义，提供者带副作用
+                // 也只触发一次。
+                const std::vector<cell::tools::host_tool> hosts =
+                    host_tools_ ? host_tools_() : std::vector<cell::tools::host_tool>{};
+                auto tools_o = build_tools(false, false, &hosts);
+                auto tools_a = build_tools(true, false, &hosts);
+                auto tools_r = build_tools(false, true, &hosts); // Responses API format
+                // 换指针而不是原地清空：teamwork 的后台作业可能拿着上一版工具表还在跑，
+                // 它手里的 shared_ptr 让旧快照活到作业结束。
+                tool_list_ = std::make_shared<const std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>>(std::move(tools_o.first));
                 tool_defs_openai_ = std::move(tools_o.second);
                 tool_defs_anthropic_ = std::move(tools_a.second);
                 tool_defs_responses_ = std::move(tools_r.second);
-                install_runtime();
             }
 
             cell::tools::runtime &tools_rt() { return tool_rt_; }
@@ -21355,6 +21482,7 @@ namespace cell
                 const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_openai_ : no_tools);
                 auto &client = cache_.o(p.base);
                 client.set_proxy(p.proxy);
+                client.set_extra_body(p.extra_body);
                 if (stream)
                     return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
                 return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
@@ -21408,10 +21536,14 @@ namespace cell
             cell::encrypt::crypt &vault_;
             cell::chat::history &h_;
             bool persist_turn_config_ = true;
-            std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> tool_list_;
+            // 工具表按快照换：teamwork 的后台作业拿的是 shared_ptr，重建不会踩到旧读者
+            std::shared_ptr<const std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>> tool_list_;
+            cell::tools::host_tools_provider host_tools_;
             nlohmann::json tool_defs_openai_, tool_defs_anthropic_, tool_defs_responses_;
             cell::tools::runtime tool_rt_;
             cell::teamwork::runtime_context team_rt_;
+            // act 的动作表变了（换模型 / 模型报回新清单）：下一回合开头重建工具定义
+            std::atomic<bool> tools_dirty_{false};
             std::atomic<long long> llm_requests_{0};
             std::atomic<long long> tool_calls_{0};
             // the events of the turn currently running (approval + cancellation
@@ -21493,7 +21625,7 @@ namespace cell
             // reused across all rounds: no shared curl handle between children and
             // no per-round client churn.
             team_rt_.settings = &cfg_;
-            team_rt_.tool_list = &tool_list_;
+            team_rt_.tool_list = tool_list_;
             team_rt_.tool_defs_openai = &tool_defs_openai_;
             team_rt_.tool_defs_anthropic = &tool_defs_anthropic_;
             team_rt_.tool_defs_responses = &tool_defs_responses_;
@@ -21531,6 +21663,7 @@ namespace cell
                 }
                 auto client = std::make_shared<cell::llm::OpenAI>(base);
                 client->set_proxy(proxy);
+                client->set_extra_body(p.extra_body);
                 return [client, secret, no_tools](const std::string &model, int,
                                                   const nlohmann::json &msgs, const nlohmann::json *tools,
                                                   nlohmann::json &reply, nlohmann::json &tc,
@@ -21785,6 +21918,10 @@ namespace cell
             // tool call, teamwork child and box-cache access below inherits the
             // workspace of this engine (no-op for the CLI's ambient context)
             cell::exec_context_guard ctx_guard(h_.explicit_cwd(), h_.box_context());
+            // 工具表脏了就在这里重建：重建换的是 shared_ptr 快照，tw 的后台作业
+            // （run_job_bg）即使还在自己的线程上跑，手里那份旧表也不会被释放。
+            if (tools_dirty_.exchange(false, std::memory_order_acq_rel))
+                rebuild_tools();
             // cross-session edit claims taken by this turn release when the
             // agent loop ends, whatever its exit path (natural end, cancel,
             // error): a claim can never outlive its agent
@@ -22092,8 +22229,8 @@ namespace cell
                         res[i].policy = "?";
                         res[i].status = "failed";
                         res[i].output = "[tool failed]";
-                        auto it = tool_list_.find(res[i].name);
-                        if (it == tool_list_.end())
+                        auto it = tool_list_->find(res[i].name);
+                        if (it == tool_list_->end())
                         {
                             res[i].output = std::format("[unknown tool: {}]", res[i].name);
                             res[i].status = "unknown";
@@ -22148,8 +22285,8 @@ namespace cell
                         if (res[i].policy != "defer" && res[i].policy != "ask")
                             continue;
                         auto t0 = cell::sys::detail::clock::now();
-                        auto it = tool_list_.find(res[i].name);
-                        cell::tools::tool *t = it != tool_list_.end() ? it->second.get() : nullptr;
+                        auto it = tool_list_->find(res[i].name);
+                        cell::tools::tool *t = it != tool_list_->end() ? it->second.get() : nullptr;
                         cell::ToolOutput o;
                         try
                         {
