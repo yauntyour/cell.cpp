@@ -2216,6 +2216,11 @@ namespace cell
     {
         std::filesystem::path cwd;         // workspace directory; empty = process cwd
         std::string cwd_norm;              // normalized sandbox boundary; empty = workdir_norm()
+        // sessions directory for this engine; empty = root/"sessions". The
+        // desktop shell gives every character its own sessions tree
+        // (characters/<role>/sessions), so sessions of different characters
+        // never share a folder even though the process root is shared.
+        std::filesystem::path sessions_root;
         box::context *box_state = nullptr; // null = the process-wide default
     };
     inline exec_context &default_exec_context()
@@ -2234,19 +2239,22 @@ namespace cell
         return c ? *c : default_exec_context();
     }
     // Scoped installation for a turn / a tool call; restores the previous
-    // context on exit (nested calls included). An empty cwd plus a null box
-    // state leaves the ambient context untouched, which is the CLI's behaviour.
+    // context on exit (nested calls included). Empty cwd, null box state and an
+    // empty sessions root leave the ambient context untouched, which is the
+    // CLI's behaviour.
     struct exec_context_guard
     {
         exec_context ctx;
         exec_context *prev = nullptr;
         bool active = false;
-        explicit exec_context_guard(const std::filesystem::path &cwd, box::context *bs)
+        explicit exec_context_guard(const std::filesystem::path &cwd, box::context *bs,
+                                    const std::filesystem::path &sessions_root = {})
         {
-            if (cwd.empty() && !bs)
+            if (cwd.empty() && !bs && sessions_root.empty())
                 return;
             ctx.cwd = cwd;
             ctx.cwd_norm = cwd.empty() ? std::string() : normalize_path(cwd.string());
+            ctx.sessions_root = sessions_root;
             ctx.box_state = bs;
             prev = tls_exec_context();
             tls_exec_context() = &ctx;
@@ -2276,6 +2284,15 @@ namespace cell
     {
         const exec_context &c = current_exec_context();
         return c.cwd.empty() ? cwd_id() : cwd_id_of(c.cwd);
+    }
+    // The sessions tree of the calling thread's context. The CLI keeps using
+    // root/"sessions"; a multi-character frontend installs one tree per
+    // character, so two characters opening sessions at the same time never
+    // write into the same folder (session ids stay cwd-keyed inside it).
+    static std::filesystem::path sessions_root()
+    {
+        const exec_context &c = current_exec_context();
+        return c.sessions_root.empty() ? root / "sessions" : c.sessions_root;
     }
     // =========================================================================
     //  claims — cross-session file-edit claims ("first come, first served")
@@ -2404,7 +2421,7 @@ namespace cell
     // archives (saved/). session_file is the transcript path.
     static std::filesystem::path session_dir(const std::string &session_id)
     {
-        return root / "sessions" / session_prefix(session_id) / session_id;
+        return sessions_root() / session_prefix(session_id) / session_id;
     }
     static std::filesystem::path session_file(const std::string &session_id)
     {
@@ -2459,7 +2476,7 @@ namespace cell
     }
     static std::filesystem::path sessions_index_path()
     {
-        return root / "sessions" / "sessions.json";
+        return sessions_root() / "sessions.json";
     }
     static std::optional<nlohmann::json> &index_cache()
     {
@@ -2479,11 +2496,14 @@ namespace cell
         static std::recursive_mutex mx;
         return mx;
     }
-    // Cached sessions index; invalidated by root changes.
+    // Cached sessions index; invalidated by root changes. The identity is the
+    // resolved sessions tree, not cell::root: the desktop shell runs one tree
+    // per character, and their indexes must never be served from one cache.
     static const nlohmann::json &sessions_index()
     {
         std::lock_guard<std::recursive_mutex> lk(index_mx());
-        if (index_cache() && index_cache_root() == root)
+        const std::filesystem::path sr = sessions_root();
+        if (index_cache() && index_cache_root() == sr)
             return *index_cache();
         nlohmann::json j = nlohmann::json::object();
         std::ifstream f(sessions_index_path());
@@ -2500,7 +2520,7 @@ namespace cell
             }
         }
         index_cache() = std::move(j);
-        index_cache_root() = root;
+        index_cache_root() = sr;
         return *index_cache();
     }
     static std::string cwd_for_key(const std::string &key)
@@ -2518,7 +2538,7 @@ namespace cell
             return;
         std::lock_guard<std::recursive_mutex> lk(index_mx());
         std::error_code ec;
-        std::filesystem::create_directories(root / "sessions", ec);
+        std::filesystem::create_directories(sessions_root(), ec);
         // Ensure cache is loaded
         sessions_index();
         if (index_cache())
@@ -2531,7 +2551,7 @@ namespace cell
         if (!index_cache())
             index_cache() = nlohmann::json::object();
         (*index_cache())[key] = path;
-        index_cache_root() = root;
+        index_cache_root() = sessions_root();
         async_io::submit(sessions_index_path(), index_cache()->dump(2));
     }
     // forget_cwd — drop a workspace key from the sessions index (workspace
@@ -2543,7 +2563,7 @@ namespace cell
         if (key.empty())
             return;
         std::lock_guard<std::recursive_mutex> lk(index_mx());
-        sessions_index(); // ensure the cache is loaded for the current root
+        sessions_index(); // ensure the cache is loaded for the current sessions tree
         if (!index_cache() || !index_cache()->contains(key))
             return;
         index_cache()->erase(key);
@@ -3385,6 +3405,10 @@ namespace cell
         //   ReadOnly   - only read-only tools (read, rg, find, ls) allowed
         //   EditOnly   - read-only tools plus write and edit allowed
         //   FullAccess - all tools allowed (default)
+        // On top of the mode, host-protected roots (set_protected_write_roots)
+        // are readable but never writable: check_path() is the read gate,
+        // check_write_path() the write gate, and check_exec() refuses commands
+        // that name the tree at all.
         enum class SandboxMode : int
         {
             ReadOnly = 0,
@@ -3455,13 +3479,96 @@ namespace cell
             return call.find("..") != std::string_view::npos;
         }
 
+        // ---- host-protected roots (read-only to the agent) -------------------
+        // The desktop shell owns a data tree the agent may *read* (its role
+        // card, memories, sessions) but must never write with file tools: the
+        // host tool "settings" is the only writer. Paths are injected by the
+        // host at startup (set_protected_write_roots); the core keeps no
+        // app-specific knowledge. Everything under cell::root is already
+        // sensitive, so the only new thing is the read exemption below.
+        static std::mutex &protected_mx()
+        {
+            static std::mutex m;
+            return m;
+        }
+        static std::vector<std::filesystem::path> &protected_roots_raw()
+        {
+            static std::vector<std::filesystem::path> v;
+            return v;
+        }
+        static std::vector<std::string> &protected_roots_norm()
+        {
+            static std::vector<std::string> v;
+            return v;
+        }
+        void set_protected_write_roots(std::vector<std::filesystem::path> roots)
+        {
+            std::lock_guard<std::mutex> lk(protected_mx());
+            protected_roots_raw() = std::move(roots);
+            protected_roots_norm().clear();
+            for (auto &p : protected_roots_raw())
+            {
+                std::string n = cell::normalize_path(p.string());
+                while (n.size() > 1 && n.back() == '/')
+                    n.pop_back();
+                if (!n.empty())
+                    protected_roots_norm().push_back(std::move(n));
+            }
+        }
+        // copy: the host writes this once at startup, readers run on workers
+        std::vector<std::filesystem::path> protected_write_roots()
+        {
+            std::lock_guard<std::mutex> lk(protected_mx());
+            return protected_roots_raw();
+        }
+        // /a/proj_evil must not count as being inside /a/proj
+        static bool normalized_under(const std::string &path, const std::string &base)
+        {
+            if (base.empty() || path.size() < base.size())
+                return false;
+            if (path.compare(0, base.size(), base) != 0)
+                return false;
+            return path.size() == base.size() || path[base.size()] == '/';
+        }
+        bool is_protected_path(std::string_view path)
+        {
+            const std::string n = cell::normalize_path(path);
+            if (n.empty())
+                return false;
+            std::lock_guard<std::mutex> lk(protected_mx());
+            for (auto &base : protected_roots_norm())
+                if (normalized_under(n, base))
+                    return true;
+            return false;
+        }
+        // an exec command that keeps a path literal to the protected tree (or
+        // to the runtime root, from where it could cd into it) is refused. Like
+        // every other exec rule this is a path check, not command parsing.
+        static bool exec_references_protected_path(std::string_view lower_cmd)
+        {
+            std::string cmd(lower_cmd);
+            for (char &c : cmd)
+                if (c == '\\')
+                    c = '/';
+            {
+                std::lock_guard<std::mutex> lk(protected_mx());
+                for (auto &base : protected_roots_norm())
+                    if (!base.empty() && cmd.find(base) != std::string::npos)
+                        return true;
+            }
+            const std::string rt = cell::normalize_path(cell::root.string());
+            return !rt.empty() && cmd.find(rt) != std::string::npos;
+        }
+
         // check path-only tools (grep, read, exist): reject path traversal and
-        // sensitive-path access (credential vault, key files)
+        // sensitive-path access (credential vault, key files). A host-protected
+        // root is exempt from the sensitive rule: the agent may read its own
+        // character data, it just cannot write it (see check_write_path).
         bool check_path(std::string_view call)
         {
             if (has_path_traversal(call))
                 return false;
-            if (is_sensitive_path(call))
+            if (is_sensitive_path(call) && !is_protected_path(call))
                 return false;
             if (has_reserved_device_or_ads(call))
                 return false; // device name / alternate data stream (Windows)
@@ -3472,10 +3579,28 @@ namespace cell
                 return false;
             return true;
         }
+        // check write/edit targets: the read gate plus "never inside a protected
+        // root". Kept separate from check_path so the read exemption above can
+        // never turn into a write permission.
+        bool check_write_path(std::string_view call)
+        {
+            if (has_path_traversal(call))
+                return false;
+            if (is_sensitive_path(call))
+                return false;
+            if (is_protected_path(call))
+                return false;
+            if (has_reserved_device_or_ads(call))
+                return false;
+            if (has_windows_trailing_dot_or_space(call))
+                return false;
+            return true;
+        }
 
         static std::vector<std::string> tokens(std::string_view s);
 
-        // check command/write tools (exec, write, remove, mkdir, edit): path restrictions only
+        // check command/write tools without an explicit path (exec fallback,
+        // composite tools): path restrictions only
         bool check(std::string_view call)
         {
             if (has_path_traversal(call))
@@ -3483,6 +3608,8 @@ namespace cell
             // Check if the command references sensitive paths
             std::string lower = to_lower(call);
             if (is_sensitive_path(lower))
+                return false;
+            if (is_protected_path(call))
                 return false;
             if (has_windows_trailing_dot_or_space(call))
                 return false; // Windows strips the dot/space: ".cell." -> ".cell"
@@ -3529,6 +3656,11 @@ namespace cell
             // Check if the command references sensitive paths
             std::string lower = to_lower(call);
             if (exec_references_sensitive_path(lower))
+                return false;
+            // Host-protected roots are read-only to the agent: exec cannot name
+            // them (it could not tell a read from a write), while the read tool
+            // still can.
+            if (exec_references_protected_path(lower))
                 return false;
             // In read-only mode, exec is blocked entirely
             if (sandbox_mode() == SandboxMode::ReadOnly)
@@ -5434,9 +5566,9 @@ namespace cell
         // create a NEW file only: refuses overwrites and missing parent directories
         bool write_new(std::string_view path, std::string_view input, std::string &output)
         {
-            if (!check_path(path))
+            if (!check_write_path(path))
             {
-                output = "write refused: path is blocked by the sandbox (path traversal or sensitive file).";
+                output = "write refused: path is blocked by the sandbox (path traversal, sensitive file, or a read-only character folder).";
                 return false;
             }
             if (exist(path))
@@ -5506,9 +5638,9 @@ namespace cell
             std::string content_buf(content);
             // only the path field is sandbox-checked: search_buf/content_buf carry code
             // text that may legally contain ">", "|" or ".."
-            if (!check_path(path))
+            if (!check_write_path(path))
             {
-                output = "edit refused: path is blocked by the sandbox (path traversal or sensitive file).";
+                output = "edit refused: path is blocked by the sandbox (path traversal, sensitive file, or a read-only character folder).";
                 return false;
             }
             std::string file_key = read_log_key(path);
@@ -7894,6 +8026,10 @@ namespace cell
             // process working directory (the CLI's single-workspace behaviour).
             std::filesystem::path cwd;
             cell::box::context *box_ctx = nullptr;
+            // the sessions tree this runtime's tools live in (notice / teamwork
+            // stores sit inside a session folder). Empty = root/"sessions"; the
+            // desktop shell sets characters/<role>/sessions per engine.
+            std::filesystem::path sessions_root;
             // Cross-session edit claims (see cell::claims): the session that
             // owns this call's edits (conflict scope) and the loop instance
             // token that releases them when it ends. Unset callbacks = claims
@@ -8079,7 +8215,7 @@ namespace cell
                         std::string wd_val;
                         if (parsed_ok && parsed.is_object() && parsed.contains("wd") && parsed["wd"].is_string())
                             wd_val = parsed["wd"].get<std::string>();
-                        if (!wd_val.empty() && !box::check_path(wd_val))
+                        if (!wd_val.empty() && !box::check_write_path(wd_val))
                         {
                             output = deny(rejection_reason::sandbox,
                                           std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val),
@@ -8112,15 +8248,22 @@ namespace cell
                     else
                     {
                         // write/edit carry code content that may legally contain
-                        // ">", "|" or ".." — only the path field is sandbox-checked
+                        // ">", "|" or ".." — only the path field is sandbox-checked.
+                        // A write target goes through the write gate (protected
+                        // roots are read-only to the agent), everything else
+                        // through the read gate.
                         std::string path_val;
                         if (parsed_ok && parsed.is_object() && parsed.contains("path") && parsed["path"].is_string())
                             path_val = parsed["path"].get<std::string>();
-                        bool blocked = path_val.empty() ? !box::check(input) : !box::check_path(path_val);
+                        const bool write_kind = tool_kind() == ToolKind::Write;
+                        bool blocked = path_val.empty()
+                                           ? !box::check(input)
+                                           : (write_kind ? !box::check_write_path(path_val)
+                                                         : !box::check_path(path_val));
                         if (blocked)
                         {
                             output = deny(rejection_reason::sandbox,
-                                          std::format("[{}] path blocked by sandbox (traversal or sensitive file)", name()),
+                                          std::format("[{}] path blocked by sandbox (traversal, sensitive file, or read-only character folder)", name()),
                                           std::format("sandbox args={}", input));
                             return false;
                         }
@@ -8129,20 +8272,26 @@ namespace cell
                 else if (policy() == Policy::Allow)
                 {
                     // read-only tools take a "path" (or "dirpath") argument; check only the
-                    // path field for traversal so regex patterns containing ".." are not rejected
+                    // path field for traversal so regex patterns containing ".." are not rejected.
+                    // Write tools (write/edit) go through the write gate instead: a
+                    // protected root (the character data folder) may be read but
+                    // never written by the agent.
+                    const bool write_kind = tool_kind() == ToolKind::Write;
+                    auto gate = [write_kind](const std::string &p)
+                    { return write_kind ? box::check_write_path(p) : box::check_path(p); };
                     bool blocked = false;
                     if (parsed_ok && parsed.is_object())
                     {
                         for (const char *key : {"path", "dirpath"})
                         {
-                            if (parsed.contains(key) && parsed[key].is_string() && !box::check_path(parsed[key].get<std::string>()))
+                            if (parsed.contains(key) && parsed[key].is_string() && !gate(parsed[key].get<std::string>()))
                             {
                                 blocked = true;
                                 break;
                             }
                         }
                     }
-                    else if (!box::check_path(input))
+                    else if (!gate(input))
                         blocked = true;
                     if (blocked)
                     {
@@ -8169,7 +8318,7 @@ namespace cell
                 // install this runtime's execution context for the whole call:
                 // the sandbox gates, the handler and the box caches below must
                 // all see one workspace (no-op for the CLI's ambient context)
-                cell::exec_context_guard ctx_guard(rt.cwd, rt.box_ctx);
+                cell::exec_context_guard ctx_guard(rt.cwd, rt.box_ctx, rt.sessions_root);
                 // parse the input JSON once and reuse across all sandbox checks
                 nlohmann::json parsed = nlohmann::json::parse(input, nullptr, false);
                 // resolve relative path arguments against the engine's workspace
@@ -11528,7 +11677,8 @@ details{break-inside:avoid}
             std::string session_id;
             std::string cwd;                                   // working directory this session belongs to
             nlohmann::json messages = nlohmann::json::array(); // [{"role":"user","content":"hi"},...]
-            std::filesystem::path dir;                         // <root>/sessions/<cwd-key>/<id>/
+            std::filesystem::path dir;                         // <sessions-root>/<cwd-key>/<id>/
+            std::filesystem::path sessions_root_;              // the tree this folder lives in
             std::filesystem::path file;                        // dir / "messages.jsonl"
             std::filesystem::path interrupt_file;              // dir / "interrupt.json"
             std::string interrupt_reason;                      // non-empty while the last turn is interrupted
@@ -11574,7 +11724,8 @@ details{break-inside:avoid}
             // no index entry yet: the process cwd for the CLI, the context's
             // workspace for a multi-workspace engine.
             session(const std::string &id, const std::filesystem::path &fallback_cwd)
-                : session_id(id), dir(cell::session_dir(session_id)), file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json")
+                : session_id(id), dir(cell::session_dir(session_id)), sessions_root_(cell::sessions_root()),
+                  file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json")
             {
                 // a session folder may live under another cwd's group: the index
                 // maps the id prefix (the cwd key) back to the real directory
@@ -11669,6 +11820,10 @@ details{break-inside:avoid}
             }
             void unload()
             {
+                // this runs on the command thread too (session.new / shutdown),
+                // where no engine context is installed: re-install the tree this
+                // session was opened from before touching the sessions index
+                cell::exec_context_guard root_guard(std::filesystem::path{}, nullptr, sessions_root_);
                 std::error_code ec;
                 std::filesystem::create_directories(dir, ec);
                 // serialize on this thread, hand the bytes to the background writer;
@@ -11737,7 +11892,7 @@ details{break-inside:avoid}
         static std::string latest_session_id_for_cwd(const std::string &cwd_key = cell::cwd_id())
         {
             std::error_code ec;
-            std::filesystem::path dir = root / "sessions" / cwd_key;
+            std::filesystem::path dir = sessions_root() / cwd_key;
             if (!std::filesystem::is_directory(dir, ec))
                 return "";
 
@@ -12127,21 +12282,43 @@ details{break-inside:avoid}
             // fixed workspace for multi-workspace engines; unset = the process
             // cwd is the workspace (the CLI's single-workspace behaviour)
             std::optional<std::filesystem::path> cwd_;
+            // fixed sessions tree for engines that do not use root/"sessions"
+            // (the desktop shell gives every character its own tree)
+            std::optional<std::filesystem::path> sessions_root_;
             cell::box::context *box_ctx_ = nullptr;
+
+            // every filesystem lookup below (session_dir / load / unload /
+            // remove) must see this history's sessions tree
+            struct sessions_guard
+            {
+                std::optional<cell::exec_context_guard> g;
+                explicit sessions_guard(const std::optional<std::filesystem::path> &sr)
+                {
+                    if (sr)
+                        g.emplace(std::filesystem::path{}, nullptr, *sr);
+                }
+            };
 
         public:
             history() = default;
-            explicit history(const std::filesystem::path &cwd) : cwd_(cwd) {}
+            explicit history(const std::filesystem::path &cwd,
+                             const std::filesystem::path &sessions_root = {})
+                : cwd_(cwd), sessions_root_(sessions_root.empty()
+                                                ? std::nullopt
+                                                : std::optional<std::filesystem::path>(sessions_root)) {}
             // the workspace this history belongs to (process cwd when unset)
             std::filesystem::path cwd() const { return cwd_ ? *cwd_ : workdir(); }
             std::string cwd_key() const { return cwd_ ? cell::cwd_id_of(*cwd_) : cwd_id(); }
             // the explicit workspace, when one was set (empty = process cwd)
             std::filesystem::path explicit_cwd() const { return cwd_ ? *cwd_ : std::filesystem::path{}; }
+            // the explicit sessions tree, when one was set (empty = root/"sessions")
+            std::filesystem::path sessions_root() const { return sessions_root_ ? *sessions_root_ : std::filesystem::path{}; }
             // per-context box state, when the frontend installed one
             cell::box::context *box_context() { return box_ctx_; }
             void set_box_context(cell::box::context *c) { box_ctx_ = c; }
             session &now()
             {
+                sessions_guard guard(sessions_root_);
                 auto it = session_list.find(current);
                 if (it == session_list.end())
                 {
@@ -12172,6 +12349,7 @@ details{break-inside:avoid}
             }
             void remove(const std::string &session_id)
             {
+                sessions_guard guard(sessions_root_);
                 for (auto it = session_list.begin(); it != session_list.end(); ++it)
                 {
                     if (it->second.id() != session_id)
@@ -13004,7 +13182,7 @@ details{break-inside:avoid}
         {
             std::vector<session_info> out;
             std::error_code ec;
-            std::filesystem::path base = root / "sessions";
+            std::filesystem::path base = sessions_root();
             if (!std::filesystem::is_directory(base, ec))
                 return out;
             for (auto &g : std::filesystem::directory_iterator(base, ec))
@@ -13121,7 +13299,7 @@ details{break-inside:avoid}
             std::vector<std::string> ids;
             {
                 std::error_code ec;
-                std::filesystem::path base = root / "sessions";
+                std::filesystem::path base = sessions_root();
                 for (auto &g : std::filesystem::directory_iterator(base, ec))
                 {
                     if (ec)
@@ -13164,7 +13342,7 @@ details{break-inside:avoid}
             auto newest_in_group = [&](const std::string &key) -> std::string
             {
                 std::error_code ec;
-                if (!std::filesystem::is_directory(root / "sessions" / key, ec))
+                if (!std::filesystem::is_directory(sessions_root() / key, ec))
                     return "";
                 return chat::latest_session_id_for_cwd(key);
             };
@@ -13662,7 +13840,7 @@ details{break-inside:avoid}
         {
             std::vector<std::filesystem::path> out;
             std::error_code ec;
-            std::filesystem::path sessions = root / "sessions";
+            std::filesystem::path sessions = cell::sessions_root();
             auto scan_group = [&](const std::filesystem::path &group)
             {
                 if (!std::filesystem::is_directory(group, ec))
@@ -13822,7 +14000,7 @@ details{break-inside:avoid}
                         return false;
                     }
                     const std::string raw = p.get<std::string>();
-                    if (!box::check_path(raw))
+                    if (!box::check_write_path(raw))
                     {
                         err = std::format("{} path '{}' is blocked by the sandbox", key, raw);
                         return false;
@@ -15844,7 +16022,7 @@ details{break-inside:avoid}
                     raw_path = (cell::exec_cwd() / raw_path).lexically_normal().string();
                 // no path, or one the sandbox blocks: let the tool report it —
                 // the lease never records a path the sandbox would refuse anyway
-                if (raw_path.empty() || !box::check_path(raw_path))
+                if (raw_path.empty() || !box::check_write_path(raw_path))
                     return true;
                 const std::string path = normalize_path(raw_path);
                 std::error_code ec;
@@ -16096,7 +16274,8 @@ details{break-inside:avoid}
             // file lease, the box caches and path resolution follow the job's
             // workspace (no-op for the CLI's ambient context)
             cell::exec_context_guard ctx_guard(rt.tools_rt ? rt.tools_rt->cwd : std::filesystem::path{},
-                                               rt.tools_rt ? rt.tools_rt->box_ctx : nullptr);
+                                               rt.tools_rt ? rt.tools_rt->box_ctx : nullptr,
+                                               rt.tools_rt ? rt.tools_rt->sessions_root : std::filesystem::path{});
             worker_report r = run_worker_impl(job, worker, worker_index, rt, job_store);
             post_progress(job, r.name, "worker",
                           std::format("worker {} finished status={} ({} rounds, {} tool calls): {}",
@@ -16555,7 +16734,8 @@ details{break-inside:avoid}
                 // resolution, session lookup and box state must follow the
                 // job's workspace, not the ambient thread state
                 cell::exec_context_guard ctx_guard(job.rt.tools_rt ? job.rt.tools_rt->cwd : std::filesystem::path{},
-                                                   job.rt.tools_rt ? job.rt.tools_rt->box_ctx : nullptr);
+                                                   job.rt.tools_rt ? job.rt.tools_rt->box_ctx : nullptr,
+                                                   job.rt.tools_rt ? job.rt.tools_rt->sessions_root : std::filesystem::path{});
                 try
                 {
                     status = run_workflow_body(job.job_id, job.store, job.snapshot, job.rt,
@@ -17627,6 +17807,42 @@ static int run_selftest()
         R.expect(!cell::box::check_exec(std::format("type {}", (cell::root / "config.json").string())), "exec blocks config read");
         cell::box::sandbox_mode() = saved;
     }
+
+    // host-protected roots: the agent may read a character's own data tree but
+    // never write it, and exec cannot even name it (the host tool writes it).
+    {
+        const std::filesystem::path chars = cell::root / "characters";
+        cell::box::set_protected_write_roots({chars});
+        R.expect(cell::box::is_protected_path((chars / "xier" / "Agent.md").string()),
+                 "protected root detected");
+        R.expect(cell::box::check_path((chars / "xier" / "Agent.md").string()),
+                 "protected root is readable");
+        R.expect(!cell::box::check_path((chars / ".." / ".key").string()),
+                 "traversal out of a protected root is still blocked");
+        R.expect(!cell::box::check_write_path((chars / "xier" / "Agent.md").string()),
+                 "protected root is not writable");
+        R.expect(!cell::box::check((chars / "xier" / "Agent.md").string()),
+                 "protected path refused by the write fallback");
+        R.expect(cell::box::check_write_path("workspace/notes.md"),
+                 "normal workspace file stays writable");
+        const std::string abs_card =
+            std::filesystem::absolute(chars / "xier" / "Agent.md").lexically_normal().string();
+        R.expect(!cell::box::check_exec("cat " + abs_card),
+                 "exec cannot name a protected root");
+        cell::box::set_protected_write_roots({});
+        R.expect(!cell::box::is_protected_path((chars / "xier" / "Agent.md").string()),
+                 "protected roots can be cleared");
+    }
+    // per-engine sessions tree: session folders follow the installed context
+    {
+        const std::filesystem::path custom = cell::root / "char-sessions";
+        cell::exec_context_guard g(std::filesystem::path{}, nullptr, custom);
+        R.expect(cell::session_dir("abcd-1") == custom / "abcd" / "abcd-1",
+                 "session_dir follows the context sessions root");
+        R.expect(cell::sessions_root() == custom, "sessions_root reports the context tree");
+    }
+    R.expect(cell::sessions_root() == cell::root / "sessions",
+             "ambient sessions root is root/sessions again");
 
     // exec sandbox hardening: simplified to path-only checks (encoded payloads now allowed)
     {
@@ -21557,6 +21773,7 @@ namespace cell
             // empty for the CLI (tools then resolve against the process cwd)
             tool_rt_.cwd = h_.explicit_cwd();
             tool_rt_.box_ctx = h_.box_context();
+            tool_rt_.sessions_root = h_.sessions_root();
             // cross-session edit claims: this engine's edits belong to its
             // current session, and the running turn's loop releases them when
             // the turn ends (see run_turn's claim guard)
@@ -21917,7 +22134,7 @@ namespace cell
             // install the engine's execution context for the whole turn: every
             // tool call, teamwork child and box-cache access below inherits the
             // workspace of this engine (no-op for the CLI's ambient context)
-            cell::exec_context_guard ctx_guard(h_.explicit_cwd(), h_.box_context());
+            cell::exec_context_guard ctx_guard(h_.explicit_cwd(), h_.box_context(), h_.sessions_root());
             // 工具表脏了就在这里重建：重建换的是 shared_ptr 快照，tw 的后台作业
             // （run_job_bg）即使还在自己的线程上跑，手里那份旧表也不会被释放。
             if (tools_dirty_.exchange(false, std::memory_order_acq_rel))
@@ -23878,7 +24095,7 @@ int repl::run()
                  };
                  std::vector<s_entry> entries;
                  std::error_code ec;
-                 std::filesystem::path dir = cell::root / "sessions";
+                 std::filesystem::path dir = cell::sessions_root();
                  const nlohmann::json &index = cell::sessions_index();
                  if (std::filesystem::exists(dir, ec))
                  {
