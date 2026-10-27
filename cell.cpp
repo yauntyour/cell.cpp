@@ -3070,6 +3070,8 @@ namespace cell
                 ".wv",
                 ".mid",
                 ".midi",
+                ".amr",
+                ".silk",
             };
             if (audio_exts.count(ext))
                 return FileType::Audio;
@@ -3144,6 +3146,8 @@ namespace cell
                 {".aiff", "audio/aiff"},
                 {".mid", "audio/midi"},
                 {".midi", "audio/midi"},
+                {".amr", "audio/amr"},
+                {".silk", "audio/silk"},
                 {".mp4", "video/mp4"},
                 {".avi", "video/x-msvideo"},
                 {".mkv", "video/x-matroska"},
@@ -3183,6 +3187,14 @@ namespace cell
             };
             auto it = formats.find(media_type);
             return it != formats.end() ? it->second : "mp3";
+        }
+
+        // 聊天软件的语音容器（AMR / Silk）不在 provider 的 input_audio 格式表里：
+        // get_audio_format() 没有对应项，会把它们硬说成 "mp3"。read 因此只回
+        // 元数据 + 转写提示，不构造音频块。
+        static bool audio_is_metadata_only(std::string_view media_type)
+        {
+            return media_type == "audio/amr" || media_type == "audio/silk";
         }
 
         // =====================================================================
@@ -5424,6 +5436,15 @@ namespace cell
                 // metadata only: no content reached the model, so nothing is
                 // recorded as read (recording it would satisfy read-before-edit
                 // for a file the model has never actually seen)
+                return true;
+            }
+            // IM 语音（QQ / OneBot 的 .amr / .silk）同样只回元数据：provider 的
+            // input_audio 只认 get_audio_format() 里那几种格式，塞一个音频块只会
+            // 把格式猜成 mp3；而消息里通常已经带了「语音转写」。所以不读 base64、
+            // 不记 read，只给元数据加一句提示。
+            if (file_type == FileType::Audio && audio_is_metadata_only(media_type))
+            {
+                result.text += "\n（AMR / Silk 是聊天软件里的语音格式，不能直接作为多模态音频读取；如果消息里已经有「语音转写」，以转写文字为准。）";
                 return true;
             }
             // Encode to base64
@@ -17178,7 +17199,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                          std::max<size_t>(1, std::min<size_t>(num_arg(j, "page_size", 500), 500)), out.text);
             return out;
         });
-    add("read", "Read a file and return its contents. Text files return line-numbered content. Binary files (images, audio, video, documents) return base64-encoded content for LLM multimodal processing. Use offset (0-based line offset) and limit (max lines) for text files.",
+    add("read", "Read a file and return its contents. Text files return line-numbered content. Images and audio return multimodal content when the provider supports the format; video, documents and chat voice formats (AMR / Silk) return metadata only, so do not read a voice file that was already transcribed. Use offset (0-based line offset) and limit (max lines) for text files.",
         {{"path", str_prop("file path")},
          {"offset", num_prop("number of lines to skip from the start (0-based, optional)")},
          {"limit", num_prop("maximum number of lines to read (optional, reads to end if omitted)")}},
@@ -18265,6 +18286,8 @@ static int run_selftest()
         R.expect(cell::box::detect_file_type("test.jpg") == cell::box::FileType::Image, "detect_file_type .jpg -> Image");
         R.expect(cell::box::detect_file_type("test.mp3") == cell::box::FileType::Audio, "detect_file_type .mp3 -> Audio");
         R.expect(cell::box::detect_file_type("test.wav") == cell::box::FileType::Audio, "detect_file_type .wav -> Audio");
+        R.expect(cell::box::detect_file_type("test.amr") == cell::box::FileType::Audio, "detect_file_type .amr -> Audio");
+        R.expect(cell::box::detect_file_type("test.silk") == cell::box::FileType::Audio, "detect_file_type .silk -> Audio");
         R.expect(cell::box::detect_file_type("test.mp4") == cell::box::FileType::Video, "detect_file_type .mp4 -> Video");
         R.expect(cell::box::detect_file_type("test.pdf") == cell::box::FileType::Document, "detect_file_type .pdf -> Document");
         R.expect(cell::box::detect_file_type("test.bin") == cell::box::FileType::Binary, "detect_file_type .bin -> Binary");
@@ -18274,6 +18297,8 @@ static int run_selftest()
         R.expect(cell::box::get_media_type("test.jpg") == "image/jpeg", "get_media_type .jpg -> image/jpeg");
         R.expect(cell::box::get_media_type("test.mp3") == "audio/mpeg", "get_media_type .mp3 -> audio/mpeg");
         R.expect(cell::box::get_media_type("test.wav") == "audio/wav", "get_media_type .wav -> audio/wav");
+        R.expect(cell::box::get_media_type("test.amr") == "audio/amr", "get_media_type .amr -> audio/amr");
+        R.expect(cell::box::get_media_type("test.silk") == "audio/silk", "get_media_type .silk -> audio/silk");
         R.expect(cell::box::get_media_type("test.mp4") == "video/mp4", "get_media_type .mp4 -> video/mp4");
         R.expect(cell::box::get_media_type("test.pdf") == "application/pdf", "get_media_type .pdf -> application/pdf");
         R.expect(cell::box::get_media_type("test.xyz") == "application/octet-stream", "get_media_type unknown -> application/octet-stream");
@@ -18358,6 +18383,24 @@ static int run_selftest()
         R.expect(audio_result.blocks.size() == 1, "read_multimodal produces 1 audio block");
         R.expect(audio_result.blocks[0].type == cell::ContentBlock::Type::InputAudio, "audio block type is InputAudio");
 
+        // IM 语音（QQ / OneBot 的 .amr / .silk）只回元数据：不带音频块、不读 base64，
+        // 并且提示以消息里的「语音转写」为准 —— 否则模型会去啃 NUL 字节的音频。
+        std::vector<uint8_t> amr = {'#', '!', 'A', 'M', 'R', '\n', 0x00, 0x00, 0x00};
+        R.expect(write_bin("test.amr", amr), "multimodal fixture: write test.amr");
+        cell::ToolOutput amr_result;
+        R.expect(cell::box::read_multimodal("test.amr", amr_result, 0, 0, true, &mm_err), "read_multimodal test.amr succeeds");
+        R.expect(amr_result.text.find("Type: Audio") != std::string::npos, "read_multimodal reports Type: Audio for .amr");
+        R.expect(amr_result.text.find("Media-Type: audio/amr") != std::string::npos, "read_multimodal reports Media-Type: audio/amr");
+        R.expect(amr_result.text.find("语音转写") != std::string::npos, "read_multimodal .amr points at 语音转写");
+        R.expect(amr_result.blocks.empty(), "read_multimodal .amr returns no multimodal blocks");
+        std::vector<uint8_t> silk = {0x02, 0x23, 0x21, 0x53, 0x49, 0x4C, 0x4B, 0x00, 0x00};
+        R.expect(write_bin("test.silk", silk), "multimodal fixture: write test.silk");
+        cell::ToolOutput silk_result;
+        R.expect(cell::box::read_multimodal("test.silk", silk_result, 0, 0, true, &mm_err), "read_multimodal test.silk succeeds");
+        R.expect(silk_result.text.find("Type: Audio") != std::string::npos, "read_multimodal reports Type: Audio for .silk");
+        R.expect(silk_result.text.find("Media-Type: audio/silk") != std::string::npos, "read_multimodal reports Media-Type: audio/silk");
+        R.expect(silk_result.blocks.empty(), "read_multimodal .silk returns no multimodal blocks");
+
         // Video returns metadata only (no base64)
         std::vector<uint8_t> fake_video = {0, 0, 0, 0x1C, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 1, 'i', 's', 'o', 'm'};
         R.expect(write_bin("test.mp4", fake_video), "multimodal fixture: write test.mp4");
@@ -18388,6 +18431,8 @@ static int run_selftest()
         R.expect(cell::box::remove("test.wav"), "multimodal cleanup test.wav");
         R.expect(cell::box::remove("test.mp4"), "multimodal cleanup test.mp4");
         R.expect(cell::box::remove("test.pdf"), "multimodal cleanup test.pdf");
+        R.expect(cell::box::remove("test.amr"), "multimodal cleanup test.amr");
+        R.expect(cell::box::remove("test.silk"), "multimodal cleanup test.silk");
     }
 
     R.expect(!cell::box::write_new("box_test.txt", "x", out) && out.find("already exists") != std::string::npos, "write_new refuses overwrite");
