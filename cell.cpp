@@ -8634,6 +8634,98 @@ namespace cell
             return true;
         }
 
+        // Content parts a text-only model cannot take. The engine stores media
+        // in three shapes — Chat Completions (`image_url` / `input_audio`),
+        // Anthropic (`image` / `audio`, also nested in a `tool_result`) and
+        // Responses (`input_image`, also nested in `function_call_output`) — so
+        // the check goes by part type, not by transport.
+        static bool is_media_part(const nlohmann::json &part)
+        {
+            if (!part.is_object())
+                return false;
+            const std::string t = part.value("type", "");
+            return t == "image_url" || t == "input_image" || t == "image" ||
+                   t == "input_audio" || t == "audio";
+        }
+        // "image"/"audio", for the note the part is replaced with
+        static const char *media_part_kind(const nlohmann::json &part)
+        {
+            const std::string t = part.value("type", "");
+            return (t == "input_audio" || t == "audio") ? "audio" : "image";
+        }
+        // Replaces every media part under a content/output array with a text
+        // note, recursing into tool_result blocks and function_call_output items.
+        // Returns true when at least one part was replaced.
+        static bool strip_media_in(nlohmann::json &node)
+        {
+            if (node.is_array())
+            {
+                bool changed = false;
+                for (auto &part : node)
+                {
+                    if (is_media_part(part))
+                    {
+                        const std::string kind = media_part_kind(part);
+                        part = {{"type", "text"},
+                                {"text", std::format("[{} omitted: the current model does not accept {} input]", kind, kind)}};
+                        changed = true;
+                    }
+                    else if (strip_media_in(part))
+                        changed = true;
+                }
+                return changed;
+            }
+            if (!node.is_object())
+                return false;
+            bool changed = false;
+            for (const char *key : {"content", "output"})
+            {
+                auto it = node.find(key);
+                if (it != node.end() && it->is_array() && strip_media_in(*it))
+                    changed = true;
+            }
+            return changed;
+        }
+        // Transcript-level counterpart: drop image/audio parts from every
+        // message. Called after a provider rejected multimodal input so the
+        // turn can go on with the text the model CAN read instead of dying on
+        // a 400 that the frontend shows as a bare "interrupted" line.
+        static bool strip_media_parts(nlohmann::json &msgs)
+        {
+            if (!msgs.is_array())
+                return false;
+            bool changed = false;
+            for (auto &m : msgs)
+                if (strip_media_in(m))
+                    changed = true;
+            return changed;
+        }
+        // Does this client error say the endpoint/model refused image or audio
+        // input? Providers word it very differently ("unknown variant
+        // `image_url`", "this model does not support image input", "invalid
+        // content type", a 413 for a base64-heavy body, ...) — a text-only
+        // OpenAI-compatible model is the common case. Matching stays narrow:
+        // the message must mention media AND a rejection/limit word, so an
+        // ordinary bad request never triggers a media retry.
+        static bool is_multimodal_rejection(const std::string &err)
+        {
+            std::string s = err;
+            lower_ascii(s);
+            const bool media = s.find("image") != std::string::npos || s.find("vision") != std::string::npos ||
+                               s.find("audio") != std::string::npos || s.find("multimodal") != std::string::npos ||
+                               s.find("multi-modal") != std::string::npos;
+            if (!media)
+                return false;
+            static const char *const reject[] = {"not support", "unsupported", "does not accept",
+                                                 "invalid", "unknown", "unexpected", "unrecognized",
+                                                 "too large", "too big", "exceeds", "payload",
+                                                 "content type", "content_type", "deserialize", "413"};
+            for (const char *r : reject)
+                if (s.find(r) != std::string::npos)
+                    return true;
+            return false;
+        }
+
         // -------- API clients --------
         // The post-flight epilogue every streaming client shares: wipe the auth
         // headers, publish the status code, then turn an HTTP-level or
@@ -20828,6 +20920,44 @@ static int run_selftest()
                  "openai chat moves tool images to a follow-up user message");
     }
 
+    // a text-only model refuses image/audio parts. The turn recovers by
+    // replacing them with a text note instead of aborting with a hidden error
+    // (see the multimodal branch in runner::run_turn).
+    {
+        nlohmann::json nested_tool = nlohmann::json::array({
+            {{"type", "text"}, {"text", "a"}},
+            {{"type", "image"}, {"source", {{"type", "base64"}, {"media_type", "image/png"}, {"data", "AA=="}}}},
+        });
+        nlohmann::json with_media = nlohmann::json::array();
+        with_media.push_back({{"role", "user"},
+                              {"content", nlohmann::json::array({{{"type", "text"}, {"text", "look"}},
+                                                                  {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
+        with_media.push_back({{"role", "tool"},
+                              {"tool_call_id", "t1"},
+                              {"content", nlohmann::json::array({{{"type", "text"}, {"text", "shot:"}},
+                                                                  {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
+        with_media.push_back({{"role", "user"},
+                              {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "t2"}, {"content", nested_tool}}})}});
+        with_media.push_back({{"type", "function_call_output"},
+                              {"call_id", "t3"},
+                              {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", "b"}},
+                                                                 {{"type", "input_image"}, {"image_url", "data:image/png;base64,AA=="}}})}});
+        with_media.push_back({{"role", "assistant"}, {"content", "kept"}});
+        R.expect(cell::llm::strip_media_parts(with_media), "media stripping reports a change");
+        const std::string flat = with_media.dump();
+        R.expect(flat.find("image_url") == std::string::npos && flat.find("\"image\"") == std::string::npos &&
+                     flat.find("input_image") == std::string::npos && flat.find("base64") == std::string::npos,
+                 "media stripping removes every image part, including nested tool results");
+        R.expect(flat.find("[image omitted") != std::string::npos && with_media[4]["content"] == "kept",
+                 "media stripping leaves a text note and touches no text");
+        nlohmann::json text_only = nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}});
+        R.expect(!cell::llm::strip_media_parts(text_only), "media stripping is a no-op without media");
+        R.expect(cell::llm::is_multimodal_rejection("HTTP error 400: unknown variant `image_url`, expected `text`") &&
+                     cell::llm::is_multimodal_rejection("this model does not support image input") &&
+                     !cell::llm::is_multimodal_rejection("HTTP error 400: invalid model name"),
+                 "only multimodal rejections trigger the media retry");
+    }
+
     // log rotation: trim_log keeps only the tail of an over-cap log file
     {
         auto logpath = cell::root / "logs" / "trim_test.log";
@@ -22788,6 +22918,10 @@ namespace cell
             int rounds = 0;
             long long turn_tool_calls = 0;
             long long turn_thinking_entries = 0;
+            // set once a round failed because the provider rejected image/audio
+            // parts: the transcript then holds text notes instead of the media,
+            // so every later round of this turn goes through
+            bool media_dropped = false;
             // Safety valve: a model that keeps calling tools would otherwise loop
             // (and bill) without bound. Teamwork children are capped at 8 rounds;
             // the main loop legitimately needs far more, so this sits well above it.
@@ -22992,6 +23126,34 @@ namespace cell
                         if (ev.on_round_end)
                             ev.on_round_end(rv);
                         break;
+                    }
+                    // The provider rejected the request because it carried
+                    // image/audio parts (a text-only model such as deepseek-chat
+                    // refuses `image_url` with a 400; a gateway may answer 413
+                    // for a base64-heavy body). That is still a 4xx, but the turn
+                    // does not have to die: the media is a read tool's output, so
+                    // replace every image/audio part with a text note and retry
+                    // the same round once. Without this, "read the screenshot,
+                    // then continue" killed the whole session with an error the
+                    // frontend hides after reloading the transcript.
+                    if (!ok && !media_dropped && cell::llm::is_multimodal_rejection(err) &&
+                        cell::llm::strip_media_parts(h_.now().msg()))
+                    {
+                        media_dropped = true;
+                        // persist the text note: the base64 belongs to a model
+                        // that cannot use it, and keeping it would fail every
+                        // later round (and after a restart) the same way
+                        h_.now().note_rewrite();
+                        h_.now().unload();
+                        cell::async_io::flush();
+                        log.warn("llm", std::format("multimodal_rejected model={} round={} err={} -> omitted media, retrying",
+                                                    cfg_.model_label(), rounds, err.empty() ? "n/a" : err));
+                        if (ev.on_status)
+                            ev.on_status("[multimodal] the model cannot accept image/audio input - omitted them and retried");
+                        if (ev.on_attempt_reset)
+                            ev.on_attempt_reset();
+                        reset_stream_state();
+                        continue; // same round, without the media parts
                     }
                     // request failed: retry only transient failures. 4xx other than
                     // 408/409/425/429 is deterministic (bad request, model or base,
