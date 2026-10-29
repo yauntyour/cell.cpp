@@ -20931,17 +20931,17 @@ static int run_selftest()
         nlohmann::json with_media = nlohmann::json::array();
         with_media.push_back({{"role", "user"},
                               {"content", nlohmann::json::array({{{"type", "text"}, {"text", "look"}},
-                                                                  {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
+                                                                 {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
         with_media.push_back({{"role", "tool"},
                               {"tool_call_id", "t1"},
                               {"content", nlohmann::json::array({{{"type", "text"}, {"text", "shot:"}},
-                                                                  {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
+                                                                 {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}}})}});
         with_media.push_back({{"role", "user"},
                               {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "t2"}, {"content", nested_tool}}})}});
         with_media.push_back({{"type", "function_call_output"},
                               {"call_id", "t3"},
                               {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", "b"}},
-                                                                 {{"type", "input_image"}, {"image_url", "data:image/png;base64,AA=="}}})}});
+                                                                {{"type", "input_image"}, {"image_url", "data:image/png;base64,AA=="}}})}});
         with_media.push_back({{"role", "assistant"}, {"content", "kept"}});
         R.expect(cell::llm::strip_media_parts(with_media), "media stripping reports a change");
         const std::string flat = with_media.dump();
@@ -22788,14 +22788,14 @@ namespace cell
             cell::chat::extract_parts(rest, conv_text, think_text);
             std::string summary_model;
             std::string conv_summary = summarize_part(
-                "Summarize the conversation content as the memory, preserving key decisions, facts, file paths and unfinished tasks. Output only the memory.",
+                "Summarize the conversation and output only a summary list that includes key decisions, important facts, relevant file paths, and outstanding tasks.",
                 conv_text, "conversation", "Context Summary", ev, &summary_model);
             if (conv_summary.empty())
                 return "compaction aborted: summarization failed, context left unchanged";
             std::string think_summary;
             if (!think_text.empty())
                 think_summary = summarize_part(
-                    "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
+                    "Based on the agent's reasoning process, output only a step-by-step thought process that includes key insights, important decisions, valid evidence, and conclusions reached.",
                     think_text, "reasoning", "Thinking Summary", ev, &summary_model);
             // a chat template also needs at least one real turn left: replacing the
             // whole conversation with system messages alone is rejected ("No user
