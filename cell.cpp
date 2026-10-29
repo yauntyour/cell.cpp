@@ -515,8 +515,12 @@ namespace cell
         // POSIX uses a single-threaded poll loop (no reader threads to join, no
         // 20 ms busy-wait); Windows keeps two readers but terminates the job
         // before joining them.
+        // cancel: polled every ~50 ms while waiting for the child. A true return
+        // kills the child's whole process tree and reports exit_code=130, so a
+        // stop request bites in the middle of a long command instead of waiting
+        // for it (or for its timeout) to finish. Empty = never cancelled.
         inline bool spawn_cmd(const std::string &cmd, double timeout_s, std::string &output, int &exit_code, std::string &stderr_output,
-                              const std::filesystem::path &cwd = {})
+                              const std::filesystem::path &cwd = {}, const std::function<bool()> &cancel = {})
         {
             // the child inherits our stdout: anything still buffered must go out
             // first, or the child's output can overtake ours on screen
@@ -644,8 +648,41 @@ namespace cell
                 while (ReadFile(hread_err, tmp, sizeof(tmp), &n, nullptr) && n > 0)
                     append_capped(stderr_output, tmp, (size_t)n, stderr_capped); });
             DWORD wait_ms = timeout_s > 0 ? (DWORD)(timeout_s * 1000.0) : INFINITE;
-            DWORD wr = WaitForSingleObject(pi.hProcess, wait_ms);
-            bool timed_out = wr == WAIT_TIMEOUT;
+            // Wait in short slices only when someone can actually cancel: the
+            // uncancellable path keeps the single exact wait (no added wakeups).
+            bool timed_out = false, cancelled = false;
+            if (!cancel)
+            {
+                timed_out = WaitForSingleObject(pi.hProcess, wait_ms) == WAIT_TIMEOUT;
+            }
+            else
+            {
+                auto wait_start = std::chrono::steady_clock::now();
+                for (;;)
+                {
+                    DWORD slice = 50;
+                    if (wait_ms != INFINITE)
+                    {
+                        double spent_ms = std::chrono::duration<double, std::milli>(
+                                              std::chrono::steady_clock::now() - wait_start)
+                                              .count();
+                        double left_ms = (double)wait_ms - spent_ms;
+                        if (left_ms <= 0)
+                        {
+                            timed_out = true;
+                            break;
+                        }
+                        slice = (DWORD)std::min<double>(left_ms, 50.0);
+                    }
+                    if (WaitForSingleObject(pi.hProcess, slice) != WAIT_TIMEOUT)
+                        break; // the child exited on its own
+                    if (cancel())
+                    {
+                        cancelled = true;
+                        break;
+                    }
+                }
+            }
             DWORD code = 0;
             GetExitCodeProcess(pi.hProcess, &code); // STILL_ACTIVE when it timed out
             // tear the job tree down before joining the readers: a grandchild that
@@ -653,11 +690,11 @@ namespace cell
             // seeing EOF (and would previously hang the join forever)
             if (job_ok)
                 TerminateJobObject(hjob, 1);
-            else if (timed_out)
+            else if (timed_out || cancelled)
                 TerminateProcess(pi.hProcess, 1);
             // Without a job object a surviving grandchild can hold the pipe
             // write ends open forever: cancel the blocking reads after the kill
-            if (!job_ok && timed_out)
+            if (!job_ok && (timed_out || cancelled))
             {
                 CancelSynchronousIo((HANDLE)reader_out.native_handle());
                 CancelSynchronousIo((HANDLE)reader_err.native_handle());
@@ -677,6 +714,11 @@ namespace cell
             {
                 output += std::format("\n[tool timed out after {}s, process tree killed]", (long long)timeout_s);
                 exit_code = 124;
+            }
+            else if (cancelled)
+            {
+                output += "\n[tool cancelled by the user, process tree killed]";
+                exit_code = 130;
             }
             return true;
 #else
@@ -768,7 +810,7 @@ namespace cell
                 }
             };
             bool out_capped = false, err_capped = false;
-            bool eof_out = false, eof_err = false, timed_out = false, reaped = false;
+            bool eof_out = false, eof_err = false, timed_out = false, reaped = false, cancelled = false;
             int status = 0;
             auto start = std::chrono::steady_clock::now();
             for (;;)
@@ -782,6 +824,11 @@ namespace cell
                     reaped = true;
                     break;
                 }
+                if (cancel && cancel())
+                {
+                    cancelled = true;
+                    break;
+                }
                 int wait_ms = -1;
                 if (timeout_s > 0)
                 {
@@ -793,6 +840,10 @@ namespace cell
                     }
                     wait_ms = (int)std::max(1.0, (timeout_s - elapsed) * 1000.0);
                 }
+                // a canceller needs a wakeup at least every 50 ms, or a quiet
+                // child (no output) would hide the stop request behind the poll
+                if (cancel && (wait_ms < 0 || wait_ms > 50))
+                    wait_ms = 50;
                 struct pollfd pfd[2];
                 nfds_t nfds = 0;
                 if (!eof_out)
@@ -812,6 +863,13 @@ namespace cell
                 waitpid(pid, &status, 0);
                 output += std::format("\n[tool timed out after {}s, process tree killed]", (long long)timeout_s);
                 exit_code = 124;
+            }
+            else if (cancelled)
+            {
+                kill_tree();
+                waitpid(pid, &status, 0);
+                output += "\n[tool cancelled by the user, process tree killed]";
+                exit_code = 130;
             }
             else
             {
@@ -5056,7 +5114,8 @@ namespace cell
                 (!args.contains("wd") || !args["wd"].is_string() || args["wd"].get_ref<const std::string &>().empty()))
                 args["wd"] = cwd.lexically_normal().string();
         }
-        bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code, std::string_view wd = "")
+        bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code, std::string_view wd = "",
+                  const std::function<bool()> &cancel = {})
         {
             if (!check(cmd))
             {
@@ -5079,7 +5138,7 @@ namespace cell
                     run_dir = wd_s;
             }
             std::string stderr_output;
-            bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code, stderr_output, run_dir);
+            bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code, stderr_output, run_dir, cancel);
             // spawn_cmd only fails to LAUNCH the process (pipe / CreateProcess /
             // fork error): a command that ran and exited non-zero is ok=true with
             // its real exit code. surface a reason, or the result degrades to a
@@ -8119,6 +8178,10 @@ namespace cell
             // disabled (tests, direct box use); an empty returned owner = same.
             std::function<std::string()> claim_owner;
             std::function<std::string()> claim_loop;
+            // 回合取消（用户点了停止）：长工具在自己的等待循环里轮询它，
+            // 返回 true 就该立刻放手（exec 会杀掉整棵进程树）。
+            // 未设置 = 不可取消（单元测试、宿主自建 runtime）。
+            std::function<bool()> cancelled;
         };
         // 宿主自定义工具：核心不认识、由前端自己实现的能力（舞台动作、设备控制、
         // 自家的业务接口……）。宿主用 runner::set_host_tools() 注册一个提供者，
@@ -17820,14 +17883,14 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
          {"timeout", num_prop("timeout in seconds, default 30, max 300")},
          {"wd", str_prop("working directory for the command (optional, defaults to cwd)")}},
         {"cmd"}, Policy::Ask, ToolKind::Exec,
-        [](const nlohmann::json &j, const cell::tools::runtime &) -> cell::ToolOutput
+        [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
         {
             double timeout = dbl_arg(j, "timeout", 30.0);
             if (!(timeout > 0) || timeout > 300)
                 timeout = 30.0;
             int exit_code = 1;
             cell::ToolOutput out;
-            out.ok = cell::box::exec(j.value("cmd", ""), timeout, out.text, exit_code, j.value("wd", ""));
+            out.ok = cell::box::exec(j.value("cmd", ""), timeout, out.text, exit_code, j.value("wd", ""), rt.cancelled);
             out.text += std::format("exitcode={}", exit_code);
             return out;
         });
@@ -22474,6 +22537,22 @@ namespace cell
                 return answer;
             }
 
+            // 本回合是否已被取消（工具段专用）。Esc 是一次性按键：peek 到就被
+            // 消费掉，再问 ev.cancelled() 只会得到 false —— 所以第一次读到 true
+            // 就在这里粘住，剩余的排队工具与 exec 等待循环都能看到同一个结论。
+            bool cancel_requested()
+            {
+                if (cancel_latched_.load(std::memory_order_acquire))
+                    return true;
+                const events *ev = current_events_.load(std::memory_order_acquire);
+                if (ev && ev->cancelled && ev->cancelled())
+                {
+                    cancel_latched_.store(true, std::memory_order_release);
+                    return true;
+                }
+                return false;
+            }
+
             // install the approval / safety channels + teamwork machinery on the
             // the runner-owned tool runtime (approval / safety channels, the
             // live session, the teamwork machinery)
@@ -22505,6 +22584,8 @@ namespace cell
             // the events of the turn currently running (approval + cancellation
             // channels read it from worker threads; one turn at a time)
             std::atomic<const events *> current_events_{nullptr};
+            // cleared at the start of every turn, set by cancel_requested()
+            std::atomic<bool> cancel_latched_{false};
         };
 
         void runner::install_runtime()
@@ -22521,6 +22602,10 @@ namespace cell
             { return h_.now().id(); };
             tool_rt_.claim_loop = [this]() -> std::string
             { return "session " + h_.now().id(); };
+            // 取消通道：长工具（exec）在等待循环里轮询它，停止请求才能立刻生效。
+            // 走 cancel_requested() 而不是直接问 ev：Esc 被消费后仍要粘住
+            tool_rt_.cancelled = [this]() -> bool
+            { return cancel_requested(); };
             tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action) -> std::string
             { return autoallow_check(tool, action); };
             tool_rt_.approval_required = [](const std::string &tool, const std::string &operation) -> bool
@@ -22884,6 +22969,8 @@ namespace cell
                 std::atomic<const events *> &slot;
                 ~slot_guard() { slot.store(nullptr, std::memory_order_release); }
             } guard{current_events_};
+            // 新回合：把上一回合粘住的取消状态清掉
+            cancel_latched_.store(false, std::memory_order_release);
             // install the engine's execution context for the whole turn: every
             // tool call, teamwork child and box-cache access below inherits the
             // workspace of this engine (no-op for the CLI's ambient context)
@@ -23316,6 +23403,15 @@ namespace cell
                         // already marked it rejected, pass 2 must not run it
                         if (res[i].policy != "defer" && res[i].policy != "ask")
                             continue;
+                        if (cancel_requested())
+                        {
+                            // 停止/ Esc 已命中：不再执行任何后续工具（exec 在这里
+                            // 根本不会起进程；已经在跑的由它自己的等待循环收尾）
+                            cell::ToolOutput o = cell::ToolOutput::fail("[cancelled: the user stopped this turn before the tool ran]");
+                            record(i, nullptr, std::move(o), 0.0);
+                            res[i].status = "cancelled";
+                            continue;
+                        }
                         auto t0 = cell::sys::detail::clock::now();
                         auto it = tool_list_->find(res[i].name);
                         cell::tools::tool *t = it != tool_list_->end() ? it->second.get() : nullptr;
@@ -23462,6 +23558,20 @@ namespace cell
                                 h_.now().msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
                             }
                         }
+                    }
+                    // 停止请求命中工具段（exec 被当场杀掉，或剩余工具被标成
+                    // cancelled）：结果已经全部写回，转录仍然合法，但这一回合
+                    // 到此为止 —— 不要再向模型追问下一轮
+                    if (cancel_requested())
+                    {
+                        log.warn("tool", "cancelled while running tools; ending the turn");
+                        if (ev.on_error)
+                            ev.on_error("[cancelled]");
+                        if (ev.on_status)
+                            ev.on_status("[interrupted] tool calls stopped; the turn ended here");
+                        done = true;
+                        natural_end = false;
+                        continue;
                     }
                     // sandbox security refusals are normal feedback; only approval
                     // refusals end the run (user decline only, autoallow reject
