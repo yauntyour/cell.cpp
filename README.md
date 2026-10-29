@@ -936,12 +936,27 @@ blocked/rejected, the user cancels, or an error occurs. Each round logs `round=`
 counts, cache hit rate, total time and time-to-first-token. After every user turn the session and
 config are persisted.
 
-**Failures and retries.** A failed LLM request is retried up to 5 attempts per round with a 5-second
-delay between attempts (`[retrying in 5s... attempt N/5]`); exhausting them ends the turn with
-`[llm error after 5 attempts]` and records an interrupted turn (see
-[Interruptions](#interruptions-and-reload)). If the failure is a context-overflow error, the round is
-compacted once and retried immediately instead of burning a retry attempt (see
-[automatic compaction](#slash-commands)).
+**Failures and retries.** A failed LLM request is retried up to 5 attempts per round with an
+exponential backoff of 5 s, 10 s, 20 s and then 30 s between attempts
+(`[retrying in 5s... attempt N/5]`); exhausting them ends the turn with `[llm error after 5 attempts]`
+and records an interrupted turn (see [Interruptions](#interruptions-and-reload)). Only *transient*
+failures are retried — a 5xx, a throttling reply (408/409/425/429), a transport abort (reset, timeout,
+TLS drop) or a stream that ended without delivering an answer; a deterministic 4xx (bad request,
+unknown model, invalid key) fails at once instead of burning four backoff waits. If the failure is a
+context-overflow error, the round is compacted once and retried immediately instead of burning a retry
+attempt (see [automatic compaction](#slash-commands)).
+
+**A dropped connection is never mistaken for an answer.** Every streaming request is checked for a
+*terminal* marker: the `[DONE]` sentinel or a chunk carrying `finish_reason` for Chat Completions, and
+`response.completed` (or `.incomplete`) for the Responses API. A 200 that delivers no event at all, or
+that stops mid-answer without one of those markers, is treated as a truncated transfer and retried —
+the partial text is discarded from the screen (see `on_attempt_reset` below) and only the last attempt
+is kept. Two related cases are handled the same way: a gateway that ignores `"stream": true` and
+answers with a single plain completion body is parsed and echoed instead of being dropped, and an OpenAI
+`refusal` delta is surfaced as the answer rather than silently producing an empty turn. Idle
+connections are kept alive (`TCP_KEEPALIVE`) and a dead peer is detected by a low-speed watchdog
+(~4 min without a byte) instead of a total-transfer timeout that used to kill healthy long streams at
+300 s.
 
 ## Streaming UI and keyboard control
 
