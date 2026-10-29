@@ -2214,8 +2214,8 @@ namespace cell
     }
     struct exec_context
     {
-        std::filesystem::path cwd;         // workspace directory; empty = process cwd
-        std::string cwd_norm;              // normalized sandbox boundary; empty = workdir_norm()
+        std::filesystem::path cwd; // workspace directory; empty = process cwd
+        std::string cwd_norm;      // normalized sandbox boundary; empty = workdir_norm()
         // sessions directory for this engine; empty = root/"sessions". The
         // desktop shell gives every character its own sessions tree
         // (characters/<role>/sessions), so sessions of different characters
@@ -2558,7 +2558,7 @@ namespace cell
     // deleted; cwd_for_key() must stop resolving it). Goes through the same
     // cache as remember_cwd(). No-op when the key is absent, so this never
     // creates the file.
-    static void forget_cwd(const std::string &key)
+    [[maybe_unused]] static void forget_cwd(const std::string &key)
     {
         if (key.empty())
             return;
@@ -12461,7 +12461,7 @@ details{break-inside:avoid}
                     --b;
                 while (e < text.size() && (text[e] == '\n' || text[e] == ' '))
                     ++e;
-                std::string left = text.substr(0, b);   // sealed seams are re-joined
+                std::string left = text.substr(0, b); // sealed seams are re-joined
                 std::string right = text.substr(e);
                 text = std::move(left);
                 if (!text.empty() && !right.empty())
@@ -16597,8 +16597,8 @@ details{break-inside:avoid}
                         ++attempt;
                         const int delay_ms = 1000 * (1 << (attempt - 1)); // 1s, 2s
                         cell::sys::logger::instance().warn("teamwork",
-                            std::format("worker_request_failed worker={} attempt={}/{} err={} -> retrying in {}ms",
-                                        result.name, attempt, kWorkerMaxAttempts, err.empty() ? "n/a" : err, delay_ms));
+                                                           std::format("worker_request_failed worker={} attempt={}/{} err={} -> retrying in {}ms",
+                                                                       result.name, attempt, kWorkerMaxAttempts, err.empty() ? "n/a" : err, delay_ms));
                         post_progress(job, result.name, "retry",
                                       std::format("worker {}: transient request failure ({}) — retrying ({}/{})",
                                                   result.name, err.empty() ? "unknown error" : err, attempt + 1, kWorkerMaxAttempts));
@@ -17574,7 +17574,7 @@ static void print_help()
 // runner 会先问一次它的 host_tools_provider 再传进来，同一份定义不用为三种
 // schema 方言各生成一遍。
 static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>, nlohmann::json> build_tools(bool anthropic, bool responses_api = false,
-                                                                                                                    const std::vector<cell::tools::host_tool> *hosts = nullptr)
+                                                                                                                  const std::vector<cell::tools::host_tool> *hosts = nullptr)
 {
     using cell::tools::Phase;
     using cell::tools::Policy;
@@ -18111,8 +18111,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             if (t.name.empty() || !t.run)
                 continue;
             drop_def(t.name);
-            add(t.name, t.description, t.properties, t.required, t.policy, t.kind,
-                [name = t.name, run = t.run](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
+            add(t.name, t.description, t.properties, t.required, t.policy, t.kind, [name = t.name, run = t.run](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
                 {
                     cell::ToolOutput out;
                     if (!run(j, rt, out))
@@ -18123,9 +18122,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     }
                     else if (out.text.empty())
                         out.text = "done";
-                    return out;
-                },
-                t.phase);
+                    return out; }, t.phase);
         }
     }
     return {list, defs};
@@ -19345,20 +19342,19 @@ static int run_selftest()
         std::string buf = "data: {\"a\":1}\n\n";
         size_t base = 0;
         bool done = false;
-        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data(), buf.size()),
-                            [](const nlohmann::json &) {}, &done);
+        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data(), buf.size()), [](const nlohmann::json &) {}, &done);
         R.expect(!done, "sse: a stream without [DONE] is reported as unterminated");
         const std::string tail = "data: [DONE]\r\n\r\n";
         buf += tail;
-        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data() + buf.size() - tail.size(), tail.size()),
-                            [](const nlohmann::json &) {}, &done);
+        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data() + buf.size() - tail.size(), tail.size()), [](const nlohmann::json &) {}, &done);
         R.expect(done, "sse: a CRLF [DONE] sentinel is reported to the client");
         // and the sentinel must not be delivered as an event
         std::string buf2 = "data: [DONE]\n\n";
         size_t base2 = 0;
         size_t events = 0;
         cell::llm::sse_feed(buf2, base2, std::span<const char>(buf2.data(), buf2.size()),
-                            [&](const nlohmann::json &) { ++events; });
+                            [&](const nlohmann::json &)
+                            { ++events; });
         R.expect(events == 0, "sse: [DONE] is never delivered as an event");
     }
 
@@ -21420,14 +21416,13 @@ static int run_selftest()
                             })}},
             {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "<tool_output tool=\"exec\" path=\"probe\">\n<h1>injected</h1>\n</tool_output>"}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "call_2"}, {"content", "<tool_output tool=\"read\">\nfile body\n</tool_output>"}}})}},
-            {{"role", "assistant"}, {"model", "test-provider:test-model"},
-             {"content", "## Plan\n\n1. read\n2. write\n\n- alpha\n- [docs](https://example.com/x)\n\n"
-                         "| key | val |\n| --- | --- |\n| a | 1 |\n\n> quoted note\n\n"
-                         "**bold** *em* ~~old~~ `code` [bad](javascript:alert(1))\n\n"
-                         "```python\nprint(1)\n```\n\n"
-                         "- parent\n  - child one\n  - child two\n- sibling\n\n"
-                         "3. third\n\n4. fourth\n\n"
-                         "- - -\n"}},
+            {{"role", "assistant"}, {"model", "test-provider:test-model"}, {"content", "## Plan\n\n1. read\n2. write\n\n- alpha\n- [docs](https://example.com/x)\n\n"
+                                                                                       "| key | val |\n| --- | --- |\n| a | 1 |\n\n> quoted note\n\n"
+                                                                                       "**bold** *em* ~~old~~ `code` [bad](javascript:alert(1))\n\n"
+                                                                                       "```python\nprint(1)\n```\n\n"
+                                                                                       "- parent\n  - child one\n  - child two\n- sibling\n\n"
+                                                                                       "3. third\n\n4. fourth\n\n"
+                                                                                       "- - -\n"}},
         });
         std::filesystem::path out = cell::root / "selftest-export.html";
         R.expect(cell::chat::export_transcript_html(ex_msgs, "selftest-sid", out, xerr), "HTML export writes the transcript");
@@ -21993,10 +21988,10 @@ namespace cell
             // has been discarded, so a frontend may close/clear that line before
             // the retry's output begins (the engine never re-sends it)
             std::function<void()> on_attempt_reset;
-            std::function<void(long long)> on_progress;       // ~500ms while waiting for the first token
-            std::function<void(std::string_view)> on_status;  // informational line (retry, compact, ...)
-            std::function<void(std::string_view)> on_error;   // error line
-            std::function<void(std::string_view)> on_notice;  // notice rendered + delivered to the session
+            std::function<void(long long)> on_progress;      // ~500ms while waiting for the first token
+            std::function<void(std::string_view)> on_status; // informational line (retry, compact, ...)
+            std::function<void(std::string_view)> on_error;  // error line
+            std::function<void(std::string_view)> on_notice; // notice rendered + delivered to the session
             // structured companion to on_notice: the raw record (id, from,
             // topic, body, created_at), for frontends that render notices
             // themselves (folding, grouping) instead of plain text
@@ -25235,7 +25230,7 @@ int repl::run()
                  h.now().msg().push_back({{"role", "system"},
                                           {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
                  cell::chat::fold_system_messages(h.now().msg()); // a skill loaded mid-conversation joins the leading block
-                 h.now().note_rewrite(); // the fold reordered the transcript: replace the file, do not append
+                 h.now().note_rewrite();                          // the fold reordered the transcript: replace the file, do not append
                  h.now().unload();
                  log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), h.now().msg().size()));
                  cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), h.now().msg().size());
