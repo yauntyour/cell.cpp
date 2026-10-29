@@ -375,7 +375,12 @@ With ≤ 12 messages to aggregate it reports "context already small" and does no
 summarization call fails, a truncation placeholder is used. The summary is re-run through the
 injection sanitizer before it is inserted, and the read-before-edit log is reset because the earlier
 `read` results are gone from context. Compaction is itself one LLM request per part and counts
-toward usage.
+toward usage. Notices are the one piece of system state compaction *drops*: each injected notice is
+fenced (`<cell-notice> … </cell-notice>`) when it is folded into the leading block, and
+`chat::strip_notices` removes those sections while the durable state (base prompt, skill bodies)
+survives — a notice reports something that already happened, so carrying it into the compacted
+context would only keep a stale interruption alive for the rest of the session. The child-side
+compaction (`compact_worker_segment`) strips them the same way.
 
 **Transcript shape.** Chat Completions servers render the transcript with their own chat template,
 and strict ones (llama.cpp's Jinja templates) accept **exactly one `system` message, at the very
@@ -383,7 +388,9 @@ front** — a second one, or one that follows a turn, fails with `System message
 beginning`. So whenever session state arrives mid-conversation (notices, a loaded skill, an
 interrupt note) every `system` message is merged into the single leading one
 in transcript order (`chat::fold_system_messages`), and the same fold runs on the transcript before
-every request as a last line of defence. The other two API styles never cared: they lift system
+every request as a last line of defence. Notices are fenced when they are injected
+(`<cell-notice> … </cell-notice>`) precisely because the fold erases the message boundary that
+tells them apart from durable session state; see the compaction notes above. The other two API styles never cared: they lift system
 messages out of the array into `system` / `instructions` anyway.
 
 **Automatic compaction.** Two triggers, both using the same `compact()` path:

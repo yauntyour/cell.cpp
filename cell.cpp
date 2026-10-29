@@ -12429,6 +12429,94 @@ details{break-inside:avoid}
             return true;
         }
 
+        // A notice is a message with a shelf life: it reports that a background
+        // job finished, that another session answered, that a worker progressed.
+        // Once folded into the leading system block it is indistinguishable from
+        // session state (the base prompt, skill bodies) — and compaction keeps
+        // every system message verbatim, so a stale notice would be re-sent for
+        // the rest of the session. Each injected notice is therefore fenced with
+        // these markers, which cost nothing in context and let compaction (and
+        // anything else that wants the durable system state) drop the notice
+        // sections again. The fence is namespaced so a notice body quoting it
+        // cannot close the section early by accident.
+        static constexpr std::string_view notice_fence_open = "<cell-notice>";
+        static constexpr std::string_view notice_fence_close = "</cell-notice>";
+
+        // removes every fenced notice section from one block of system text,
+        // together with the blank-line seam folding left around it; true when
+        // something was removed
+        static bool strip_notice_text(std::string &text)
+        {
+            bool changed = false;
+            for (;;)
+            {
+                size_t b = text.find(notice_fence_open);
+                if (b == std::string::npos)
+                    break;
+                size_t e = text.find(notice_fence_close, b);
+                // an unterminated fence runs to the end: everything behind it
+                // is notice text, so dropping it is the conservative reading
+                e = (e == std::string::npos) ? text.size() : e + notice_fence_close.size();
+                while (b > 0 && (text[b - 1] == '\n' || text[b - 1] == ' '))
+                    --b;
+                while (e < text.size() && (text[e] == '\n' || text[e] == ' '))
+                    ++e;
+                std::string left = text.substr(0, b);   // sealed seams are re-joined
+                std::string right = text.substr(e);
+                text = std::move(left);
+                if (!text.empty() && !right.empty())
+                    text += "\n\n";
+                text += right;
+                changed = true;
+            }
+            return changed;
+        }
+
+        // strips the fenced notices from every system message of a transcript;
+        // a system message that held nothing but notices is dropped entirely.
+        // Anchored at the transcript level because folding has already merged
+        // the notices into the leading block by the time compaction looks.
+        static bool strip_notices(nlohmann::json &msgs)
+        {
+            if (!msgs.is_array())
+                return false;
+            // a fence is the only thing worth rebuilding for, and the rebuild
+            // moves the messages out of the input array — so look first
+            bool fenced = false;
+            for (const auto &m : msgs)
+                if (m.is_object() && m.value("role", "") == "system" && m.contains("content") &&
+                    m["content"].is_string() &&
+                    m["content"].get_ref<const std::string &>().find(notice_fence_open) != std::string::npos)
+                {
+                    fenced = true;
+                    break;
+                }
+            if (!fenced)
+                return false;
+            nlohmann::json out = nlohmann::json::array();
+            for (auto &m : msgs)
+            {
+                if (!m.is_object() || m.value("role", "") != "system" || !m.contains("content") ||
+                    !m["content"].is_string())
+                {
+                    out.push_back(std::move(m));
+                    continue;
+                }
+                std::string text = m["content"].get<std::string>();
+                if (!strip_notice_text(text))
+                {
+                    out.push_back(std::move(m));
+                    continue;
+                }
+                if (text.empty())
+                    continue; // the message was a notice and nothing else
+                m["content"] = std::move(text);
+                out.push_back(std::move(m));
+            }
+            msgs = std::move(out);
+            return true;
+        }
+
         // context-overflow detection: covers OpenAI Chat Completions, OpenAI
         // Responses and Anthropic error phrases. Matched case-insensitively
         // against the human-readable error message returned by the API clients;
@@ -15974,6 +16062,9 @@ details{break-inside:avoid}
             for (size_t i = 0; i < base; i++)
                 kept.push_back(messages[i]);
             cell::chat::fold_system_messages(kept);
+            // a notice that reached this child is just as time-sensitive here:
+            // drop it with the compacted segment instead of resending it forever
+            cell::chat::strip_notices(kept);
             kept.push_back({{"role", "assistant"}, {"content", content}});
             messages = std::move(kept);
             base = messages.size();
@@ -21211,6 +21302,41 @@ static int run_selftest()
                      "a trailing system message is merged into a new leading one");
         }
 
+        // notices are time-sensitive: the fenced sections an injection leaves
+        // behind in the leading system block are stripped again when compaction
+        // keeps the system messages verbatim (the durable session state survives)
+        {
+            const std::string open{cell::chat::notice_fence_open};
+            const std::string close{cell::chat::notice_fence_close};
+            nlohmann::json m = nlohmann::json::array({
+                {{"role", "system"}, {"content", "base\n\n" + open + "\nA notice was delivered to this session (from=x).\nworker 1 finished\n" + close}},
+                {{"role", "user"}, {"content", "hi"}},
+                {{"role", "assistant"}, {"content", "hello"}},
+                {{"role", "system"}, {"content", open + "\nonly a notice\n" + close}},
+            });
+            R.expect(cell::chat::strip_notices(m), "stripping reports that it removed a notice");
+            R.expect(m.size() == 3 && m[0]["role"] == "system" && m[0]["content"] == "base",
+                     "the notice section is gone from the leading block, the base prompt stays");
+            R.expect(m[1]["content"] == "hi" && m[2]["content"] == "hello",
+                     "stripping touches nothing but the system messages");
+            nlohmann::json durable = nlohmann::json::array({
+                {{"role", "system"}, {"content", "base\n\nskill body"}},
+                {{"role", "user"}, {"content", "hi"}},
+            });
+            R.expect(!cell::chat::strip_notices(durable) && durable.size() == 2 &&
+                         durable[0]["content"] == "base\n\nskill body",
+                     "a transcript without notices is left untouched");
+            // an unterminated fence runs to the end of the block: everything
+            // behind it is notice text, so it goes with the section
+            std::string dangling = "base\n\n" + open + "\ndangling notice";
+            R.expect(cell::chat::strip_notice_text(dangling) && dangling == "base",
+                     "an unterminated fence swallows the remainder of the block");
+            // a notice body may quote the opening fence; only a close ends it
+            std::string quoted = "base\n\n" + open + "\nthe child wrote " + open + " itself\n" + close + "\n\ntail";
+            R.expect(cell::chat::strip_notice_text(quoted) && quoted == "base\n\ntail",
+                     "a quoted opening fence does not reopen the section");
+        }
+
         // context-overflow phrases and the summarizer input extraction are
         // shared between the main loop and the Teamwork children: both sides
         // rely on the same table and the same 400-chars-per-message rule
@@ -22412,11 +22538,16 @@ namespace cell
                 bool answerable = !m.from_session.empty() && m.from_session != h_.now().id();
                 if (answerable)
                     meta += " session=" + m.from_session;
+                // the notice is fenced so the time-sensitive part can be
+                // identified and dropped again on compaction (see
+                // chat::strip_notices); the fence survives the fold verbatim
                 h_.now().msg().push_back({{"role", "system"},
-                                          {"content", std::format("A notice was delivered to this session ({}). Treat it as context from the user or a supervised agent.{}\n{}",
+                                          {"content", std::format("{}\nA notice was delivered to this session ({}). Treat it as context from the user or a supervised agent.{}\n{}\n{}",
+                                                                  cell::chat::notice_fence_open,
                                                                   meta,
                                                                   answerable ? " You can answer its sender with the notice tool (operation=send, session=reply)." : "",
-                                                                  m.body)}});
+                                                                  m.body,
+                                                                  cell::chat::notice_fence_close)}});
             }
             // notices arrive mid-conversation: lift them into the leading system
             // block so a chat template never sees a system message behind a user turn
@@ -22572,6 +22703,14 @@ namespace cell
             // fold first, while the array holds only system messages, so the
             // leading block stays canonical for strict chat templates
             cell::chat::fold_system_messages(new_msgs);
+            // notices are time-sensitive: one that was folded into the leading
+            // block describes something that already happened, and compaction
+            // keeps every system message verbatim, so without this it would be
+            // carried by every later request. Strip them along with the
+            // conversation they belong to; the durable session state (base
+            // prompt, skill bodies) stays.
+            if (cell::chat::strip_notices(new_msgs))
+                cell::sys::logger::instance().info("ctx", "notices stripped from the system block on compaction");
             if (tail_user)
                 new_msgs.push_back(*tail_user);
             // the summary is the assistant's own memory of the compacted run: a
