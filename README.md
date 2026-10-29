@@ -220,7 +220,7 @@ Inside the REPL, providers are managed without restarting:
 
 ```
 usage: cell [options]        # verbatim from print_usage — the --sandbox line overstates the modes
-  --provider NAME             select an existing provider, or create one (style = NAME)
+  --provider NAME             select an existing provider, or create one (NAME = openai-chat|openai-responses|anthropic also picks the API style)
   --base URL                  api base url for the current provider
   --model MODEL               default model name
   --proxy URL                 http(s) proxy for the current provider
@@ -236,7 +236,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 
 | Option | Value | Effect |
 | --- | --- | --- |
-| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style** (`openai` / `anthropic`); for OpenAI-style providers with no explicit style, the API style defaults to `openai-chat`. Switching to a **different** provider clears `current_model` — the stored model name belonged to the previous provider — while re-selecting the already-active provider (including the empty `current_provider` case, which means "first provider is active") keeps it; an explicit `--model` on the same command line is applied afterwards. |
+| `--provider` | name | Selects an existing provider by name; if none matches, a provider is created whose **name doubles as the API style**: `openai` / `openai-chat` select `openai-chat`, `openai-responses` selects the Responses API (`/v1/responses`), `anthropic` selects the native Anthropic surface; any other name labels the provider and gets `openai-chat`. Switching to a **different** provider clears `current_model` — the stored model name belonged to the previous provider — while re-selecting the already-active provider (including the empty `current_provider` case, which means "first provider is active") keeps it; an explicit `--model` on the same command line is applied afterwards. |
 | `--base` | URL | Sets `base` on the current provider. There is **no built-in default base** — an empty base means the provider is unusable until you set one. |
 | `--model` | string | Active model name, stored as-is (it need not appear in `/models`; a mismatch only warns). |
 | `--proxy` | URL | HTTP(S) proxy for the current provider, credentials may be embedded. `localhost`, `127.0.0.1`, `::1` always bypass it (`CURLOPT_NOPROXY`); HTTPS targets are tunnelled with `CONNECT`. |

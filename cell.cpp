@@ -6250,6 +6250,45 @@ namespace cell
             return out;
         }
 
+        // Whether a failed request is worth repeating. One rule for the whole
+        // client: 4xx is deterministic (bad request, auth, unknown model, bad
+        // base URL) except the throttling/contention codes; 5xx and every
+        // transport-level abort (http_status == 0: reset, timeout, empty stream,
+        // TLS drop) are transient.
+        // `http_status` is 0 when the caller has no status to report (a teamwork
+        // child, or a request that never got a response); the error text is then
+        // inspected for the "HTTP error NNN" form the clients produce.
+        static bool transient_failure(long http_status, const std::string &err)
+        {
+            auto throttled = [](long code)
+            { return code == 408 || code == 409 || code == 425 || code == 429; };
+            if (http_status >= 400 && http_status < 500)
+                return throttled(http_status);
+            if (http_status >= 500)
+                return true; // 500/502/503/504 gateways, 529 overloaded
+            // transport-level or unknown: an explicitly embedded 4xx is still
+            // deterministic, everything else stays retryable
+            const std::string_view needle = "HTTP error ";
+            size_t p = err.find(needle);
+            if (p != std::string::npos)
+            {
+                size_t i = p + needle.size();
+                long code = 0;
+                bool digits = false;
+                while (i < err.size() && err[i] >= '0' && err[i] <= '9')
+                {
+                    code = code * 10 + (err[i] - '0');
+                    digits = true;
+                    if (code > 999)
+                        break;
+                    ++i;
+                }
+                if (digits && code >= 400 && code < 500)
+                    return throttled(code);
+            }
+            return true;
+        }
+
         // RAII wrapper that owns a curl_slist header list (built from spans/containers)
         class header_list
         {
@@ -6342,8 +6381,27 @@ namespace cell
                 // these used to overwrite a caller-supplied timeout_sec
                 if (timeout_sec <= 0)
                 {
-                    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+                    // A streamed answer legitimately lasts minutes (long
+                    // generations, reasoning models), so a total-transfer cap is
+                    // wrong here: CURLOPT_TIMEOUT used to abort a healthy stream
+                    // at 300s, mid-answer, and the discarded round looked like a
+                    // dropped connection. Cap the CONNECT instead, and detect a
+                    // dead peer with the low-speed watchdog: a half-open socket
+                    // (sleep/resume, NAT timeout, Wi-Fi switch) then fails in
+                    // ~4 min instead of hanging until the old total timeout.
+                    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
                     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+                    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+                    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 240L);
+#if LIBCURL_VERSION_NUM >= 0x071900
+                    // keep an idle connection alive while the model is thinking:
+                    // an idle NAT/firewall mapping is a common silent disconnect
+                    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+#if LIBCURL_VERSION_NUM >= 0x071c00
+                    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+                    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+#endif
+#endif
                 }
                 curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -6439,10 +6497,14 @@ namespace cell
         bool CURL_stream_post(CURL *curl, const char *url, const std::string &post_data,
                               const std::vector<std::string> &headers, StreamCallback on_token,
                               XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_code = nullptr,
-                              const char *proxy = nullptr)
+                              const char *proxy = nullptr, std::string *err = nullptr)
         {
+            // the transport reason (CURLE_RECV_ERROR, CURLE_OPERATION_TIMEDOUT,
+            // a dropped TLS session, ...) must reach the caller: without it the
+            // caller only learns "stream request failed" and the log cannot tell
+            // a provider outage from a local proxy reset.
             return perform(curl, url, post_data.c_str(), (curl_off_t)post_data.size(), proxy, headers,
-                           nullptr, std::move(on_token), on_xfer, xfer_data, http_code, nullptr);
+                           nullptr, std::move(on_token), on_xfer, xfer_data, http_code, err);
         }
 
         // lightweight GET (used for connectivity probes); timeout_sec defaults to a short 5s.
@@ -8397,8 +8459,12 @@ namespace cell
             return s;
         }
 
-        // scans buf from pos for the next complete "data:" line; zero-copy payload view, returns position after the line
-        static inline size_t sse_next_payload(const std::string &buf, size_t pos, std::string_view &payload)
+        // scans buf from pos for the next complete "data:" line; zero-copy payload view, returns position after the line.
+        // `saw_done` (optional) reports the "[DONE]" sentinel: a stream that
+        // ends without it was cut short by the peer, which the clients use to
+        // distinguish a finished answer from a dropped connection.
+        static inline size_t sse_next_payload(const std::string &buf, size_t pos, std::string_view &payload,
+                                              bool *saw_done = nullptr)
         {
             for (size_t nl; (nl = buf.find('\n', pos)) != std::string::npos;)
             {
@@ -8415,20 +8481,27 @@ namespace cell
                 // would hide the [DONE] sentinel from the comparison below
                 while (!payload.empty() && payload.back() == '\r')
                     payload.remove_suffix(1);
-                if (payload.empty() || payload == "[DONE]")
+                if (payload.empty())
                     continue;
+                if (payload == "[DONE]")
+                {
+                    if (saw_done)
+                        *saw_done = true;
+                    continue;
+                }
                 return pos;
             }
             return std::string::npos;
         }
         // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
-        static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
+        static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed,
+                                                         bool *saw_done = nullptr)
         {
             std::string_view payload;
             size_t pos = consumed;
             while (true)
             {
-                size_t next = sse_next_payload(buf, pos, payload);
+                size_t next = sse_next_payload(buf, pos, payload, saw_done);
                 if (next == std::string::npos)
                     co_return;
                 pos = next;
@@ -8456,10 +8529,11 @@ namespace cell
         // which reports the reason on stderr.
         constexpr size_t kMaxStreamBuffer = (size_t)32 * 1024 * 1024;
         template <typename F>
-        static void sse_feed(std::string &buf, size_t &base, std::span<const char> data, F &&on_event)
+        static void sse_feed(std::string &buf, size_t &base, std::span<const char> data, F &&on_event,
+                             bool *saw_done = nullptr)
         {
             buf.append(data.data(), data.size());
-            for (const nlohmann::json &j : sse_events(buf, base))
+            for (const nlohmann::json &j : sse_events(buf, base, saw_done))
                 on_event(j);
             if (base >= 64 * 1024)
             {
@@ -8543,6 +8617,21 @@ namespace cell
                 text = dump_safe(content);
             }
             return text;
+        }
+        // Whether a reply carries any output at all (text or reasoning blocks).
+        // Distinguishes a real answer from a silent blank turn: some providers
+        // answer 200 and then send nothing, and a turn that ends on such a reply
+        // looks to the user like the agent simply ignored the request.
+        static bool reply_has_output(const nlohmann::json &reply)
+        {
+            auto it = reply.find("content");
+            if (it == reply.end() || it->is_null())
+                return false;
+            if (it->is_string())
+                return !it->get_ref<const std::string &>().empty();
+            if (it->is_array())
+                return !it->empty();
+            return true;
         }
 
         // -------- API clients --------
@@ -8630,8 +8719,13 @@ namespace cell
                                 long *http_status, std::string &sse_buf, size_t &sse_base,
                                 std::string &stream_err, std::string &err)
         {
+            // Ask for an event stream explicitly. Some OpenAI-compatible
+            // gateways (and CDNs in front of them) only stream when the client
+            // says it accepts SSE; without it they buffer the whole body, which
+            // the user experiences as a request that never answers.
+            hdrs.push_back("Accept: text/event-stream");
             long http = 0;
-            bool ok = net::CURL_stream_post(curl, url.c_str(), dump_safe(payload), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy.c_str());
+            bool ok = net::CURL_stream_post(curl, url.c_str(), dump_safe(payload), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy.c_str(), &err);
             return finish_stream(ok, http, url, hdrs, http_status, sse_buf, sse_base, stream_err, err);
         }
         // Provider tool_calls are untrusted input. Normalize them into the shape
@@ -8684,6 +8778,51 @@ namespace cell
                 arr.push_back({{"type", "text"}, {"text", text}});
             return arr;
         }
+        // Parse one Chat-Completions JSON body into the reply shape the turn
+        // loop expects. Shared by the non-streaming request and by the
+        // stream client's fallback for endpoints that answer a `stream:true`
+        // request with a plain completion body (proxies that ignore the flag
+        // or reject SSE): without the fallback such a response produced an
+        // empty assistant message and the turn ended with no answer at all.
+        static bool parse_chat_completion(const std::string &buf, nlohmann::json &reply,
+                                          nlohmann::json &tool_calls, nlohmann::json &usage,
+                                          std::string &err)
+        {
+            tool_calls = nlohmann::json::array();
+            usage = nlohmann::json::object();
+            try
+            {
+                auto j = nlohmann::json::parse(buf);
+                if (!j.is_object() || !j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
+                {
+                    err = "response has no choices";
+                    return false;
+                }
+                const auto &choice = j["choices"][0];
+                if (!choice.is_object() || !choice.contains("message") || !choice["message"].is_object())
+                {
+                    err = "response has no message object";
+                    return false;
+                }
+                reply = choice["message"];
+                if (reply.contains("tool_calls"))
+                {
+                    tool_calls = normalize_tool_calls(reply["tool_calls"]);
+                    if (tool_calls.empty())
+                        reply.erase("tool_calls");
+                    else
+                        reply["tool_calls"] = tool_calls;
+                }
+                if (j.contains("usage") && j["usage"].is_object())
+                    usage = j["usage"];
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                err = std::format("response parse error: {}", e.what());
+                return false;
+            }
+        }
 
         class OpenAI
         {
@@ -8691,6 +8830,11 @@ namespace cell
             const std::string api_base;
             std::string proxy_;
             nlohmann::json extra_body_ = nlohmann::json::object();
+            // The client (and its single CURL handle) is cached per provider and
+            // shared: the turn thread streams while pass-1 tools may run
+            // autoallow checks on worker threads. libcurl forbids two concurrent
+            // transfers on one easy handle, so every request takes this lock.
+            std::mutex mu_;
             CURL *curl = curl_easy_init();
 
             // Flatten our internal transcript into the subset that all
@@ -8851,11 +8995,20 @@ namespace cell
                 if (!net::curl_global_is_down())
                     curl_easy_cleanup(curl);
             }
-            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
-            void set_extra_body(nlohmann::json x) { extra_body_ = std::move(x); }
+            void set_proxy(std::string proxy)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                proxy_ = std::move(proxy);
+            }
+            void set_extra_body(nlohmann::json x)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                extra_body_ = std::move(x);
+            }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
             {
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
@@ -8863,42 +9016,12 @@ namespace cell
                 std::vector<std::string> hdrs = bearer_headers(api_key);
                 if (!post_json(curl, url, proxy_, hdrs, body(model, messages, tools, false, extra_body_), buf, err, http_status))
                     return false;
-                try
-                {
-                    auto j = nlohmann::json::parse(buf);
-                    if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
-                    {
-                        err = "response has no choices";
-                        return false;
-                    }
-                    const auto &choice = j["choices"][0];
-                    if (!choice.is_object() || !choice.contains("message") || !choice["message"].is_object())
-                    {
-                        err = "response has no message object";
-                        return false;
-                    }
-                    reply = choice["message"];
-                    if (reply.contains("tool_calls"))
-                    {
-                        tool_calls = normalize_tool_calls(reply["tool_calls"]);
-                        if (tool_calls.empty())
-                            reply.erase("tool_calls");
-                        else
-                            reply["tool_calls"] = tool_calls;
-                    }
-                    if (j.contains("usage") && j["usage"].is_object())
-                        usage = j["usage"];
-                    return true;
-                }
-                catch (const std::exception &e)
-                {
-                    err = std::format("response parse error: {}", e.what());
-                    return false;
-                }
+                return parse_chat_completion(buf, reply, tool_calls, usage, err);
             }
 
             bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string text;
@@ -8906,11 +9029,18 @@ namespace cell
                 std::string sse_buf;
                 std::string stream_err;
                 size_t sse_base = 0;
+                // stream liveness: a 200 response whose body carried no event at
+                // all is a dropped connection, not an empty answer
+                bool saw_done = false;
+                size_t event_count = 0;
+                // a terminal chunk arrived (finish_reason) — see the probe in handle()
+                bool terminal = false;
                 std::string url = api_base + "/chat/completions";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
                     auto handle = [&](const nlohmann::json &j)
                     {
+                        ++event_count;
                         // some OpenAI-compatible servers report mid-stream failures
                         // as an error chunk instead of a failing HTTP status
                         if (j.contains("error") && j["error"].is_object())
@@ -8920,6 +9050,16 @@ namespace cell
                         }
                         if (j.contains("usage") && j["usage"].is_object())
                             usage = j["usage"];
+                        // A terminal chunk is the only proof the answer is
+                        // complete: the last chunk carries a non-null
+                        // finish_reason ("stop", "length", "tool_calls", ...).
+                        // A stream that simply stops still ends with HTTP 200
+                        // and some text, so without this a cut connection is
+                        // recorded as a finished (but mysteriously short) reply.
+                        if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty() &&
+                            j["choices"][0].is_object() && j["choices"][0].contains("finish_reason") &&
+                            !j["choices"][0]["finish_reason"].is_null())
+                            terminal = true;
                         // const operator[] asserts on a missing key, and this
                         // build keeps asserts enabled: never index blindly
                         if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty() ||
@@ -8950,6 +9090,15 @@ namespace cell
                             text.append(t);
                             on_token(std::span<const char>(t));
                         }
+                        // a refusal streams as its own delta key on OpenAI's
+                        // Chat Completions; dropping it left a response that
+                        // looked like an empty answer
+                        else if (delta.contains("refusal") && delta["refusal"].is_string())
+                        {
+                            const std::string &t = delta["refusal"].get_ref<const std::string &>();
+                            text.append(t);
+                            on_token(std::span<const char>(t));
+                        }
                         if (delta.contains("tool_calls") && delta["tool_calls"].is_array())
                         {
                             for (auto &tc : delta["tool_calls"])
@@ -8976,35 +9125,89 @@ namespace cell
                             }
                         }
                     };
-                    sse_feed(sse_buf, sse_base, data, handle);
+                    sse_feed(sse_buf, sse_base, data, handle, &saw_done);
                 };
                 std::vector<std::string> hdrs = bearer_headers(api_key);
                 bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true, extra_body_), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
-                // assemble the reply even after a failed/aborted transfer so partial text survives
-                reply["role"] = "assistant";
-                if (text.empty() && reasoning.empty())
-                    reply["content"] = nullptr;
-                else if (!reasoning.empty())
-                    // store reasoning_content in reply for session persistence
-                    reply["content"] = reasoning_content_array(text, reasoning);
-                else
-                    reply["content"] = text;
-                tool_calls = normalize_tool_calls(tool_calls);
-                if (!tool_calls.empty())
-                    reply["tool_calls"] = tool_calls;
+                // A gateway that ignores "stream": true answers with one plain
+                // completion body. There is no "data:" line to parse, so the
+                // whole body would be dropped and the turn would end silently.
+                bool json_fallback = false;
+                if (ok && event_count == 0 && !sse_buf.empty())
+                {
+                    nlohmann::json fb_reply, fb_calls, fb_usage;
+                    std::string fb_err;
+                    if (parse_chat_completion(sse_buf, fb_reply, fb_calls, fb_usage, fb_err))
+                    {
+                        reply = std::move(fb_reply);
+                        tool_calls = std::move(fb_calls);
+                        usage = std::move(fb_usage);
+                        json_fallback = true;
+                        cell::sys::logger::instance().warn("llm", "stream_not_sse endpoint=chat-completions action=accepted_plain_completion");
+                        // the answer arrived in one piece, not as deltas: hand it
+                        // to the UI anyway, or the console shows an empty reply
+                        // line even though the turn produced text
+                        std::string answer = content_text(reply.contains("content") ? reply["content"] : nlohmann::json());
+                        if (!answer.empty() && on_token)
+                            on_token(std::span<const char>(answer));
+                    }
+                }
+                if (!json_fallback)
+                {
+                    // assemble the reply even after a failed/aborted transfer so partial text survives
+                    reply["role"] = "assistant";
+                    if (text.empty() && reasoning.empty())
+                        reply["content"] = nullptr;
+                    else if (!reasoning.empty())
+                        // store reasoning_content in reply for session persistence
+                        reply["content"] = reasoning_content_array(text, reasoning);
+                    else
+                        reply["content"] = text;
+                    tool_calls = normalize_tool_calls(tool_calls);
+                    if (!tool_calls.empty())
+                        reply["tool_calls"] = tool_calls;
+                }
                 if (!reasoning.empty())
                     cell::sys::logger::instance().debug("llm", std::format("reasoning_chars={}", reasoning.size()));
+                if (!saw_done && ok)
+                    cell::sys::logger::instance().debug("llm", std::format("stream_without_done events={}", event_count));
+                // Nothing at all came back on a 200: the peer closed the
+                // connection before the model produced anything (proxy reset,
+                // half-open socket, quota proxy that answers 200 + empty body).
+                // Report it as a failure so the caller retries, instead of
+                // recording a blank assistant turn and ending with no answer.
+                if (!json_fallback && ok && text.empty() && reasoning.empty() && tool_calls.empty())
+                {
+                    ok = false;
+                    const std::string snippet = net::error_body_snippet(sse_buf);
+                    err = snippet.empty()
+                              ? "the provider closed the stream before sending any content"
+                              : std::format("the provider closed the stream before sending any content (body: {})", snippet);
+                }
+                // Same 200, but with text: a stream that ends without a terminal
+                // chunk was cut mid-answer (peer reset, a proxy that closes after
+                // N bytes, a cancelled generation). The partial reply stays in
+                // `reply` for the transcript, but the round fails so the caller
+                // retries instead of quietly recording half an answer.
+                if (!json_fallback && ok && !saw_done && !terminal)
+                {
+                    ok = false;
+                    err = std::format(
+                        "the provider closed the stream before the answer was complete ({} chars, no finish_reason and no [DONE])",
+                        text.size() + reasoning.size());
+                }
                 return ok;
             }
         };
 
         // OpenAI Responses API client: POST {base}/v1/responses
-        // Handles the newer Responses API format with typed input/output items.
         class OpenAIResponses
         {
         private:
             const std::string api_base;
             std::string proxy_;
+            // see OpenAI: one cached client per base, shared across threads
+            std::mutex mu_;
             CURL *curl = curl_easy_init();
 
             // convert Chat Completions messages to Responses API input items + extract instructions
@@ -9273,10 +9476,15 @@ namespace cell
                 if (!net::curl_global_is_down())
                     curl_easy_cleanup(curl);
             }
-            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
+            void set_proxy(std::string proxy)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                proxy_ = std::move(proxy);
+            }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
             {
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
@@ -9300,6 +9508,7 @@ namespace cell
             bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
                 (void)on_reason; // Responses API uses encrypted reasoning, not plaintext deltas
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string text;
@@ -9307,6 +9516,13 @@ namespace cell
                 std::string sse_buf;
                 std::string stream_err;
                 size_t sse_base = 0;
+                // stream liveness (see the chat client): a 200 with no event at
+                // all means the connection dropped before the model answered
+                bool saw_done = false;
+                size_t event_count = 0;
+                // a terminal event arrived (response.completed / .incomplete) —
+                // the Responses stream's only proof the answer is complete
+                bool terminal = false;
                 // track function_call deltas by item_id (OpenAI Responses streaming
                 // keys the argument deltas with item_id; the call_id that the
                 // tool_result must reference is recovered from output_item.added)
@@ -9326,9 +9542,11 @@ namespace cell
                 {
                     auto handle = [&](const nlohmann::json &ev)
                     {
+                        ++event_count;
                         std::string type = ev.value("type", "");
                         if (type == "response.completed" && ev.contains("response"))
                         {
+                            terminal = true;
                             auto &resp = ev["response"];
                             // usage arrives here (Responses API does not use stream_options)
                             if (resp.contains("usage") && resp["usage"].is_object())
@@ -9399,6 +9617,42 @@ namespace cell
                                 on_token(std::span<const char>(t));
                             }
                         }
+                        else if (type == "response.refusal.delta")
+                        {
+                            // a refusal is a real answer, not silence: surface it
+                            // to the user and keep it in the transcript
+                            if (ev.contains("delta") && ev["delta"].is_string())
+                            {
+                                const std::string &t = ev["delta"].get_ref<const std::string &>();
+                                text.append(t);
+                                on_token(std::span<const char>(t));
+                            }
+                        }
+                        else if (type == "response.incomplete")
+                        {
+                            // max_output_tokens / content_filter: the stream ends
+                            // "successfully" with no completion. Fail the round when
+                            // nothing usable was produced; otherwise keep the partial
+                            // text and only note it (the caller decides to continue).
+                            terminal = true; // a deliberate, complete stop
+                            if (text.empty() && reasoning.empty() && func_call_args.empty())
+                            {
+                                std::string why;
+                                if (ev.contains("response") && ev["response"].is_object())
+                                {
+                                    auto &resp = ev["response"];
+                                    if (resp.contains("incomplete_details") && resp["incomplete_details"].is_object())
+                                        why = resp["incomplete_details"].value("reason", "");
+                                    if (why.empty() && resp.contains("error") && resp["error"].is_object())
+                                        why = resp["error"].value("message", "");
+                                }
+                                stream_err = why.empty()
+                                                 ? "the response was cut short before producing any content"
+                                                 : std::format("the response was cut short: {}", why);
+                            }
+                            else
+                                cell::sys::logger::instance().warn("llm", "responses_incomplete_partial_output_kept");
+                        }
                         else if (type == "response.reasoning_summary_text.delta")
                         {
                             if (ev.contains("delta") && ev["delta"].is_string())
@@ -9438,55 +9692,98 @@ namespace cell
                             stream_err = msg.empty() ? "provider stream error" : std::move(msg);
                         }
                     };
-                    sse_feed(sse_buf, sse_base, data, handle);
+                    sse_feed(sse_buf, sse_base, data, handle, &saw_done);
                 };
                 std::vector<std::string> hdrs = bearer_headers(api_key);
                 bool ok = stream_post(curl, url, proxy_, hdrs, body(model, messages, tools, true), std::move(cb), on_xfer, xfer_data, http_status, sse_buf, sse_base, stream_err, err);
-                // assemble the reply in Chat Completions-compatible format
-                reply["role"] = "assistant";
-                // when the model produced tool calls, content must be null (per the
-                // Chat Completions contract) even if no text was streamed
-                if (!func_call_args.empty())
+                // a gateway that ignores "stream": true answers with one plain
+                // JSON response: parse it instead of dropping the whole body
+                bool json_fallback = false;
+                if (ok && event_count == 0 && !sse_buf.empty())
                 {
-                    // one round can carry BOTH text and a tool call. The OpenAI-chat
-                    // path keeps the text; dropping it here made the two styles
-                    // disagree and silently threw away content the model produced.
-                    if (!reasoning.empty() || !text.empty())
-                        reply["content"] = reasoning_content_array(text, reasoning);
-                    else
-                        reply["content"] = nullptr;
+                    auto j = nlohmann::json::parse(sse_buf, nullptr, false);
+                    if (j.is_object() && (j.contains("output") || j.contains("choices")))
+                    {
+                        parse_output(j, reply, tool_calls, usage);
+                        json_fallback = true;
+                        cell::sys::logger::instance().warn("llm", "stream_not_sse endpoint=responses action=accepted_plain_response");
+                        // delivered in one piece rather than as deltas: still
+                        // hand it to the UI so the reply is actually shown
+                        std::string answer = content_text(reply.contains("content") ? reply["content"] : nlohmann::json());
+                        if (!answer.empty() && on_token)
+                            on_token(std::span<const char>(answer));
+                    }
                 }
-                else if (!reasoning.empty())
-                    // store reasoning_content in reply for session persistence
-                    reply["content"] = reasoning_content_array(text, reasoning);
-                else if (text.empty())
-                    reply["content"] = nullptr;
-                else
-                    reply["content"] = text;
+                if (!json_fallback)
+                {
+                    // assemble the reply in Chat Completions-compatible format
+                    reply["role"] = "assistant";
+                    // when the model produced tool calls, content must be null (per the
+                    // Chat Completions contract) even if no text was streamed
+                    if (!func_call_args.empty())
+                    {
+                        // one round can carry BOTH text and a tool call. The OpenAI-chat
+                        // path keeps the text; dropping it here made the two styles
+                        // disagree and silently threw away content the model produced.
+                        if (!reasoning.empty() || !text.empty())
+                            reply["content"] = reasoning_content_array(text, reasoning);
+                        else
+                            reply["content"] = nullptr;
+                    }
+                    else if (!reasoning.empty())
+                        // store reasoning_content in reply for session persistence
+                        reply["content"] = reasoning_content_array(text, reasoning);
+                    else if (text.empty())
+                        reply["content"] = nullptr;
+                    else
+                        reply["content"] = text;
+                    // assemble tool_calls from accumulated deltas. func_call_args is keyed
+                    // by item_id; resolve the function name and the call_id (used by the
+                    // tool_result's function_call_output) through the mappings built above.
+                    // Emit in first-seen order, not unordered_map order.
+                    auto push_call = [&](const std::string &item_id)
+                    {
+                        nlohmann::json tc;
+                        tc["id"] = func_call_callids.count(item_id) ? func_call_callids[item_id] : item_id;
+                        tc["type"] = "function";
+                        tc["function"]["name"] = func_call_names.count(item_id) ? func_call_names[item_id] : "";
+                        tc["function"]["arguments"] = func_call_args[item_id];
+                        tool_calls.push_back(std::move(tc));
+                    };
+                    for (auto &item_id : func_call_order)
+                        if (func_call_args.count(item_id))
+                            push_call(item_id);
+                    // safety net for calls that never appeared in an ordering event
+                    for (auto &[item_id, args] : func_call_args)
+                        if (std::find(func_call_order.begin(), func_call_order.end(), item_id) == func_call_order.end())
+                            push_call(item_id);
+                    if (!tool_calls.empty())
+                        reply["tool_calls"] = tool_calls;
+                }
                 if (!reasoning.empty())
                     cell::sys::logger::instance().debug("llm", std::format("responses_reasoning_chars={}", reasoning.size()));
-                // assemble tool_calls from accumulated deltas. func_call_args is keyed
-                // by item_id; resolve the function name and the call_id (used by the
-                // tool_result's function_call_output) through the mappings built above.
-                // Emit in first-seen order, not unordered_map order.
-                auto push_call = [&](const std::string &item_id)
+                if (!saw_done && ok)
+                    cell::sys::logger::instance().debug("llm", std::format("responses_stream_without_done events={}", event_count));
+                // 200 + no event at all: the peer dropped the connection before
+                // the model answered. Report a failure so the turn retries
+                // rather than ending on a blank assistant message.
+                if (!json_fallback && ok && text.empty() && reasoning.empty() && tool_calls.empty())
                 {
-                    nlohmann::json tc;
-                    tc["id"] = func_call_callids.count(item_id) ? func_call_callids[item_id] : item_id;
-                    tc["type"] = "function";
-                    tc["function"]["name"] = func_call_names.count(item_id) ? func_call_names[item_id] : "";
-                    tc["function"]["arguments"] = func_call_args[item_id];
-                    tool_calls.push_back(std::move(tc));
-                };
-                for (auto &item_id : func_call_order)
-                    if (func_call_args.count(item_id))
-                        push_call(item_id);
-                // safety net for calls that never appeared in an ordering event
-                for (auto &[item_id, args] : func_call_args)
-                    if (std::find(func_call_order.begin(), func_call_order.end(), item_id) == func_call_order.end())
-                        push_call(item_id);
-                if (!tool_calls.empty())
-                    reply["tool_calls"] = tool_calls;
+                    ok = false;
+                    const std::string snippet = net::error_body_snippet(sse_buf);
+                    err = snippet.empty()
+                              ? "the provider closed the stream before sending any content"
+                              : std::format("the provider closed the stream before sending any content (body: {})", snippet);
+                }
+                // a stream that stops without response.completed was cut mid-answer:
+                // keep the partial text, but fail the round so the caller retries
+                if (!json_fallback && ok && !saw_done && !terminal)
+                {
+                    ok = false;
+                    err = std::format(
+                        "the provider closed the stream before the response was complete ({} chars, no response.completed)",
+                        text.size() + reasoning.size());
+                }
                 return ok;
             }
         };
@@ -9497,6 +9794,8 @@ namespace cell
             const std::string api_base;
             CURL *curl = curl_easy_init();
             std::string proxy_;
+            // see OpenAI: one cached client per base, shared across threads
+            std::mutex mu_;
 
         public:
             static nlohmann::json body(const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, bool stream, int think_level = 0)
@@ -9680,10 +9979,15 @@ namespace cell
                 if (!net::curl_global_is_down())
                     curl_easy_cleanup(curl);
             }
-            void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
+            void set_proxy(std::string proxy)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                proxy_ = std::move(proxy);
+            }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, long *http_status = nullptr)
             {
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
@@ -9722,6 +10026,7 @@ namespace cell
 
             bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
+                std::lock_guard<std::mutex> lk(mu_);
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::vector<nlohmann::json> blocks;
@@ -16148,9 +16453,22 @@ details{break-inside:avoid}
                 std::string err;
                 bool ok = false;
                 bool retry_round = false;
+                // A child used to die on the first transport blip ("LLM request
+                // failed: Recv failure"), losing the whole stage even though a
+                // retry would have succeeded. Retry transient failures here the
+                // same way the main loop does (children run non-streaming, so a
+                // retry never duplicates partial output).
+                constexpr int kWorkerMaxAttempts = 3;
+                int attempt = 0;
                 do
                 {
                     retry_round = false;
+                    // every attempt starts from a clean slate: a failed request may
+                    // have left a partial reply behind
+                    reply = nlohmann::json{};
+                    tool_calls = nlohmann::json{};
+                    usage = nlohmann::json{};
+                    err.clear();
                     try
                     {
                         ok = worker_chat(model, think_level, messages, &tool_defs, reply, tool_calls, usage, err);
@@ -16159,6 +16477,13 @@ details{break-inside:avoid}
                     {
                         err = std::format("exception: {}", e.what());
                         ok = false;
+                    }
+                    // a 200 that carries no content and no tool call is not an
+                    // answer: treat it as a failed round (see the main loop)
+                    if (ok && tool_calls.empty() && !cell::llm::reply_has_output(reply))
+                    {
+                        ok = false;
+                        err = "the model returned an empty reply (no content, no tool calls)";
                     }
                     if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err))
                     {
@@ -16175,6 +16500,19 @@ details{break-inside:avoid}
                             retry_round = true;
                             continue;
                         }
+                    }
+                    if (!ok && cell::net::transient_failure(0, err) && attempt + 1 < kWorkerMaxAttempts)
+                    {
+                        ++attempt;
+                        const int delay_ms = 1000 * (1 << (attempt - 1)); // 1s, 2s
+                        cell::sys::logger::instance().warn("teamwork",
+                            std::format("worker_request_failed worker={} attempt={}/{} err={} -> retrying in {}ms",
+                                        result.name, attempt, kWorkerMaxAttempts, err.empty() ? "n/a" : err, delay_ms));
+                        post_progress(job, result.name, "retry",
+                                      std::format("worker {}: transient request failure ({}) — retrying ({}/{})",
+                                                  result.name, err.empty() ? "unknown error" : err, attempt + 1, kWorkerMaxAttempts));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                        retry_round = true;
                     }
                 } while (retry_round);
                 if (!ok)
@@ -17057,7 +17395,7 @@ details{break-inside:avoid}
 static void print_usage(const char *prog)
 {
     cell::sys::println("usage: {} [options]", prog);
-    cell::sys::println("  --provider NAME             select an existing provider, or create one (style = NAME)");
+    cell::sys::println("  --provider NAME             select an existing provider, or create one (NAME = openai-chat|openai-responses|anthropic also picks the API style)");
     cell::sys::println("  --base URL                   api base url for the current provider");
     cell::sys::println("  --model MODEL                default model name");
     cell::sys::println("  --proxy URL                  http(s) proxy for the current provider");
@@ -18909,6 +19247,91 @@ static int run_selftest()
         R.expect(sse_buf.size() < 64 * 1024, "sse_feed compacts consumed prefix");
     }
 
+    {
+        // stream liveness: the "[DONE]" sentinel is what distinguishes a
+        // finished stream from a connection that died after the last token.
+        // Without this flag a truncated 200 looked exactly like an empty answer.
+        std::string buf = "data: {\"a\":1}\n\n";
+        size_t base = 0;
+        bool done = false;
+        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data(), buf.size()),
+                            [](const nlohmann::json &) {}, &done);
+        R.expect(!done, "sse: a stream without [DONE] is reported as unterminated");
+        const std::string tail = "data: [DONE]\r\n\r\n";
+        buf += tail;
+        cell::llm::sse_feed(buf, base, std::span<const char>(buf.data() + buf.size() - tail.size(), tail.size()),
+                            [](const nlohmann::json &) {}, &done);
+        R.expect(done, "sse: a CRLF [DONE] sentinel is reported to the client");
+        // and the sentinel must not be delivered as an event
+        std::string buf2 = "data: [DONE]\n\n";
+        size_t base2 = 0;
+        size_t events = 0;
+        cell::llm::sse_feed(buf2, base2, std::span<const char>(buf2.data(), buf2.size()),
+                            [&](const nlohmann::json &) { ++events; });
+        R.expect(events == 0, "sse: [DONE] is never delivered as an event");
+    }
+
+    {
+        // transient vs deterministic failure: one rule shared by the turn loop
+        // and the teamwork child loop (a child used to die on the first blip)
+        using cell::net::transient_failure;
+        R.expect(transient_failure(0, "Recv failure: Connection was reset"), "retry: a transport reset is transient");
+        R.expect(transient_failure(0, "Timeout was reached"), "retry: a timeout is transient");
+        R.expect(transient_failure(0, "the model returned an empty reply (no content, no tool calls)"),
+                 "retry: an empty reply is transient");
+        R.expect(transient_failure(0, "Operation timed out after 300001 milliseconds with 0 bytes received"),
+                 "retry: a stalled transfer is transient");
+        R.expect(transient_failure(429, ""), "retry: 429 is transient");
+        R.expect(transient_failure(408, ""), "retry: 408 is transient");
+        R.expect(transient_failure(409, ""), "retry: 409 is transient");
+        R.expect(transient_failure(425, ""), "retry: 425 is transient");
+        R.expect(transient_failure(500, ""), "retry: 500 is transient");
+        R.expect(transient_failure(502, ""), "retry: 502 is transient");
+        R.expect(transient_failure(503, ""), "retry: 503 is transient");
+        R.expect(transient_failure(529, ""), "retry: 529 is transient");
+        R.expect(!transient_failure(400, "HTTP error 400 (POST x): bad request"), "retry: 400 is deterministic");
+        R.expect(!transient_failure(401, "HTTP error 401 (POST x): invalid key"), "retry: 401 is deterministic");
+        R.expect(!transient_failure(404, "HTTP error 404 (POST x): no such model"), "retry: 404 is deterministic");
+        // no status reported (a teamwork child): the message decides
+        R.expect(!transient_failure(0, "HTTP error 400 (POST http://x): bad request"),
+                 "retry: an embedded 400 is deterministic even without a status");
+        R.expect(transient_failure(0, "HTTP error 503 (POST http://x): overloaded"),
+                 "retry: an embedded 5xx stays transient");
+        R.expect(transient_failure(0, ""), "retry: an unexplained failure stays retryable");
+    }
+
+    {
+        // an endpoint that ignores "stream": true answers with one plain
+        // completion body; parsing it is the difference between a real answer
+        // and a silently empty turn
+        nlohmann::json reply, calls, usage;
+        std::string perr;
+        const std::string body = R"({"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}})";
+        R.expect(cell::llm::parse_chat_completion(body, reply, calls, usage, perr),
+                 "plain completion body is accepted as a stream fallback");
+        R.expect(cell::llm::content_text(reply["content"]) == "hello", "plain completion body keeps its text");
+        R.expect(usage_total(usage).value_or(0) == 5, "plain completion body keeps its usage");
+        R.expect(!cell::llm::parse_chat_completion("{\"error\":{\"message\":\"nope\"}}", reply, calls, usage, perr),
+                 "a body without choices is rejected");
+        R.expect(!cell::llm::parse_chat_completion("<html>502</html>", reply, calls, usage, perr),
+                 "a non-JSON body is rejected rather than crashing");
+        R.expect(!cell::llm::parse_chat_completion("{\"choices\":[]}", reply, calls, usage, perr),
+                 "an empty choices array is rejected");
+
+        // and the empty-vs-answer classification the turn loop relies on
+        R.expect(!cell::llm::reply_has_output(nlohmann::json{{"role", "assistant"}, {"content", nullptr}}),
+                 "empty reply: null content is no output");
+        R.expect(!cell::llm::reply_has_output(nlohmann::json{{"role", "assistant"}, {"content", ""}}),
+                 "empty reply: empty string is no output");
+        R.expect(!cell::llm::reply_has_output(nlohmann::json{{"role", "assistant"}, {"content", nlohmann::json::array()}}),
+                 "empty reply: an empty block array is no output");
+        R.expect(cell::llm::reply_has_output(nlohmann::json{{"role", "assistant"}, {"content", "x"}}),
+                 "empty reply: text counts as output");
+        R.expect(cell::llm::reply_has_output(nlohmann::json{{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "r"}}})}}),
+                 "empty reply: a reasoning-only answer still counts as output");
+        R.expect(!cell::llm::reply_has_output(nlohmann::json()), "empty reply: a null reply is no output");
+    }
+
     // walk_entries: shared lazy walker used by rg/glob/find
     {
         R.expect(cell::box::mkdir("walk_dir"), "walk dir");
@@ -20412,6 +20835,23 @@ static int run_selftest()
         R.expect(mc_openai.size() == 1 && mc_openai[0].first == "https://api.anthropic.com/models" && !mc_openai[0].second,
                  "model list candidates: openai style has no fallback");
     }
+    // api style names: the same tokens /provide add, /model api_style: and
+    // --provider accept, so a CLI launch can pin the Responses wire format
+    {
+        using cell::config::provider_entry;
+        R.expect(provider_entry::parse_api_style("openai") == "openai-chat", "api_style alias: openai -> openai-chat");
+        R.expect(provider_entry::parse_api_style("OpenAI-Chat") == "openai-chat", "api_style alias: case-insensitive");
+        R.expect(provider_entry::parse_api_style("openai-responses") == "openai-responses", "api_style alias: openai-responses kept");
+        R.expect(provider_entry::parse_api_style("anthropic") == "anthropic", "api_style alias: anthropic kept");
+        R.expect(provider_entry::parse_api_style("ollama").empty(), "api_style alias: an unknown name is no style");
+        provider_entry pe;
+        pe.set_api_style("openai-responses");
+        R.expect(pe.api_style == "openai-responses" && pe.style == "openai-responses", "set_api_style: responses case");
+        pe.set_api_style("openai-chat");
+        R.expect(pe.api_style == "openai-chat" && pe.style == "openai", "set_api_style: chat case");
+        pe.set_api_style("anthropic");
+        R.expect(pe.api_style == "anthropic" && pe.style == "anthropic", "set_api_style: anthropic case");
+    }
     cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
     auto legacy_res = cell::config::load();
     R.expect(legacy_res.has_value() && legacy_res->providers.size() == 1 && legacy_res->providers[0].style == "anthropic" && legacy_res->providers[0].name == "anthropic", "config legacy flat load");
@@ -21423,6 +21863,10 @@ namespace cell
             std::function<void(std::string_view)> on_reason;  // reasoning delta
             std::function<void(std::string_view)> on_summary; // compaction summary delta
             std::function<void()> on_answer_begin;            // first answer delta of a round
+            // a request is being retried: whatever the previous attempt streamed
+            // has been discarded, so a frontend may close/clear that line before
+            // the retry's output begins (the engine never re-sends it)
+            std::function<void()> on_attempt_reset;
             std::function<void(long long)> on_progress;       // ~500ms while waiting for the first token
             std::function<void(std::string_view)> on_status;  // informational line (retry, compact, ...)
             std::function<void(std::string_view)> on_error;   // error line
@@ -22250,9 +22694,13 @@ namespace cell
                 auto t0 = cell::sys::detail::clock::now();
                 ui.t0 = t0;
                 xfer_ctx xc{&ui, &ev};
-                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries (attempt resets on success)
+                // retry loop for LLM requests: up to 5 attempts, with backoff
+                // between them (5s, 10s, 20s, 30s: a network blip clears fast, a
+                // throttled or restarting provider gets room to recover); the
+                // attempt counter resets as soon as a round succeeds
                 constexpr int kMaxRetries = 5;
-                constexpr double kRetryDelaySec = 5.0;
+                constexpr double kRetryBaseDelaySec = 5.0;
+                constexpr double kRetryMaxDelaySec = 30.0;
                 bool ok = false;
                 std::string err;
                 int attempt = 0;
@@ -22279,10 +22727,19 @@ namespace cell
                 {
                     if (attempt > 0)
                     {
-                        log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, kRetryDelaySec, cfg_.model_label(), rounds));
+                        // whatever the failed attempt streamed is about to be
+                        // thrown away: close that line FIRST, so the retry notice
+                        // below does not run into the discarded partial text
+                        if (ev.on_attempt_reset)
+                            ev.on_attempt_reset();
+                        // exponential backoff with a ceiling: 5s, 10s, 20s, 30s
+                        double delay = kRetryBaseDelaySec * (double)(1 << (attempt - 1));
+                        if (delay > kRetryMaxDelaySec)
+                            delay = kRetryMaxDelaySec;
+                        log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, delay, cfg_.model_label(), rounds));
                         if (ev.on_status)
-                            ev.on_status(std::format("[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries));
-                        std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
+                            ev.on_status(std::format("[retrying in {:.0f}s... attempt {}/{}]", delay, attempt + 1, kMaxRetries));
+                        std::this_thread::sleep_for(std::chrono::milliseconds((long long)(delay * 1000)));
                         // reset UI state for retry
                         reset_stream_state();
                     }
@@ -22324,6 +22781,18 @@ namespace cell
                     // the reply now exists on every path (success, cancel, error):
                     // stamp it before the overflow retry below may reset it
                     tag_reply();
+                    // A request that "succeeded" but carried neither content nor
+                    // a tool call is a blank turn: the provider accepted the call
+                    // and then said nothing (a stream that died between the
+                    // headers and the first token, a proxy that swallowed the
+                    // body, a model that emitted only an empty finish chunk).
+                    // Ending the turn on it looks like the agent ignored the
+                    // user, so treat it as transient: retry, then report it.
+                    if (ok && tool_calls.empty() && !llm::reply_has_output(reply))
+                    {
+                        ok = false;
+                        err = "the model returned an empty reply (no content, no tool calls)";
+                    }
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
                     if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
@@ -22335,8 +22804,9 @@ namespace cell
                         cell::box::reset_read_log(h_.box_context());
                         h_.now().unload();
                         cell::async_io::flush();
+                        if (ev.on_attempt_reset)
+                            ev.on_attempt_reset();
                         reset_stream_state();
-                        compacted_this_round = true;
                         // the transcript just shrank: re-baseline the per-turn
                         // stats, otherwise the delta below underflows size_t
                         before = h_.now().msg().size();
@@ -22361,10 +22831,14 @@ namespace cell
                     }
                     if (ok)
                     {
-                        // success: reset attempt count and break out of retry loop
-                        attempt = 0;
+                        // success: leave the retry loop. `attempt` still counts the
+                        // requests this round actually spent (a round that needed
+                        // two retries reports attempts=3), and the time to first
+                        // token is measured from THIS attempt's start — measuring
+                        // it from the round's start reported the backoff as if it
+                        // were model latency.
                         double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                        double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
+                        double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(ui.t0, ui.tok0) / 1000.0;
                         log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={} attempts={}",
                                                     rounds, cfg_.model_label(), (long long)h_.now().msg().size(),
                                                     usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
@@ -22385,12 +22859,12 @@ namespace cell
                             ev.on_round_end(rv);
                         break;
                     }
-                    // request failed: retry only transient failures. A 4xx other
-                    // than 408/409/429 is deterministic (bad request, model or
-                    // base, auth, validation) — retrying it only burns 5s per
-                    // attempt; transport aborts report 0 here and stay retryable
-                    bool retryable = !(http_status >= 400 && http_status < 500 &&
-                                       http_status != 408 && http_status != 409 && http_status != 429);
+                    // request failed: retry only transient failures. 4xx other than
+                    // 408/409/425/429 is deterministic (bad request, model or base,
+                    // auth, validation) — retrying it only burns an attempt and the
+                    // user's time; transport aborts, 5xx and an empty reply stay
+                    // retryable. See net::transient_failure.
+                    bool retryable = cell::net::transient_failure(http_status, err);
                     if (retryable && attempt < kMaxRetries - 1)
                     {
                         log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg_.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
@@ -22926,7 +23400,16 @@ int repl::run()
         {
             cell::config::provider_entry ne;
             ne.name = provider_arg;
-            ne.style = provider_arg; // "openai" | "anthropic" style, matched by name
+            // The name doubles as the API style: "openai" / "openai-chat" /
+            // "openai-responses" / "anthropic" pin the wire format, any other
+            // name just labels the provider (chat-completions by default).
+            // Without this, `--provider openai-responses` silently created a
+            // chat-completions provider and posted Chat bodies to /v1/responses.
+            if (const std::string canonical = cell::config::provider_entry::parse_api_style(provider_arg);
+                !canonical.empty())
+                ne.set_api_style(canonical);
+            else
+                ne.style = provider_arg; // "openai" | "anthropic" style, matched by name
             ne.normalize_api_style();
             cfg.providers.push_back(std::move(ne));
             cfg.current_provider = provider_arg;
@@ -23247,6 +23730,11 @@ int repl::run()
     {
         bool got = false, timer_line = false, tok_line = false, reason_active = false;
         long long toks = 0, last_cnt_ms = 0;
+        // bytes written for the current attempt and how many of them were
+        // newlines: a retry can erase a single-line partial answer instead of
+        // letting it run into the next attempt's text
+        size_t chars = 0;
+        long long newlines = 0;
         cell::sys::detail::clock::time_point tok0;
         cell::sys::color summary_color = cell::sys::color::cyan;
     } tui;
@@ -23264,6 +23752,16 @@ int repl::run()
             }
             tui.timer_line = false;
             tui.tok_line = false;
+        }
+        // An answer that ended without a trailing newline would swallow the
+        // next line written to the terminal (an error, a retry notice, a tool
+        // echo), e.g. "[interrupted] partial output kept" glued onto the last
+        // token of a cut-short reply.
+        if (tui.got && tui.chars > 0 && tui.newlines == 0)
+        {
+            std::fwrite("\n", 1, 1, stdout);
+            std::fflush(stdout);
+            tui.newlines = 1; // close it once
         }
     };
 
@@ -23311,6 +23809,48 @@ int repl::run()
         }
         tui.got = false;
         tui.toks = 0;
+        tui.chars = 0;
+        tui.newlines = 0;
+        tui.last_cnt_ms = 0;
+    };
+    // a retried attempt throws away whatever it streamed. A single-line partial
+    // answer can be erased outright (the common case: the connection died after
+    // the first few tokens); anything longer is closed with a note saying the
+    // text above was discarded, so the retry never appears to continue it.
+    ev.on_attempt_reset = [&]()
+    {
+        // decide before clear_stream_line touches the line state: a one-line
+        // partial answer can be wiped in place, longer output cannot (it is
+        // already in the scrollback)
+        const bool any_output = tui.chars > 0 || tui.got;
+        const bool erase = tui.chars > 0 && tui.newlines == 0 && cell::sys::detail::color_enabled;
+        if (erase)
+        {
+            const std::string s = "\r\x1b[2K";
+            std::fwrite(s.data(), 1, s.size(), stdout);
+            tui.timer_line = false;
+            tui.tok_line = false;
+        }
+        else
+            clear_stream_line();
+        if (tui.reason_active)
+        {
+            std::fwrite("\n", 1, 1, stdout);
+            tui.reason_active = false;
+        }
+        if (!erase && any_output)
+        {
+            const std::string plain = "[previous attempt's output discarded]\n";
+            const std::string s = cell::sys::detail::color_enabled
+                                      ? "\x1b[2m[previous attempt's output discarded]\x1b[0m\n"
+                                      : plain;
+            std::fwrite(s.data(), 1, s.size(), stdout);
+        }
+        std::fflush(stdout);
+        tui.got = false;
+        tui.toks = 0;
+        tui.chars = 0;
+        tui.newlines = 0;
         tui.last_cnt_ms = 0;
     };
     ev.on_answer = [&](std::string_view data)
@@ -23322,6 +23862,10 @@ int repl::run()
         bool vt = stream_prologue(out);
         out.append(data.data(), data.size());
         tui.toks++;
+        tui.chars += data.size();
+        for (char c : data)
+            if (c == '\n')
+                ++tui.newlines;
         if (vt && data.back() == '\n')
         {
             long long ms = cell::sys::elapsed_ms(tui.tok0);
