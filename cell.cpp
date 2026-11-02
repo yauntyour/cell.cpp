@@ -519,8 +519,12 @@ namespace cell
         // kills the child's whole process tree and reports exit_code=130, so a
         // stop request bites in the middle of a long command instead of waiting
         // for it (or for its timeout) to finish. Empty = never cancelled.
+        // on_chunk: receives every captured block as it arrives (data, is_stderr),
+        // from the reader thread(s) — a background task tees its output into a
+        // live tail with it. Empty = capture only, no notification.
         inline bool spawn_cmd(const std::string &cmd, double timeout_s, std::string &output, int &exit_code, std::string &stderr_output,
-                              const std::filesystem::path &cwd = {}, const std::function<bool()> &cancel = {})
+                              const std::filesystem::path &cwd = {}, const std::function<bool()> &cancel = {},
+                              const std::function<void(std::string_view, bool)> &on_chunk = {})
         {
             // the child inherits our stdout: anything still buffered must go out
             // first, or the child's output can overtake ours on screen
@@ -640,13 +644,21 @@ namespace cell
                 char tmp[4096];
                 DWORD n = 0;
                 while (ReadFile(hread_out, tmp, sizeof(tmp), &n, nullptr) && n > 0)
-                    append_capped(output, tmp, (size_t)n, output_capped); });
+                {
+                    append_capped(output, tmp, (size_t)n, output_capped);
+                    if (on_chunk)
+                        on_chunk(std::string_view(tmp, (size_t)n), false);
+                } });
             std::thread reader_err([&]
                                    {
                 char tmp[4096];
                 DWORD n = 0;
                 while (ReadFile(hread_err, tmp, sizeof(tmp), &n, nullptr) && n > 0)
-                    append_capped(stderr_output, tmp, (size_t)n, stderr_capped); });
+                {
+                    append_capped(stderr_output, tmp, (size_t)n, stderr_capped);
+                    if (on_chunk)
+                        on_chunk(std::string_view(tmp, (size_t)n), true);
+                } });
             DWORD wait_ms = timeout_s > 0 ? (DWORD)(timeout_s * 1000.0) : INFINITE;
             // Wait in short slices only when someone can actually cancel: the
             // uncancellable path keeps the single exact wait (no added wakeups).
@@ -783,7 +795,7 @@ namespace cell
                     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
             }
             // drain one pipe completely; true once every write end is closed
-            auto drain = [](int fd, std::string &sink, bool &capped)
+            auto drain = [&on_chunk](int fd, std::string &sink, bool &capped, bool is_err)
             {
                 char tmp[8192];
                 for (;;)
@@ -804,6 +816,9 @@ namespace cell
                         }
                         else
                             capped = true;
+                        // the tail must stay live even after the capture cap froze
+                        if (on_chunk)
+                            on_chunk(std::string_view(tmp, (size_t)n), is_err);
                         continue;
                     }
                     return n == 0;
@@ -816,9 +831,9 @@ namespace cell
             for (;;)
             {
                 if (!eof_out)
-                    eof_out = drain(fds_out[0], output, out_capped);
+                    eof_out = drain(fds_out[0], output, out_capped, false);
                 if (!eof_err)
-                    eof_err = drain(fds_err[0], stderr_output, err_capped);
+                    eof_err = drain(fds_err[0], stderr_output, err_capped, true);
                 if (waitpid(pid, &status, WNOHANG) == pid)
                 {
                     reaped = true;
@@ -883,8 +898,8 @@ namespace cell
                 else
                     exit_code = 1;
             }
-            drain(fds_out[0], output, out_capped);
-            drain(fds_err[0], stderr_output, err_capped);
+            drain(fds_out[0], output, out_capped, false);
+            drain(fds_err[0], stderr_output, err_capped, true);
             if (out_capped)
                 output += std::format("\n[output truncated at {} bytes]", kMaxCapturedOutput);
             if (err_capped)
@@ -5992,6 +6007,7 @@ namespace cell
             return true;
         }
     } // namespace box
+
     // =========================================================================
     //  net — curl transport: the only place in this file that knows about curl.
     //  One shared handle per client; streaming requests route bytes through a
@@ -7234,6 +7250,350 @@ namespace cell
 #endif
         }
     } // namespace sys
+
+    // =========================================================================
+    //  bg — background processes, each mounted on its own thread
+    // =========================================================================
+    // exec(background=true) hands the command here instead of blocking the turn:
+    // ONE dedicated std::thread owns the process for its whole life. It is not a
+    // thread_pool job on purpose — a dev server or a watcher runs for minutes or
+    // hours, and occupying a pool slot (the pool caps at 16) would starve the
+    // turn's tool batches. The child's process tree stays owned by spawn_cmd
+    // (job object on Windows, process group on POSIX), so a kill reaps
+    // grandchildren too. Every task is visible through /tasks (CLI) and the
+    // desktop task panel, and killable from either.
+    namespace bg
+    {
+        // how much of a task's output is kept live: a running server is asked
+        // about its tail, and a chatty build must not grow the process unbounded
+        constexpr size_t kTailBytes = 64 * 1024;
+        constexpr size_t kMaxLiveTasks = 32; // concurrently mounted processes
+        constexpr size_t kMaxKeptTasks = 64; // registry entries, finished ones included
+
+        struct task
+        {
+            std::string id;      // "t1", "t2", ... unique for the process lifetime
+            std::string tid;     // mounted thread id (hex, informational)
+            std::string cmd;
+            std::string wd;
+            std::string session; // session that spawned it ("" = unknown)
+            std::chrono::steady_clock::time_point started;
+            std::atomic<bool> cancel{false};
+            std::atomic<bool> done{false}; // the thread has finished
+            std::mutex mx;                 // guards everything below
+            std::condition_variable cv;    // tid published / thread finished
+            bool tid_set = false;
+            bool running = true;
+            int exit_code = -1;
+            std::string tail; // last kTailBytes of stdout+stderr, arrival order
+        };
+
+        inline std::mutex &registry_mx()
+        {
+            static std::mutex m;
+            return m;
+        }
+        // insertion order == id order (t1, t2, ... t10): a std::map keyed by the
+        // string would sort t10 before t2
+        inline std::vector<std::shared_ptr<task>> &registry()
+        {
+            static std::vector<std::shared_ptr<task>> r;
+            return r;
+        }
+        inline long long &next_seq()
+        {
+            static long long n = 0;
+            return n;
+        }
+        inline std::function<void()> &watcher_slot()
+        {
+            static std::function<void()> w;
+            return w;
+        }
+        // The host (the desktop shell) installs a watcher to push the list to its
+        // UI; the CLI leaves it empty. Copied under the lock and called outside
+        // it, so a watcher may call back into this namespace.
+        inline void set_watcher(std::function<void()> w)
+        {
+            std::lock_guard lk(registry_mx());
+            watcher_slot() = std::move(w);
+        }
+        inline void notify_watcher()
+        {
+            std::function<void()> w;
+            {
+                std::lock_guard lk(registry_mx());
+                w = watcher_slot();
+            }
+            if (!w)
+                return;
+            try
+            {
+                w();
+            }
+            catch (...)
+            {
+            }
+        }
+        inline std::shared_ptr<task> find_task(const std::string &id)
+        {
+            std::lock_guard lk(registry_mx());
+            for (auto &t : registry())
+                if (t->id == id || (!t->tid.empty() && t->tid == id))
+                    return t;
+            return nullptr;
+        }
+        // drop the oldest finished entries once the registry is full; a running
+        // task is never dropped (the user must still be able to kill it)
+        static void prune_locked()
+        {
+            auto &reg = registry();
+            while (reg.size() > kMaxKeptTasks)
+            {
+                auto it = std::find_if(reg.begin(), reg.end(),
+                                       [](const std::shared_ptr<task> &t)
+                                       { return t->done.load(std::memory_order_acquire); });
+                if (it == reg.end())
+                    return;
+                reg.erase(it);
+            }
+        }
+        // Mount `cmd` on its own thread and return immediately. `err` explains a
+        // refusal (empty command, too many live tasks). timeout is deliberately
+        // not a parameter: a background task runs until it exits or is killed.
+        inline std::shared_ptr<task> spawn(std::string cmd, std::string wd, std::string session, std::string &err)
+        {
+            err.clear();
+            if (cmd.empty())
+            {
+                err = "exec: empty command";
+                return nullptr;
+            }
+            auto t = std::make_shared<task>();
+            {
+                std::lock_guard lk(registry_mx());
+                prune_locked();
+                size_t live = 0;
+                for (auto &x : registry())
+                    if (!x->done.load(std::memory_order_acquire))
+                        live++;
+                if (live >= kMaxLiveTasks)
+                {
+                    err = std::format("too many background tasks: {} already running (max {}); kill one with /task kill ID first",
+                                      live, kMaxLiveTasks);
+                    return nullptr;
+                }
+                t->id = std::format("t{}", ++next_seq());
+                t->cmd = std::move(cmd);
+                t->wd = std::move(wd);
+                t->session = std::move(session);
+                t->started = std::chrono::steady_clock::now();
+                registry().push_back(t);
+            }
+            std::filesystem::path run_dir;
+            if (!t->wd.empty())
+            {
+                std::string wd_s = cell::normalize_path(t->wd);
+                if (!wd_s.empty())
+                    run_dir = wd_s;
+            }
+            try
+            {
+                std::thread worker([t, run_dir]
+                        {
+                {
+                    std::lock_guard lk(t->mx);
+                    t->tid = std::format("{:x}", (unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                    t->tid_set = true;
+                }
+                t->cv.notify_all();
+                std::string out, errout;
+                int code = -1;
+                auto chunk = [t](std::string_view data, bool is_err)
+                {
+                    (void)is_err; // the tail interleaves both streams in arrival order
+                    std::lock_guard lk(t->mx);
+                    t->tail.append(data);
+                    if (t->tail.size() > kTailBytes)
+                        t->tail.erase(0, t->tail.size() - kTailBytes);
+                };
+                // timeout 0 = no deadline; the cancel flag is what ends a task that
+                // never finishes (spawn_cmd polls it every ~50ms and kills the tree)
+                cell::plat::spawn_cmd(t->cmd, 0.0, out, code, errout, run_dir,
+                                      [t]
+                                      { return t->cancel.load(std::memory_order_acquire); },
+                                      chunk);
+                {
+                    std::lock_guard lk(t->mx);
+                    t->running = false;
+                    t->exit_code = code;
+                }
+                t->done.store(true, std::memory_order_release);
+                t->cv.notify_all();
+                cell::sys::logger::instance().info("bg", std::format("task_finished id={} exit={} cmd={}", t->id, code, t->cmd));
+                notify_watcher(); });
+                worker.detach();
+            }
+            catch (const std::exception &e)
+            {
+                // thread creation failed (resource exhaustion): never leave the
+                // registry holding a task that nothing will ever finish
+                {
+                    std::lock_guard lk(t->mx);
+                    t->running = false;
+                    t->exit_code = -1;
+                }
+                t->done.store(true, std::memory_order_release);
+                err = std::format("cannot mount a background thread: {}", e.what());
+                cell::sys::logger::instance().warn("bg", std::format("task_spawn_failed id={} err={}", t->id, e.what()));
+                return nullptr;
+            }
+            // publish the thread id before returning, so the caller can print it
+            // (bounded: the thread sets it as its first statement)
+            {
+                std::unique_lock lk(t->mx);
+                t->cv.wait_for(lk, std::chrono::milliseconds(500), [&t]
+                               { return t->tid_set; });
+            }
+            cell::sys::logger::instance().info("bg", std::format("task_started id={} tid={} cmd={}", t->id, t->tid, t->cmd));
+            notify_watcher();
+            return t;
+        }
+        // Kill one task's whole process tree and wait (bounded) for its thread to
+        // finish. Returns a human-readable result either way.
+        inline std::string kill(const std::string &id)
+        {
+            auto t = find_task(id);
+            if (!t)
+                return std::format("no such task: {} (see /tasks)", id);
+            if (t->done.load(std::memory_order_acquire))
+            {
+                std::lock_guard lk(t->mx);
+                return std::format("task {} already finished (exit={})", t->id, t->exit_code);
+            }
+            t->cancel.store(true, std::memory_order_release);
+            std::unique_lock lk(t->mx);
+            bool stopped = t->cv.wait_for(lk, std::chrono::seconds(5), [&t]
+                                          { return t->done.load(std::memory_order_acquire); });
+            if (!stopped)
+                return std::format("kill requested for {} — the process tree did not report back within 5s", t->id);
+            return std::format("task {} killed (exit={})", t->id, t->exit_code);
+        }
+        // snapshot for the CLI table and the desktop panel; `tail_bytes` caps how
+        // much output each entry carries (0 = no output)
+        inline nlohmann::json list_json(size_t tail_bytes = 4096)
+        {
+            nlohmann::json arr = nlohmann::json::array();
+            std::lock_guard lk(registry_mx());
+            auto now = std::chrono::steady_clock::now();
+            for (auto &t : registry())
+            {
+                std::lock_guard tl(t->mx);
+                double elapsed = std::chrono::duration<double>(now - t->started).count();
+                nlohmann::json e = {{"id", t->id},
+                                    {"tid", t->tid},
+                                    {"cmd", t->cmd},
+                                    {"wd", t->wd},
+                                    {"session", t->session},
+                                    {"running", t->running},
+                                    {"exit", t->running ? -1 : t->exit_code},
+                                    {"elapsed", elapsed}};
+                if (tail_bytes)
+                {
+                    std::string tail = t->tail;
+                    if (tail.size() > tail_bytes)
+                        tail.erase(0, tail.size() - tail_bytes);
+                    e["tail"] = cell::text::utf8_safe(tail);
+                }
+                arr.push_back(std::move(e));
+            }
+            return arr;
+        }
+        inline std::string tail_of(const std::string &id, size_t max_bytes = 8192)
+        {
+            auto t = find_task(id);
+            if (!t)
+                return std::format("no such task: {} (see /tasks)", id);
+            std::lock_guard lk(t->mx);
+            std::string tail = t->tail;
+            if (tail.size() > max_bytes)
+                tail.erase(0, tail.size() - max_bytes);
+            if (tail.empty())
+                return std::format("task {} ({}) has produced no output yet", t->id, t->running ? "running" : "finished");
+            return tail;
+        }
+        inline size_t live_count()
+        {
+            std::lock_guard lk(registry_mx());
+            size_t n = 0;
+            for (auto &t : registry())
+                if (!t->done.load(std::memory_order_acquire))
+                    n++;
+            return n;
+        }
+        // cancel everything and give the threads a moment to reap their trees;
+        // called on the way out so no detached thread touches globals mid-teardown
+        inline void shutdown()
+        {
+            std::vector<std::shared_ptr<task>> all;
+            {
+                std::lock_guard lk(registry_mx());
+                all = registry();
+            }
+            for (auto &t : all)
+                if (!t->done.load(std::memory_order_acquire))
+                    t->cancel.store(true, std::memory_order_release);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            for (auto &t : all)
+            {
+                std::unique_lock lk(t->mx);
+                t->cv.wait_until(lk, deadline, [&t]
+                                 { return t->done.load(std::memory_order_acquire); });
+            }
+        }
+        // ---- rendering (CLI) ------------------------------------------------
+        static std::string fmt_elapsed(double sec)
+        {
+            long long s = (long long)sec;
+            if (s < 60)
+                return std::format("{}s", s);
+            if (s < 3600)
+                return std::format("{}m{:02d}s", s / 60, s % 60);
+            return std::format("{}h{:02d}m", s / 3600, (s % 3600) / 60);
+        }
+        static std::string one_line(std::string s)
+        {
+            for (auto &c : s)
+                if (c == '\n' || c == '\r' || c == '\t')
+                    c = ' ';
+            if (s.size() > 72)
+                s = s.substr(0, 69) + "...";
+            return s;
+        }
+        // the /tasks table: one row per task, id first (that is what /task kill takes)
+        inline std::string list_text()
+        {
+            auto arr = list_json(0);
+            if (arr.empty())
+                return "  (no background tasks)\n";
+            std::string out = "  id    thread    state     elapsed  exit  command\n";
+            for (auto &e : arr)
+            {
+                bool running = e.value("running", false);
+                int code = e.value("exit", -1);
+                out += std::format("  {:<5} {:<9} {:<9} {:<8} {:<5} {}\n",
+                                   e.value("id", ""),
+                                   e.value("tid", ""),
+                                   running ? "running" : "finished",
+                                   fmt_elapsed(e.value("elapsed", 0.0)),
+                                   running ? "-" : std::to_string(code),
+                                   one_line(e.value("cmd", "")));
+            }
+            out += std::format("  {} task(s), {} running — /task kill ID stops one, /task show ID prints its output\n",
+                               (long long)arr.size(), (long long)live_count());
+            return out;
+        }
+    } // namespace bg
     // RAII: release every cross-session file claim taken under `token` when the
     // scope exits, whatever the exit path (natural end, cancel, error). Shared
     // by an agent turn and a teamwork run — a claim never outlives its loop.
@@ -17732,6 +18092,10 @@ static void print_help()
     cell::sys::println("  /notices seen clear         archive seen.jsonl to saved/notice-<UTC time>.jsonl and empty it");
     cell::sys::println("  /notices seen rm ID         delete one accumulated notice by id");
     cell::sys::println("  /save                       save the current session");
+    cell::sys::println("  /tasks                      list background tasks (processes started by exec with background=true)");
+    cell::sys::println("  /tasks show ID              print the captured output tail of a background task");
+    cell::sys::println("  /task kill ID               stop a background task (kills its whole process tree)");
+    cell::sys::println("  /task show ID               same as /tasks show ID");
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
     cell::sys::println("  /exit | /quit               exit");
@@ -17897,18 +18261,52 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    j.value("file_type", ""), j.value("count_only", false));
             return out;
         });
-    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input. High-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) require a second confirmation.",
+    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input. High-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) require a second confirmation.\n"
+                "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). Progress is not reported back automatically — poll /tasks or its output tail.",
         {{"cmd", str_prop("shell command to execute")},
-         {"timeout", num_prop("timeout in seconds, default 30, max 300")},
-         {"wd", str_prop("working directory for the command (optional, defaults to cwd)")}},
+         {"timeout", num_prop("timeout in seconds, default 30, max 300 (ignored when background=true)")},
+         {"wd", str_prop("working directory for the command (optional, defaults to cwd)")},
+         {"background", bool_prop("run as a background task on its own thread and return immediately with a task id (default false = block until the command exits)")}},
         {"cmd"}, Policy::Ask, ToolKind::Exec,
         [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
         {
+            cell::ToolOutput out;
+            // background: same gate, different execution model — the process is
+            // mounted on its own thread and the tool returns at once. The sandbox
+            // check runs HERE because box::exec (which normally does it) is not
+            // on this path.
+            if (j.value("background", false))
+            {
+                const std::string cmd = j.value("cmd", "");
+                if (!cell::box::check(cmd))
+                {
+                    out.ok = false;
+                    out.text = "exec blocked by sandbox: the command references a protected path (credential store or cell runtime file).\nexitcode=1";
+                    return out;
+                }
+                std::string err;
+                auto task = cell::bg::spawn(cmd, j.value("wd", ""),
+                                            rt.session_id ? rt.session_id() : std::string(), err);
+                if (!task)
+                {
+                    out.ok = false;
+                    out.text = std::format("{}\nexitcode=1", err);
+                    return out;
+                }
+                std::string wd_shown = task->wd.empty() ? std::string("(cwd)") : task->wd;
+                out.ok = true;
+                out.text = std::format(
+                    "started background task {} on thread {}\n"
+                    "cmd: {}\n"
+                    "wd: {}\n"
+                    "It keeps running after this tool returns (no timeout). Check it with /tasks, read its output with /task show {}, stop it with /task kill {} — the desktop task panel lists the same tasks.\nexitcode=0",
+                    task->id, task->tid, cmd, wd_shown, task->id, task->id);
+                return out;
+            }
             double timeout = dbl_arg(j, "timeout", 30.0);
             if (!(timeout > 0) || timeout > 300)
                 timeout = 30.0;
             int exit_code = 1;
-            cell::ToolOutput out;
             out.ok = cell::box::exec(j.value("cmd", ""), timeout, out.text, exit_code, j.value("wd", ""), rt.cancelled);
             out.text += std::format("exitcode={}", exit_code);
             return out;
@@ -23952,6 +24350,9 @@ int repl::run()
         // a background teamwork run may still be in flight: stop it and join its
         // runner BEFORE the tool pool (its parallel stage workers live there)
         cell::teamwork::bg_shutdown();
+        // background exec tasks own detached threads: cancel them and give the
+        // process trees a moment to die before the globals they touch go away
+        cell::bg::shutdown();
         cell::sys::pool().shutdown(); // join tool workers before curl cleanup
         for (auto &t : probe_threads) // curl handles may be in flight on these threads
             if (t.joinable())
@@ -24509,6 +24910,40 @@ int repl::run()
             {"/help", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
              {
                  print_help();
+                 return cmd_flow::handled;
+             }},
+            {"/tasks", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+             {
+                 // background processes mounted by exec(background=true): one
+                 // dedicated thread per task, none of them a thread-pool slot
+                 if (toks.size() >= 3 && (toks[1] == "show" || toks[1] == "output"))
+                 {
+                     cell::sys::print("{}", cell::bg::tail_of(toks[2]));
+                     return cmd_flow::handled;
+                 }
+                 if (toks.size() >= 2 && toks[1] != "list")
+                 {
+                     cell::sys::error("usage: /tasks | /tasks show ID | /task kill ID   (see /tasks)");
+                     return cmd_flow::handled;
+                 }
+                 cell::sys::print("{}", cell::bg::list_text());
+                 return cmd_flow::handled;
+             }},
+            {"/task", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+             {
+                 // /task kill THREAD_ID | /task show THREAD_ID — the id is the one
+                 // /tasks prints first (t1, t2, ...); the mounted thread id works too
+                 if (toks.size() < 3)
+                 {
+                     cell::sys::error("usage: /task kill THREAD_ID | /task show THREAD_ID   (ids come from /tasks)");
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "kill" || toks[1] == "stop" || toks[1] == "rm")
+                     cell::sys::println("{}", cell::bg::kill(toks[2]));
+                 else if (toks[1] == "show" || toks[1] == "output" || toks[1] == "log")
+                     cell::sys::print("{}", cell::bg::tail_of(toks[2]));
+                 else
+                     cell::sys::error("usage: /task kill THREAD_ID | /task show THREAD_ID   (ids come from /tasks)");
                  return cmd_flow::handled;
              }},
             {"/save", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
