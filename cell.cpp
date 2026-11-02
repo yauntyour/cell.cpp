@@ -43,6 +43,19 @@
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 #include <cerrno>
+#include <array>
+#include <bit>
+#include <condition_variable>
+#include <deque>
+#include <flat_map>
+#include <map>
+#include <ranges>
+#include <set>
+
+// FlowLink's transport (header-only Boost.Asio). It must be included at global
+// scope — never inside `namespace cell` — so boost keeps its own namespace.
+#include <boost/asio.hpp>
+#include <boost/asio/ip/multicast.hpp>
 #include <cstdint>
 #ifdef _WIN32
 #include <conio.h>
@@ -62,11 +75,11 @@
 #endif
 #endif
 
-// FlowLink — the peer network (UDP discovery, pairing codes, end-to-end
-// encrypted messaging, remote cells). It lives in the CORE, not in a frontend:
-// the CLI and the desktop shell mount the same service and use the same
-// commands. Header-only; nothing is constructed until cell::link::enable().
-#include "flowlink.hpp"
+// FlowLink — the peer network — lives further down in this file, in one
+// contiguous region right before `namespace link`. It needs nothing from the
+// core below it, and keeping the protocol, its on-disk store and the /link
+// bridge together is what makes the feature readable in a single-file core.
+
 
 // Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
 // Never throws and never returns a wrapped-around value: strtoull reports ERANGE
@@ -266,6 +279,42 @@ std::vector<uint8_t> base64_decode(const std::string &encoded)
     }
     return out;
 }
+
+// =============================================================================
+//  FILE MAP — cell.cpp is the whole core, deliberately one translation unit.
+//
+//  Regions, in file order (each opens with a `// ===` banner):
+//
+//    helpers            num_arg / base64 / small string utilities
+//    cell::chat         session + history forward declarations
+//    cell::teamwork     job model
+//    cell::plat         platform adapters (paths, processes, permissions)
+//    cell::async_io     one writer thread for every transcript write
+//    cell::text         trimming, splitting, width-aware helpers
+//    cell::box          sandbox / permission policy
+//    cell::claims       the claim system (who may touch what)
+//    cell::net          HTTP + SSE client (libcurl)
+//    cell::sys          logger, console, signals
+//    cell::bg           background process registry
+//    cell::config       config.json (agent settings only — no FlowLink keys)
+//    cell::encrypt      the API-key vault
+//    cell::flowlink     FlowLink: discovery, pairing, transfers, remote turns
+//    cell::link         the /link bridge the frontends mount FlowLink through
+//    cell::tools        the tool runtime and every host tool
+//    cell::llm          provider adapters + request/response shaping
+//    cell::chat         transcripts, compaction, archives
+//    cell::skills       skill discovery and injection
+//    cell::stats        token/usage accounting
+//    cell::notice       cross-session notices
+//    cell::teamwork     job execution (sub-agents, stages, gates)
+//    selftest           the in-process test suites (--smoke*)
+//    cell::engine       the turn runner — the only place a turn executes
+//    main               CLI, REPL, HTTP bridge
+//
+//  FlowLink is a feature, not a layer: everything it owns (protocol, store,
+//  remote workspaces) sits in one contiguous region, and nothing above it
+//  depends on it. That is why it can be read — and tested — on its own.
+// =============================================================================
 namespace cell
 {
     // forward declarations: tools::runtime (below) refers to the live session
@@ -7767,16 +7816,10 @@ namespace cell
             size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
             // ---- FlowLink（局域网互联）--------------------------------------
-            // 服务本体在核心里（flowlink.hpp），CLI 与桌面外壳共用同一份设置，
-            // 所以它存在 config.json 而不是某个前端的偏好文件里。默认关闭：
-            // 不开就不挂载服务，不开端口、不起线程。
-            bool link_enabled = false;   // 进程启动时是否自动挂载
-            std::string link_name;       // 设备名（空 = 主机名）
-            int link_port = 47822;       // TCP 传输端口
-            int link_discovery = 47821;  // UDP 发现端口
-            bool link_announce = true;   // 广播自身，允许被同网段发现
-            bool link_accept = false;    // 接受远程 tw 作业与远程文件读取
-            std::string link_workspace;  // 远程作业落地目录（空 = 当前工作目录）
+            // FlowLink 的设置（开关、端口、信任的设备、工作区列表）不在
+            // config.json 里：它们属于那个功能自己，存在 .cell/links/links.json
+            // （见 flowlink::store / cell::link::settings）。config.json 只留
+            // 每个前端各自关心的东西。
 
             // An empty current_provider means "the first provider is active"; a
             // non-empty name that matches nothing means the user's selection is
@@ -8010,14 +8053,8 @@ namespace cell
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
                             s.active_sessions[k] = v.get<std::string>();
-                // FlowLink：端口来自手改过的文件也要夹到合法范围
-                s.link_enabled = json_bool(j, "link_enabled", false);
-                s.link_name = json_str(j, "link_name", "");
-                s.link_port = std::clamp((int)num_arg(j, "link_port", 47822), 0, 65535);
-                s.link_discovery = std::clamp((int)num_arg(j, "link_discovery", 47821), 0, 65535);
-                s.link_announce = json_bool(j, "link_announce", true);
-                s.link_accept = json_bool(j, "link_accept", false);
-                s.link_workspace = json_str(j, "link_workspace", "");
+                // 旧版把 FlowLink 设置写在 config.json 里：搬家由
+                // cell::link::migrate_legacy_settings() 一次完成，这里只读新位置。
             }
             catch (const std::exception &e)
             {
@@ -8054,13 +8091,6 @@ namespace cell
             if (track_active && !s.session_id.empty())
                 s.active_sessions[cwd_id()] = s.session_id;
             j["active_sessions"] = s.active_sessions;
-            j["link_enabled"] = s.link_enabled;
-            j["link_name"] = s.link_name;
-            j["link_port"] = s.link_port;
-            j["link_discovery"] = s.link_discovery;
-            j["link_announce"] = s.link_announce;
-            j["link_accept"] = s.link_accept;
-            j["link_workspace"] = s.link_workspace;
             // atomic replace: a crash mid-save can no longer truncate config.json.
             // that mattered: a failed load falls back to defaults, and the next save
             // would then persist an empty provider list over the real one.
@@ -8466,6 +8496,3137 @@ namespace cell
     } // namespace encrypt
 
     // =========================================================================
+    //  FlowLink — the peer network (UDP discovery, pairing, end-to-end
+    //  encrypted messaging, remote cells and remote workspaces).
+    //
+    //  Map of this region (in file order):
+    //    1  protocol constants + JSON readers that never throw
+    //    2  small utilities (ids, base62 pairing codes, time, platform info)
+    //    3  crypto (hash / HKDF / X25519 / Argon2id / AEAD)
+    //    4  sealed key files (Argon2id + AES-256-GCM, like the API-key vault)
+    //    5  records and the on-disk store (.cell/links/…)
+    //    6  conn — framing + handshake
+    //    7  impl — discovery, sessions, rpc dispatch
+    //    8  service — the public face (pimpl)
+    //
+    //  Nothing here is constructed until cell::link::enable() runs: no thread,
+    //  no socket, no allocation. `namespace link` right below is the bridge the
+    //  frontends use (/link, the desktop FlowLink page, the fl tool).
+    // =========================================================================
+
+    //     cell A  <-- UDP discovery (broadcast + multicast) -->  cell B
+    //     cell A  <-- TCP, X25519 + Argon2id pairing code ---->  cell B
+    //             <-- XChaCha20-Poly1305 on every frame ---->
+    //
+    //  Design notes
+    //  ------------
+    //  * The service is OPT-IN and mounted on demand: nothing here is constructed
+    //    (no thread, no socket, no allocation) until cell::link::enable() runs.
+    //    `service` owns its own io_context, so it never shares a thread with the
+    //    agent loop, the UI or the HTTP server.
+    //
+    //  * Identity: client_id = 16 random bytes from libsodium, 32 lowercase hex
+    //    characters. It lives in `<exe dir>/.cell/links/identity.json` and is the
+    //    value the `cell` field of the tw tool carries.
+    //
+    //  * Everything FlowLink owns sits in `<exe dir>/.cell/links/`:
+    //
+    //        links/identity.json           this cell's client_id + display name
+    //        links/links.json              service settings, every paired link and
+    //                                      the user's FlowLink workspace list
+    //        links/transmission.json       index of every transfer received
+    //        links/<client_id>/.key        the sealed long-term link key (trust)
+    //        links/<client_id>/<id>.jsonl  one file per received transfer
+    //
+    //    A link is trusted exactly while `.key` exists: "disconnect" removes it
+    //    and keeps the received files, re-pairing writes a fresh one.
+    //
+    //  * Pairing (TLS-like, but with no PKI and no signatures — the pairing code
+    //    IS the credential): both sides derive the same Argon2id PSK from the
+    //    512-bit code, do an ephemeral X25519 exchange, mix both into a handshake
+    //    secret and prove it by AEAD-decrypting each other's CONFIRM frame. Only a
+    //    holder of the code can produce a valid CONFIRM, so a wrong code fails the
+    //    handshake before a single byte of data is exchanged. The initiator then
+    //    hands over the long-term link key inside the already-encrypted handshake,
+    //    and both sides store it encrypted (same Argon2id + AES-256-GCM scheme as
+    //    the API-key vault) in `.cell/links/<peer client_id>/.key`.
+    //
+    //  * Every later session ("resume") uses that link key as the PSK, so pairing
+    //    happens once per pair of cells. Ephemeral keys give each session forward
+    //    secrecy; the link key is only ever a PSK, never a traffic key.
+    //
+    //  * Frames: 4-byte big-endian length + JSON body. Before the handshake the
+    //    body is plaintext (HELLO / HELLO_ACK / CONFIRM); afterwards every frame is
+    //    an AEAD blob (`{"t":"enc","n":...,"c":...}`) — "packet encryption only",
+    //    no plaintext control channel to spoof.
+    //
+    //  * This was `flowlink.hpp` next to this file. It is part of the single
+    //    translation unit now: the core stays ONE file, so the protocol, the store
+    //    and the frontends that mount it can never drift apart at an include
+    //    boundary.
+
+    namespace flowlink
+    {
+        namespace asio = boost::asio;
+        using asio::ip::tcp;
+        using asio::ip::udp;
+        using json = nlohmann::json;
+
+        // ---- protocol constants -------------------------------------------------
+        using namespace std::chrono_literals;
+        using namespace std::string_view_literals;
+
+        inline constexpr std::string_view kProto = "CELLFLNK";
+        inline constexpr int kVersion = 1;
+        inline constexpr std::uint16_t kDefaultPort = 47822;          // TCP transport
+        inline constexpr std::uint16_t kDefaultDiscoveryPort = 47821; // UDP discovery
+        inline constexpr std::string_view kGroup = "239.255.42.71";   // multicast fallback
+        inline constexpr std::size_t kMaxFrame = 16uz * 1024uz * 1024uz; // 16 MiB
+        inline constexpr std::size_t kMaxDatagram = 1024;
+        inline constexpr std::size_t kPairingBytes = 64;              // 512-bit code
+        inline constexpr std::size_t kKeyBytes = 32;
+        inline constexpr auto kAnnouncePeriod = 5s;   // discovery beacon period
+        inline constexpr auto kPeerTtl = 30s;         // discovered peer goes offline
+        inline constexpr auto kSessionIdle = 180s;    // idle TCP session is dropped
+        inline constexpr auto kSweepPeriod = 10s;     // session/discovery sweep
+        inline constexpr auto kPairSweepPeriod = 2s;  // pairing window expiry check
+        inline constexpr int kPairTtlSeconds = 300;   // default pairing window
+        inline constexpr int kPairMaxFails = 3;       // wrong codes before the window closes
+
+        // ---- JSON readers that never throw -------------------------------------
+        // Everything arriving over the network goes through these: nlohmann's
+        // value() raises a type_error when the stored type differs from the default,
+        // and an exception escaping an asio handler would end that io thread (a
+        // remote peer could send {"port":"x"} and take the service down).
+        inline std::string jstr(const json &j, const char *key, const std::string &def = {})
+        {
+            const auto it = j.find(key);
+            return (it != j.end() && it->is_string()) ? it->get<std::string>() : def;
+        }
+        inline long long jint(const json &j, const char *key, long long def = 0)
+        {
+            const auto it = j.find(key);
+            if (it == j.end())
+                return def;
+            if (it->is_number_unsigned())
+                return (long long)it->get<unsigned long long>();
+            if (it->is_number_integer())
+                return it->get<long long>();
+            if (it->is_number_float())
+                return (long long)it->get<double>();
+            return def;
+        }
+        inline bool jbool(const json &j, const char *key, bool def = false)
+        {
+            const auto it = j.find(key);
+            return (it != j.end() && it->is_boolean()) ? it->get<bool>() : def;
+        }
+
+        // ---- small utilities ----------------------------------------------------
+        inline std::string random_bytes(std::size_t n)
+        {
+            std::string out(n, '\0');
+            if (n)
+                randombytes_buf(out.data(), n);
+            return out;
+        }
+
+        inline std::string hex_encode(std::string_view raw)
+        {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string out;
+            out.reserve(raw.size() * 2);
+            for (unsigned char c : raw)
+            {
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 0x0f]);
+            }
+            return out;
+        }
+
+        inline bool is_hex_id(std::string_view s, std::size_t len)
+        {
+            if (s.size() != len)
+                return false;
+            for (char c : s)
+                if (!std::isxdigit((unsigned char)c))
+                    return false;
+            return true;
+        }
+
+        inline std::string b64_encode(std::string_view raw)
+        {
+            if (raw.empty())
+                return {};
+            std::string out(sodium_base64_encoded_len(raw.size(), sodium_base64_VARIANT_ORIGINAL), '\0');
+            sodium_bin2base64(out.data(), out.size(), (const unsigned char *)raw.data(), raw.size(),
+                              sodium_base64_VARIANT_ORIGINAL);
+            out.resize(std::strlen(out.c_str()));
+            return out;
+        }
+
+        inline bool b64_decode(std::string_view text, std::string &out)
+        {
+            out.clear();
+            if (text.empty())
+                return false;
+            std::string buf(text.size(), '\0');
+            std::size_t len = 0;
+            if (sodium_base642bin((unsigned char *)buf.data(), buf.size(), text.data(), text.size(),
+                                  nullptr, &len, nullptr, sodium_base64_VARIANT_ORIGINAL) != 0)
+                return false;
+            buf.resize(len);
+            out = std::move(buf);
+            return true;
+        }
+
+        // base62 (0-9 A-Z a-z) — the pairing code alphabet. Big-integer conversion
+        // over a byte string; a 64-byte secret encodes to 87 characters, which the
+        // UI groups into 5-character blocks for reading out loud.
+        inline constexpr char kBase62[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+        // The alphabet read backwards, built at compile time: decoding a pairing
+        // code was a strchr() scan per character, now it is one table lookup.
+        consteval std::array<std::int8_t, 256> base62_reverse()
+        {
+            std::array<std::int8_t, 256> table{};
+            table.fill(-1);
+            for (std::int8_t i = 0; i < 62; ++i)
+                table[static_cast<unsigned char>(kBase62[static_cast<std::size_t>(i)])] = i;
+            return table;
+        }
+        inline constexpr auto kBase62Rev = base62_reverse();
+
+        inline std::string base62_encode(std::string_view raw)
+        {
+            std::vector<unsigned char> num(raw.begin(), raw.end());
+            std::string out;
+            while (!num.empty())
+            {
+                unsigned rem = 0;
+                std::vector<unsigned char> q;
+                q.reserve(num.size());
+                for (unsigned char b : num)
+                {
+                    const unsigned acc = (rem << 8) | b;
+                    const unsigned d = acc / 62u;
+                    rem = acc % 62u;
+                    if (!q.empty() || d != 0)
+                        q.push_back((unsigned char)d);
+                }
+                out.push_back(kBase62[rem]);
+                num.swap(q);
+            }
+            std::reverse(out.begin(), out.end());
+            return out.empty() ? std::string("0") : out;
+        }
+
+        inline std::optional<std::string> base62_decode(std::string_view text)
+        {
+            std::vector<unsigned char> num; // big-endian
+            for (char ch : text)
+            {
+                const auto digit = kBase62Rev[static_cast<unsigned char>(ch)];
+                if (digit < 0)
+                    return std::nullopt;
+                auto carry = static_cast<unsigned>(digit);
+                for (auto it = num.rbegin(); it != num.rend(); ++it)
+                {
+                    const unsigned acc = (unsigned)(*it) * 62u + carry;
+                    *it = (unsigned char)(acc & 0xff);
+                    carry = acc >> 8;
+                }
+                while (carry)
+                {
+                    num.insert(num.begin(), (unsigned char)(carry & 0xff));
+                    carry >>= 8;
+                }
+            }
+            return std::string(num.begin(), num.end());
+        }
+
+        // strip separators/spaces: the code is read out in blocks and often pasted
+        // with the grouping spaces intact
+        inline std::string pairing_normalize(std::string_view in)
+        {
+            std::string out;
+            out.reserve(in.size());
+            for (char c : in)
+                if (std::isalnum((unsigned char)c))
+                    out.push_back(c);
+            return out;
+        }
+
+        inline std::string pairing_code_new()
+        {
+            return base62_encode(random_bytes(kPairingBytes));
+        }
+
+        // decode a normalized code back to the fixed 64-byte secret (leading zero
+        // bytes are lost by the base conversion, so left-pad)
+        inline bool pairing_code_decode(const std::string &norm, std::string &raw)
+        {
+            if (norm.size() < 80 || norm.size() > 96)
+                return false;
+            auto bytes = base62_decode(norm);
+            if (!bytes || bytes->size() > kPairingBytes)
+                return false;
+            raw.assign(kPairingBytes - bytes->size(), '\0');
+            raw += *bytes;
+            return true;
+        }
+
+        // "ABC12 DEF34 ..." for reading out loud / typing
+        inline std::string pairing_display(const std::string &norm, std::size_t group = 5)
+        {
+            std::string out;
+            for (std::size_t i = 0; i < norm.size(); i += group)
+            {
+                if (!out.empty())
+                    out.push_back(' ');
+                out.append(norm.substr(i, std::min(group, norm.size() - i)));
+            }
+            return out;
+        }
+
+        // UTC ISO-8601, straight out of <chrono> + <format>: no tm, no strftime,
+        // no locale — the one place the old code could differ between platforms.
+        inline std::string now_iso(long long epoch = 0)
+        {
+            const auto secs = std::chrono::seconds{epoch != 0 ? epoch : static_cast<long long>(std::time(nullptr))};
+            return std::format("{:%Y-%m-%dT%H:%M:%S}Z", std::chrono::sys_seconds{secs});
+        }
+
+        inline std::string default_name()
+        {
+            for (const char *var : {"CELL_FLOWLINK_NAME", "COMPUTERNAME", "HOSTNAME"})
+                if (const char *v = std::getenv(var); v && *v)
+                    return std::string(v);
+            return "cell";
+        }
+
+        // a display name must be safe to print and to put in JSON/log lines
+        inline std::string clean_name(std::string s, std::size_t max_len = 48)
+        {
+            std::string out;
+            for (unsigned char c : s)
+            {
+                if (c < 0x20 || c == 0x7f)
+                    continue;
+                out.push_back((char)c);
+                if (out.size() >= max_len)
+                    break;
+            }
+            // trim
+            while (!out.empty() && out.front() == ' ')
+                out.erase(out.begin());
+            while (!out.empty() && out.back() == ' ')
+                out.pop_back();
+            return out;
+        }
+
+        // ---- what a peer shows about itself in the device list ------------------
+        // Plain strings, no privacy surface beyond what the user already sees on
+        // their own machine: the OS name, the IANA time zone and the UI language.
+        inline std::string os_name()
+        {
+    #ifdef _WIN32
+            return "Windows";
+    #elif defined(__APPLE__)
+            return "macOS";
+    #elif defined(__linux__)
+            return "Linux";
+    #else
+            return "unknown";
+    #endif
+        }
+
+        inline std::string tz_name()
+        {
+            if (const char *v = std::getenv("TZ"); v && *v)
+                return clean_name(v, 48);
+    #ifndef _WIN32
+            // /etc/localtime is a symlink into zoneinfo on every mainstream distro;
+            // the tail after "zoneinfo/" is the IANA name the peer displays
+            std::error_code ec;
+            const auto p = std::filesystem::read_symlink("/etc/localtime", ec);
+            if (!ec)
+            {
+                const std::string s = p.string();
+                const auto at = s.find("zoneinfo/");
+                if (at != std::string::npos)
+                    return s.substr(at + 9);
+            }
+    #endif
+            return "local";
+        }
+
+        inline std::string lang_name()
+        {
+            for (const char *var : {"LANG", "LC_ALL", "LC_MESSAGES", "CELL_LANG"})
+                if (const char *v = std::getenv(var); v && *v)
+                    return clean_name(v, 32);
+    #ifdef _WIN32
+            return "zh-CN";
+    #else
+            return "C";
+    #endif
+        }
+
+        // ---- crypto -------------------------------------------------------------
+        inline std::string sha256(std::string_view in)
+        {
+            std::string out(crypto_hash_sha256_BYTES, '\0');
+            crypto_hash_sha256((unsigned char *)out.data(), (const unsigned char *)in.data(), in.size());
+            return out;
+        }
+
+        // generic HMAC-SHA256 (libsodium's crypto_auth_hmacsha256 wants a 32-byte
+        // key; HKDF feeds it arbitrary-length ones)
+        inline std::string hmac_sha256(std::string_view key, std::string_view msg)
+        {
+            std::string k(key);
+            if (k.size() > 64)
+                k = sha256(k);
+            k.resize(64, '\0');
+            std::string ipad(64, '\0'), opad(64, '\0');
+            for (std::size_t i = 0; i < 64; i++)
+            {
+                ipad[i] = (char)(k[i] ^ 0x36);
+                opad[i] = (char)(k[i] ^ 0x5c);
+            }
+            std::string inner = ipad;
+            inner.append(msg);
+            std::string outer = opad;
+            outer += sha256(inner);
+            sodium_memzero(k.data(), k.size());
+            sodium_memzero(ipad.data(), ipad.size());
+            sodium_memzero(opad.data(), opad.size());
+            return sha256(outer);
+        }
+
+        inline std::string hkdf_extract(std::string_view salt, std::string_view ikm)
+        {
+            const std::string s = salt.empty() ? std::string(32, '\0') : std::string(salt);
+            return hmac_sha256(s, ikm);
+        }
+
+        inline std::string hkdf_expand(std::string_view prk, std::string_view info, std::size_t len)
+        {
+            std::string out, t;
+            for (unsigned char i = 1; out.size() < len; i++)
+            {
+                t = hmac_sha256(prk, t + std::string(info) + std::string(1, (char)i));
+                out += t;
+                if (i == 255)
+                    break;
+            }
+            out.resize(len);
+            return out;
+        }
+
+        // XChaCha20-Poly1305 with a random 192-bit nonce — safe for an unbounded
+        // number of frames under one key, which is exactly what a long-lived
+        // session needs.
+        inline json aead_seal(std::string_view key, std::string_view aad, std::string_view plain)
+        {
+            std::string nonce(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, '\0');
+            randombytes_buf(nonce.data(), nonce.size());
+            std::string ct(plain.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES, '\0');
+            unsigned long long clen = 0;
+            crypto_aead_xchacha20poly1305_ietf_encrypt(
+                (unsigned char *)ct.data(), &clen,
+                (const unsigned char *)plain.data(), plain.size(),
+                (const unsigned char *)aad.data(), aad.size(),
+                nullptr, (const unsigned char *)nonce.data(), (const unsigned char *)key.data());
+            ct.resize((std::size_t)clen);
+            return json{{"n", b64_encode(nonce)}, {"c", b64_encode(ct)}};
+        }
+
+        inline bool aead_open(std::string_view key, std::string_view aad, const json &sealed, std::string &out)
+        {
+            out.clear();
+            if (!sealed.is_object() || !sealed.contains("n") || !sealed.contains("c"))
+                return false;
+            if (!sealed["n"].is_string() || !sealed["c"].is_string())
+                return false;
+            std::string nonce, ct;
+            if (!b64_decode(sealed["n"].get<std::string>(), nonce) || !b64_decode(sealed["c"].get<std::string>(), ct))
+                return false;
+            if (nonce.size() != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES ||
+                ct.size() < crypto_aead_xchacha20poly1305_ietf_ABYTES)
+                return false;
+            std::string plain(ct.size(), '\0');
+            unsigned long long mlen = 0;
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    (unsigned char *)plain.data(), &mlen, nullptr,
+                    (const unsigned char *)ct.data(), ct.size(),
+                    (const unsigned char *)aad.data(), aad.size(),
+                    (const unsigned char *)nonce.data(), (const unsigned char *)key.data()) != 0)
+                return false;
+            plain.resize((std::size_t)mlen);
+            out = std::move(plain);
+            return true;
+        }
+
+        struct x25519_pair
+        {
+            std::string pub; // 32 bytes
+            std::string sec; // 32 bytes
+        };
+
+        inline x25519_pair x25519_new()
+        {
+            x25519_pair k;
+            k.pub.assign(crypto_kx_PUBLICKEYBYTES, '\0');
+            k.sec.assign(crypto_kx_SECRETKEYBYTES, '\0');
+            crypto_kx_keypair((unsigned char *)k.pub.data(), (unsigned char *)k.sec.data());
+            return k;
+        }
+
+        inline bool x25519_shared(const std::string &sec, const std::string &peer_pub, std::string &out)
+        {
+            out.clear();
+            if (sec.size() != crypto_scalarmult_curve25519_SCALARBYTES ||
+                peer_pub.size() != crypto_scalarmult_curve25519_BYTES)
+                return false;
+            std::string dh(crypto_scalarmult_curve25519_BYTES, '\0');
+            if (crypto_scalarmult((unsigned char *)dh.data(), (const unsigned char *)sec.data(),
+                                  (const unsigned char *)peer_pub.data()) != 0)
+                return false; // low-order point
+            out = std::move(dh);
+            return true;
+        }
+
+        // Argon2id — used for the pairing PSK only (never per frame: it is
+        // deliberately slow).
+        inline std::string argon2id(std::string_view pass, std::string_view salt)
+        {
+            if (salt.size() != crypto_pwhash_SALTBYTES)
+                return {};
+            std::string out(kKeyBytes, '\0');
+            if (crypto_pwhash((unsigned char *)out.data(), out.size(),
+                              pass.data(), pass.size(),
+                              (const unsigned char *)salt.data(),
+                              crypto_pwhash_OPSLIMIT_MODERATE, crypto_pwhash_MEMLIMIT_MODERATE,
+                              crypto_pwhash_ALG_ARGON2ID13) != 0)
+                return {};
+            return out;
+        }
+
+        // the pairing salt both sides can compute: derived from the two client ids,
+        // order-independent, so neither side has to send it
+        inline std::string pair_salt(const std::string &a, const std::string &b)
+        {
+            const std::string lo = std::min(a, b), hi = std::max(a, b);
+            return sha256("cell-flowlink-pair|" + lo + "|" + hi).substr(0, crypto_pwhash_SALTBYTES);
+        }
+
+        inline bool const_eq(std::string_view a, std::string_view b)
+        {
+            return a.size() == b.size() && (a.empty() || sodium_memcmp(a.data(), b.data(), a.size()) == 0);
+        }
+
+        // Owner-only permissions for a secret file, portably: Windows has no mode
+        // bits, so the read-only attribute is the closest equivalent (the ACL side
+        // is cell::plat::restrict_file_permissions' job for the vault); POSIX gets
+        // 0600 regardless of the umask.
+        inline void set_owner_only(const std::filesystem::path &p)
+        {
+    #ifdef _WIN32
+            std::error_code ec;
+            std::filesystem::permissions(p,
+                                         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                         std::filesystem::perm_options::replace, ec);
+    #else
+            ::chmod(p.c_str(), S_IRUSR | S_IWUSR);
+    #endif
+        }
+
+        // ---- sealed key files ---------------------------------------------------
+        // The link key is stored exactly like an API key in the vault: Argon2id over
+        // the master secret (`.cell/.key`, or CELL_VAULT_PASSPHRASE) with a per-file
+        // salt, then AES-256-GCM (XChaCha20-Poly1305 where AES-GCM is unavailable).
+        // Format-compatible with `cell::encrypt::crypt`, one secret per file.
+        struct sealed_file
+        {
+            static std::filesystem::path master_file(const std::filesystem::path &root) { return root / ".key"; }
+
+            static bool load_master(const std::filesystem::path &root, std::string &master)
+            {
+                if (const char *p = std::getenv("CELL_VAULT_PASSPHRASE"); p && *p)
+                {
+                    master = p;
+                    return true;
+                }
+                std::ifstream f(master_file(root), std::ios::binary);
+                if (f)
+                {
+                    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                    std::string raw;
+                    if (b64_decode(text, raw) && raw.size() == 32)
+                    {
+                        master = std::move(raw);
+                        return true;
+                    }
+                }
+                // first use: create the master secret the vault will share
+                master = random_bytes(32);
+                std::error_code ec;
+                std::filesystem::create_directories(root, ec);
+                std::ofstream out(master_file(root), std::ios::trunc | std::ios::binary);
+                if (!out.is_open())
+                    return false;
+                out << b64_encode(master);
+                const bool ok = out.good();
+                out.close();
+                // owner-only from the moment it exists
+                set_owner_only(master_file(root));
+                return ok;
+            }
+
+            static bool derive(const std::filesystem::path &root, const std::string &salt, std::string &key)
+            {
+                std::string master;
+                if (!load_master(root, master))
+                    return false;
+                key = argon2id(master, salt);
+                sodium_memzero(master.data(), master.size());
+                return key.size() == kKeyBytes;
+            }
+
+            static bool write(const std::filesystem::path &root, const std::filesystem::path &file,
+                              const std::string &plain)
+            {
+                std::string salt(crypto_pwhash_SALTBYTES, '\0');
+                randombytes_buf(salt.data(), salt.size());
+                std::string key;
+                if (!derive(root, salt, key))
+                    return false;
+                json sealed;
+                const bool aes = crypto_aead_aes256gcm_is_available() != 0;
+                if (aes)
+                {
+                    std::string nonce(crypto_aead_aes256gcm_NPUBBYTES, '\0');
+                    randombytes_buf(nonce.data(), nonce.size());
+                    std::string ct(plain.size() + crypto_aead_aes256gcm_ABYTES, '\0');
+                    unsigned long long clen = 0;
+                    crypto_aead_aes256gcm_encrypt((unsigned char *)ct.data(), &clen,
+                                                  (const unsigned char *)plain.data(), plain.size(),
+                                                  nullptr, 0, nullptr,
+                                                  (const unsigned char *)nonce.data(),
+                                                  (const unsigned char *)key.data());
+                    ct.resize((std::size_t)clen);
+                    sealed = json{{"nonce", b64_encode(nonce)}, {"ct", b64_encode(ct)}};
+                }
+                else
+                {
+                    sealed = aead_seal(key, {}, plain);
+                }
+                sodium_memzero(key.data(), key.size());
+                json doc{{"version", 2},
+                         {"kdf", "argon2id"},
+                         {"aead", aes ? "aes256gcm" : "xchacha20poly1305"},
+                         {"salt", b64_encode(salt)},
+                         {"nonce", sealed["n"]},
+                         {"ct", sealed["c"]},
+                         {"created_at", (long long)std::time(nullptr)}};
+                std::error_code ec;
+                std::filesystem::create_directories(file.parent_path(), ec);
+                std::ofstream out(file, std::ios::trunc | std::ios::binary);
+                if (!out.is_open())
+                    return false;
+                out << doc.dump(2) << "\n";
+                const bool ok = out.good();
+                out.close();
+                set_owner_only(file);
+                return ok;
+            }
+
+            static bool read(const std::filesystem::path &root, const std::filesystem::path &file, std::string &plain)
+            {
+                plain.clear();
+                std::ifstream f(file, std::ios::binary);
+                if (!f)
+                    return false;
+                json doc;
+                try
+                {
+                    doc = json::parse(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>(), nullptr, false);
+                }
+                catch (const std::exception &)
+                {
+                    return false;
+                }
+                if (!doc.is_object() || !doc.contains("salt") || !doc["salt"].is_string())
+                    return false;
+                std::string salt;
+                if (!b64_decode(doc["salt"].get<std::string>(), salt))
+                    return false;
+                std::string key;
+                if (!derive(root, salt, key))
+                    return false;
+                bool ok = false;
+                const std::string aead = doc.value("aead", "");
+                if (aead == "aes256gcm")
+                {
+                    std::string nonce, ct;
+                    if (b64_decode(doc.value("nonce", ""), nonce) && b64_decode(doc.value("ct", ""), ct) &&
+                        nonce.size() == crypto_aead_aes256gcm_NPUBBYTES && ct.size() >= crypto_aead_aes256gcm_ABYTES)
+                    {
+                        std::string buf(ct.size(), '\0');
+                        unsigned long long mlen = 0;
+                        if (crypto_aead_aes256gcm_decrypt((unsigned char *)buf.data(), &mlen, nullptr,
+                                                          (const unsigned char *)ct.data(), ct.size(),
+                                                          nullptr, 0, (const unsigned char *)nonce.data(),
+                                                          (const unsigned char *)key.data()) == 0)
+                        {
+                            buf.resize((std::size_t)mlen);
+                            plain = std::move(buf);
+                            ok = true;
+                        }
+                    }
+                }
+                else
+                {
+                    json sealed{{"n", doc.value("nonce", "")}, {"c", doc.value("ct", "")}};
+                    ok = aead_open(key, {}, sealed, plain);
+                }
+                sodium_memzero(key.data(), key.size());
+                return ok;
+            }
+        };
+
+        // ---- peer records and the on-disk store ---------------------------------
+        //  Everything FlowLink owns lives in `<exe dir>/.cell/links/`:
+        //
+        //      links/identity.json          this cell's client_id + display name
+        //      links/links.json             service settings, every paired link and
+        //                                   the user's FlowLink workspace list
+        //      links/transmission.json      index of every transfer received
+        //      links/<client_id>/.key       the sealed long-term link key (trust)
+        //      links/<client_id>/<id>.jsonl one file per received transfer
+        //
+        //  A link is trusted exactly while `.key` exists: disconnecting removes it
+        //  and keeps the received files, re-pairing writes a fresh one.
+        struct peer_meta
+        {
+            std::string id;
+            std::string name;
+            std::string addr;       // last known address
+            std::uint16_t port = 0; // last known TCP port
+            long long paired_at = 0;
+            long long last_seen = 0;
+            std::string via = "code"; // "code" = we showed the code, "entered" = we typed theirs
+            bool paired = false;
+            // what the other cell told us about itself (discovery / handshake)
+            std::string os;
+            std::string tz;
+            std::string lang;
+
+            json to_json() const
+            {
+                return {{"client_id", id}, {"name", name}, {"addr", addr}, {"port", port},
+                        {"paired_at", paired_at}, {"last_seen", last_seen}, {"via", via},
+                        {"paired", paired}, {"os", os}, {"tz", tz}, {"lang", lang}};
+            }
+            static peer_meta from_json(const json &j)
+            {
+                peer_meta m;
+                if (!j.is_object())
+                    return m;
+                m.id = jstr(j, "client_id");
+                m.name = jstr(j, "name");
+                m.addr = jstr(j, "addr");
+                m.port = (std::uint16_t)std::clamp(jint(j, "port"), 0LL, 65535LL);
+                m.paired_at = jint(j, "paired_at");
+                m.last_seen = jint(j, "last_seen");
+                m.via = jstr(j, "via", "code");
+                m.paired = jbool(j, "paired");
+                m.os = jstr(j, "os");
+                m.tz = jstr(j, "tz");
+                m.lang = jstr(j, "lang");
+                return m;
+            }
+        };
+
+        // one received transfer: a shared conversation or an archived one, stored
+        // as JSONL (one {"role","text"} per line) next to the sender's `.key`
+        struct transmission
+        {
+            std::string id;
+            std::string from;      // sender client_id
+            std::string from_name; // sender display name
+            std::string subject;
+            std::string note;
+            std::string kind = "session"; // "session" | "archive" | "text"
+            std::string file;             // file name inside links/<from>/
+            long long created = 0;
+            long long bytes = 0;
+            bool read = false;
+            std::string session; // sender-side session id
+        };
+
+        inline transmission transmission_from_json(const json &j)
+        {
+            transmission t;
+            if (!j.is_object())
+                return t;
+            t.id = jstr(j, "id");
+            t.from = jstr(j, "from");
+            t.from_name = jstr(j, "from_name");
+            t.subject = jstr(j, "subject");
+            t.note = jstr(j, "note");
+            t.kind = jstr(j, "kind", "session");
+            t.file = jstr(j, "file");
+            t.created = jint(j, "created");
+            t.bytes = jint(j, "bytes");
+            t.read = jbool(j, "read");
+            t.session = jstr(j, "session");
+            return t;
+        }
+
+        inline json transmission_to_json(const transmission &t)
+        {
+            return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
+                    {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
+                    {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
+                    {"read", t.read}, {"session", t.session}};
+        }
+
+        // a FlowLink workspace: a directory on another cell that the user pinned
+        // to this cell's sidebar. Kept in links.json so it survives restarts.
+        struct link_workspace
+        {
+            std::string cell; // peer client_id
+            std::string cwd;  // absolute path on that peer
+            std::string name; // display name
+            long long added_at = 0;
+        };
+
+        struct store
+        {
+            std::filesystem::path root; // the .cell directory
+            mutable std::mutex mx;      // guards the JSON documents on disk
+
+            std::filesystem::path links() const { return root / "links"; }
+            std::filesystem::path link_dir(const std::string &id) const { return links() / id; }
+            std::filesystem::path key_file(const std::string &id) const { return link_dir(id) / ".key"; }
+            std::filesystem::path identity_file() const { return links() / "identity.json"; }
+            std::filesystem::path links_file() const { return links() / "links.json"; }
+            std::filesystem::path transmission_file() const { return links() / "transmission.json"; }
+
+            // ---- raw document helpers -----------------------------------------
+            static json read_doc(const std::filesystem::path &file)
+            {
+                std::ifstream f(file, std::ios::binary);
+                if (!f)
+                    return json::object();
+                json j = json::parse(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>(), nullptr, false);
+                return j.is_object() ? j : json::object();
+            }
+            static bool write_doc(const std::filesystem::path &file, const json &doc)
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(file.parent_path(), ec);
+                // write-then-rename: a crash mid-write must not leave links.json
+                // (which carries the trust list) truncated
+                const auto tmp = file.string() + ".tmp";
+                {
+                    std::ofstream out(tmp, std::ios::trunc | std::ios::binary);
+                    if (!out.is_open())
+                        return false;
+                    out << doc.dump(2) << "\n";
+                    if (!out.good())
+                        return false;
+                }
+                std::filesystem::rename(tmp, file, ec);
+                if (ec)
+                {
+                    std::filesystem::remove(file, ec);
+                    std::filesystem::rename(tmp, file, ec);
+                }
+                return !ec;
+            }
+
+            // ---- identity ------------------------------------------------------
+            json identity(const std::string &fallback_name)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                std::ifstream f(identity_file(), std::ios::binary);
+                if (f)
+                {
+                    json j = json::parse(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>(), nullptr, false);
+                    if (j.is_object() && j.contains("client_id") && j["client_id"].is_string() &&
+                        is_hex_id(j["client_id"].get<std::string>(), 32))
+                        return j;
+                }
+                json j{{"version", 1},
+                       {"client_id", hex_encode(random_bytes(16))},
+                       {"name", clean_name(fallback_name)},
+                       {"created_at", (long long)std::time(nullptr)}};
+                write_doc(identity_file(), j);
+                return j;
+            }
+            [[nodiscard]] bool save_identity_name(const std::string &name)
+            {
+                json j = identity(default_name());
+                j["name"] = clean_name(name);
+                std::lock_guard<std::mutex> lk(mx);
+                return write_doc(identity_file(), j);
+            }
+
+            // ---- links.json: settings + links + FlowLink workspaces ------------
+            json links_doc()
+            {
+                json doc = read_doc(links_file());
+                if (!doc.contains("version"))
+                {
+                    doc["version"] = 2;
+                    doc["enabled"] = false;
+                    doc["name"] = "";
+                    doc["port"] = kDefaultPort;
+                    doc["discovery"] = kDefaultDiscoveryPort;
+                    doc["announce"] = true;
+                    doc["accept"] = false;
+                    doc["workspace"] = "";
+                }
+                if (!doc.contains("links") || !doc["links"].is_array())
+                    doc["links"] = json::array();
+                if (!doc.contains("workspaces") || !doc["workspaces"].is_array())
+                    doc["workspaces"] = json::array();
+                return doc;
+            }
+            json get_links()
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                return links_doc();
+            }
+            [[nodiscard]] bool save_links(const json &doc)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                return write_doc(links_file(), doc);
+            }
+            // read-modify-write under one lock; fn returns false to abort the write
+            [[nodiscard]] bool update_links(const std::function<bool(json &)> &fn)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                json doc = links_doc();
+                if (!fn(doc))
+                    return false;
+                return write_doc(links_file(), doc);
+            }
+
+            // service settings, moved out of the system config on purpose: they
+            // belong to this feature, not to the agent
+            json settings()
+            {
+                json doc = get_links();
+                return {{"enabled", jbool(doc, "enabled")},
+                        {"name", jstr(doc, "name")},
+                        {"port", (int)jint(doc, "port", kDefaultPort)},
+                        {"discovery", (int)jint(doc, "discovery", kDefaultDiscoveryPort)},
+                        {"announce", jbool(doc, "announce", true)},
+                        {"accept", jbool(doc, "accept", false)},
+                        {"workspace", jstr(doc, "workspace")}};
+            }
+            [[nodiscard]] bool patch_settings(const json &patch)
+            {
+                return update_links([&](json &doc)
+                                    {
+                    for (auto it = patch.begin(); it != patch.end(); ++it)
+                    {
+                        if (it.key() == "enabled" || it.key() == "announce" || it.key() == "accept")
+                        {
+                            if (it->is_boolean()) doc[it.key()] = it->get<bool>();
+                            continue;
+                        }
+                        if (it.key() == "port" || it.key() == "discovery")
+                        {
+                            if (it->is_number_integer() || it->is_number_unsigned())
+                                doc[it.key()] = std::clamp(it->get<int>(), 0, 65535);
+                            continue;
+                        }
+                        if (it.key() == "name" || it.key() == "workspace")
+                        {
+                            if (it->is_string()) doc[it.key()] = it->get<std::string>();
+                            continue;
+                        }
+                    }
+                    return true; });
+            }
+
+            // ---- link key ------------------------------------------------------
+            [[nodiscard]] bool save_key(const std::string &id, const std::string &key)
+            {
+                return sealed_file::write(root, key_file(id), key);
+            }
+            [[nodiscard]] bool load_key(const std::string &id, std::string &key)
+            {
+                return sealed_file::read(root, key_file(id), key);
+            }
+            bool has_key(const std::string &id)
+            {
+                std::error_code ec;
+                return is_hex_id(id, 32) && std::filesystem::is_regular_file(key_file(id), ec);
+            }
+
+            // ---- peer metadata (inside links.json) ------------------------------
+            [[nodiscard]] bool save_meta(const peer_meta &m)
+            {
+                if (!is_hex_id(m.id, 32))
+                    return false;
+                return update_links([&](json &doc)
+                                    {
+                    json arr = json::array();
+                    bool replaced = false;
+                    for (const auto &e : doc["links"])
+                    {
+                        if (jstr(e, "client_id") == m.id)
+                        {
+                            arr.push_back(m.to_json());
+                            replaced = true;
+                        }
+                        else
+                            arr.push_back(e);
+                    }
+                    if (!replaced)
+                        arr.push_back(m.to_json());
+                    doc["links"] = arr;
+                    return true; });
+            }
+            std::optional<peer_meta> load_meta(const std::string &id)
+            {
+                const json doc = get_links();
+                const auto &links = doc["links"];
+                const auto it = std::ranges::find_if(links, [&](const json &e)
+                                                     { return jstr(e, "client_id") == id; });
+                if (it == links.end())
+                    return std::nullopt;
+                peer_meta m = peer_meta::from_json(*it);
+                m.id = id;
+                return m;
+            }
+            std::vector<peer_meta> all_meta()
+            {
+                const json doc = get_links();
+                auto out = doc["links"]
+                           | std::views::transform([](const json &e) { return peer_meta::from_json(e); })
+                           | std::views::filter([](const peer_meta &m) { return is_hex_id(m.id, 32); })
+                           | std::ranges::to<std::vector>();
+                std::ranges::sort(out, {}, &peer_meta::name);
+                return out;
+            }
+            // drop the record AND the received files (used by "forget")
+            [[nodiscard]] bool forget(const std::string &id)
+            {
+                if (!is_hex_id(id, 32))
+                    return false;
+                // the directory is what actually revokes trust; the record is a
+                // convenience, so a failed document write must not abort the forget
+                (void)update_links([&](json &doc)
+                                   {
+                    json arr = json::array();
+                    for (const auto &e : doc["links"])
+                        if (jstr(e, "client_id") != id)
+                            arr.push_back(e);
+                    doc["links"] = arr;
+                    json ws = json::array();
+                    for (const auto &w : doc["workspaces"])
+                        if (jstr(w, "cell") != id)
+                            ws.push_back(w);
+                    doc["workspaces"] = ws;
+                    return true; });
+                std::error_code ec;
+                std::filesystem::remove_all(link_dir(id), ec);
+                drop_transmissions_from(id);
+                return !ec;
+            }
+            // "disconnect": drop the trust credential only. The link record and
+            // every transferred file stay; a resume handshake fails until the pair
+            // is established again.
+            [[nodiscard]] bool disconnect(const std::string &id)
+            {
+                if (!is_hex_id(id, 32))
+                    return false;
+                std::error_code ec;
+                std::filesystem::remove(key_file(id), ec);
+                // the credential is what revokes access; the flag only drives the UI
+                (void)update_links([&](json &doc)
+                             {
+                    for (auto &e : doc["links"])
+                        if (jstr(e, "client_id") == id)
+                            e["paired"] = false;
+                    return true; });
+                return !ec;
+            }
+
+            // ---- transmissions -------------------------------------------------
+            // one JSONL file per transfer under links/<sender>/; the index in
+            // links/transmission.json is what the UI lists
+            std::string store_transmission(const transmission &t, const json &messages)
+            {
+                if (t.id.empty() || !is_hex_id(t.from, 32))
+                    return {};
+                std::error_code ec;
+                std::filesystem::create_directories(link_dir(t.from), ec);
+                const std::string file = t.file.empty() ? (t.id + ".jsonl") : t.file;
+                const auto path = link_dir(t.from) / file;
+                std::string body;
+                for (const auto &m : messages)
+                {
+                    if (!m.is_object())
+                        continue;
+                    body += json{{"role", jstr(m, "role", "user")},
+                                 {"text", jstr(m, "text")},
+                                 {"ts", jint(m, "ts")}}
+                                .dump(-1, ' ', false, json::error_handler_t::replace);
+                    body.push_back('\n');
+                }
+                {
+                    std::ofstream out(path, std::ios::trunc | std::ios::binary);
+                    if (!out.is_open())
+                        return {};
+                    out << body;
+                    if (!out.good())
+                        return {};
+                }
+                transmission rec = t;
+                rec.file = file;
+                rec.bytes = (long long)body.size();
+                // last_seen / paired on the sender's record: best effort, the file
+                // and the index below are the durable part
+                (void)update_links([&](json &doc)
+                             {
+                    json arr = json::array();
+                    for (const auto &e : doc["links"])
+                    {
+                        if (jstr(e, "client_id") == rec.from)
+                        {
+                            json x = e;
+                            x["paired"] = true;
+                            x["last_seen"] = rec.created;
+                            arr.push_back(x);
+                        }
+                        else
+                            arr.push_back(e);
+                    }
+                    doc["links"] = arr;
+                    return true; });
+                std::lock_guard<std::mutex> lk(mx);
+                json index = read_doc(transmission_file());
+                if (!index.contains("items") || !index["items"].is_array())
+                    index["items"] = json::array();
+                index["version"] = 1;
+                index["items"].insert(index["items"].begin(), transmission_to_json(rec));
+                write_doc(transmission_file(), index);
+                return rec.id;
+            }
+            std::vector<transmission> list_transmissions()
+            {
+                json index;
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    index = read_doc(transmission_file());
+                }
+                auto out = index.value("items", json::array())
+                           | std::views::transform([](const json &e) { return transmission_from_json(e); })
+                           | std::views::filter([](const transmission &t) { return !t.id.empty(); })
+                           | std::ranges::to<std::vector>();
+                std::ranges::sort(out, std::greater{}, &transmission::created);
+                return out;
+            }
+            bool read_transmission_messages(const transmission &t, json &out)
+            {
+                out = json::array();
+                if (!is_hex_id(t.from, 32) || t.file.empty() ||
+                    t.file.find('/') != std::string::npos || t.file.find("..") != std::string::npos)
+                    return false;
+                std::ifstream f(link_dir(t.from) / t.file, std::ios::binary);
+                if (!f)
+                    return false;
+                std::string line;
+                while (std::getline(f, line))
+                {
+                    if (line.empty())
+                        continue;
+                    json j = json::parse(line, nullptr, false);
+                    if (!j.is_object())
+                        continue;
+                    out.push_back(j);
+                }
+                return true;
+            }
+            [[nodiscard]] bool mark_transmission(const std::string &id, bool read)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                json index = read_doc(transmission_file());
+                bool found = false;
+                for (auto &e : index["items"])
+                    if (jstr(e, "id") == id)
+                    {
+                        e["read"] = read;
+                        found = true;
+                    }
+                if (!found)
+                    return false;
+                return write_doc(transmission_file(), index);
+            }
+            [[nodiscard]] bool drop_transmission(const std::string &id)
+            {
+                transmission gone;
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    json index = read_doc(transmission_file());
+                    json arr = json::array();
+                    for (const auto &e : index["items"])
+                    {
+                        if (jstr(e, "id") == id)
+                            gone = transmission_from_json(e);
+                        else
+                            arr.push_back(e);
+                    }
+                    if (gone.id.empty())
+                        return false;
+                    index["items"] = arr;
+                    write_doc(transmission_file(), index);
+                }
+                if (is_hex_id(gone.from, 32) && !gone.file.empty())
+                {
+                    std::error_code ec;
+                    std::filesystem::remove(link_dir(gone.from) / gone.file, ec);
+                }
+                return true;
+            }
+            void drop_transmissions_from(const std::string &cell)
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                json index = read_doc(transmission_file());
+                if (!index.contains("items"))
+                    return;
+                json arr = json::array();
+                for (const auto &e : index["items"])
+                    if (jstr(e, "from") != cell)
+                        arr.push_back(e);
+                index["items"] = arr;
+                write_doc(transmission_file(), index);
+            }
+            std::pair<int, int> transmission_counts()
+            {
+                int unread = 0, total = 0;
+                for (auto &t : list_transmissions())
+                {
+                    total++;
+                    if (!t.read)
+                        unread++;
+                }
+                return {unread, total};
+            }
+            static std::string new_transmission_id()
+            {
+                return std::format("t-{}-{}", (long long)std::time(nullptr), hex_encode(random_bytes(4)));
+            }
+
+            // ---- JSON views (usable with or without a running service) ---------
+            json workspaces_json()
+            {
+                json out = json::array();
+                for (const auto &w : link_workspaces())
+                {
+                    std::string name = w.name;
+                    if (name.empty())
+                    {
+                        std::filesystem::path path(w.cwd);
+                        name = path.filename().string();
+                        if (name.empty())
+                            name = w.cwd;
+                    }
+                    out.push_back({{"cell", w.cell}, {"cwd", w.cwd}, {"name", name},
+                                   {"added_at", w.added_at}});
+                }
+                return out;
+            }
+            json transmissions_json()
+            {
+                json out = json::array();
+                for (const auto &t : list_transmissions())
+                    out.push_back({{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
+                                   {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
+                                   {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
+                                   {"read", t.read}, {"session", t.session}});
+                return out;
+            }
+
+            // ---- FlowLink workspaces (links.json) ------------------------------
+            std::vector<link_workspace> link_workspaces()
+            {
+                const json doc = get_links();
+                return doc["workspaces"]
+                       | std::views::transform([](const json &w)
+                                               {
+                            link_workspace lw;
+                            lw.cell = jstr(w, "cell");
+                            lw.cwd = jstr(w, "cwd");
+                            lw.name = jstr(w, "name");
+                            lw.added_at = jint(w, "added_at");
+                            return lw; })
+                       | std::views::filter([](const link_workspace &lw)
+                                            { return !lw.cell.empty() && !lw.cwd.empty(); })
+                       | std::ranges::to<std::vector>();
+            }
+            [[nodiscard]] bool add_link_workspace(const link_workspace &w)
+            {
+                if (w.cell.empty() || w.cwd.empty())
+                    return false;
+                return update_links([&](json &doc)
+                                    {
+                    for (const auto &e : doc["workspaces"])
+                        if (jstr(e, "cell") == w.cell && jstr(e, "cwd") == w.cwd)
+                            return false; // already pinned
+                    doc["workspaces"].push_back({{"cell", w.cell}, {"cwd", w.cwd},
+                                                 {"name", w.name},
+                                                 {"added_at", w.added_at ? w.added_at : (long long)std::time(nullptr)}});
+                    return true; });
+            }
+            [[nodiscard]] bool remove_link_workspace(const std::string &cell, const std::string &cwd)
+            {
+                return update_links([&](json &doc)
+                                    {
+                    json arr = json::array();
+                    for (const auto &e : doc["workspaces"])
+                        if (!(jstr(e, "cell") == cell && jstr(e, "cwd") == cwd))
+                            arr.push_back(e);
+                    const bool changed = arr.size() != doc["workspaces"].size();
+                    doc["workspaces"] = arr;
+                    return changed; });
+            }
+        };
+
+        // =========================================================================
+        //  service — the whole FlowLink stack behind one object. Constructing it
+        //  allocates nothing but the impl; start() binds sockets and spawns the
+        //  worker threads; stop() joins them. A disabled FlowLink is a null
+        //  unique_ptr in app_core: no memory, no threads, no sockets.
+        // =========================================================================
+        struct impl : std::enable_shared_from_this<impl>
+        {
+            struct options
+            {
+                std::filesystem::path root;
+                std::string name;
+                std::uint16_t port = kDefaultPort;
+                std::uint16_t discovery_port = kDefaultDiscoveryPort;
+                bool announce = true;
+                bool accept_remote = false;
+                std::function<void(const json &)> on_event;
+                std::function<void(const std::string &, const std::string &)> on_log;
+                // methods this module does not implement itself (fs.*, tw.*): the
+                // shell answers them, because only it knows the workspaces
+                std::function<json(const std::string &, const json &, std::string &)> on_call;
+            };
+
+            // ---- connection ---------------------------------------------------
+            struct pending_rpc
+            {
+                std::mutex mx;
+                std::condition_variable cv;
+                bool done = false;
+                bool ok = false;
+                json result;
+                std::string error;
+                void finish(bool good, json r, std::string e)
+                {
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        if (done)
+                            return;
+                        done = true;
+                        ok = good;
+                        result = std::move(r);
+                        error = std::move(e);
+                    }
+                    cv.notify_all();
+                }
+            };
+
+            struct conn : std::enable_shared_from_this<conn>
+            {
+                std::shared_ptr<impl> svc;
+                tcp::socket sock;
+                asio::strand<asio::io_context::executor_type> strand;
+                bool inbound = false;
+
+                // handshake state
+                bool hello_sent = false;
+                bool ready = false;
+                std::string peer_id, peer_name;
+                std::string peer_os, peer_tz, peer_lang;
+                std::uint16_t peer_port = 0; // the port the peer LISTENS on (its source port is ephemeral)
+                std::string my_eph_pub, my_eph_sec;
+                std::string peer_eph_pub;
+                std::string psk;        // pairing code PSK or link key
+                bool pair_mode = false;
+                std::string pairing_code; // client side: the code we typed
+                std::string link_key;     // pair mode, initiator side: key we hand over
+                std::string hs_tx, hs_rx; // handshake keys
+                std::string app_tx, app_rx;
+
+                // frame IO
+                std::array<unsigned char, 4> hdr{};
+                std::string body;
+                std::deque<std::string> wq;
+                bool writing = false;
+                std::atomic<bool> closed{false};
+                std::string close_reason;
+
+                // rpc bookkeeping
+                std::mutex rmx;
+                std::map<std::uint64_t, std::shared_ptr<pending_rpc>> pend;
+                std::uint64_t next_id = 1;
+
+                // handshake wait
+                std::mutex wmx;
+                std::condition_variable wcv;
+                int state = 0; // 0 connecting/handshaking, 1 ready, -1 failed
+                std::string fail_reason;
+                long long last_rx = 0;
+
+                explicit conn(std::shared_ptr<impl> s, tcp::socket sock_)
+                    : svc(std::move(s)), sock(std::move(sock_)), strand(asio::make_strand(svc->io)) {}
+
+                void start_inbound();
+                void start_outbound(const std::string &mode, const std::string &code);
+                void read_header();
+                void read_body(std::uint32_t len);
+                void on_frame(const std::string &text);
+                void on_hello(const json &j);
+                void on_hello_ack(const json &j);
+                void on_confirm(const json &j);
+                void on_enc(const json &j);
+                void handshake_done();
+                void fail(const std::string &why);
+
+                void send_raw(std::string text);
+                void send_encrypted(const json &payload);
+                void do_write();
+                void close(const std::string &why);
+
+                bool request(const std::string &method, const json &params, int timeout_ms, json &out, std::string &err);
+                bool wait_ready(int timeout_ms, std::string &err);
+                void finish_wait(int st, const std::string &why);
+                void kill_pending(const std::string &why);
+            };
+
+            options opt;
+            store st;
+            std::string client_id;
+            std::string name;
+
+            asio::io_context io;
+            std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work;
+            std::vector<std::jthread> threads;
+            std::unique_ptr<tcp::acceptor> acceptor;
+            std::unique_ptr<udp::socket> udp_sock;
+            asio::steady_timer announce_timer{io};
+            asio::steady_timer sweep_timer{io};
+            asio::steady_timer pair_timer{io};
+            udp::endpoint group_endpoint;
+            // every address an announce goes to: 255.255.255.255, the multicast
+            // group, and the /24 broadcast of each local IPv4 (a host with a docker
+            // bridge or two NICs does not route 255.255.255.255 to every subnet)
+            std::vector<udp::endpoint> announce_targets;
+            std::atomic<bool> alive{false};
+            std::uint16_t bound_port = 0;
+
+            mutable std::mutex mx; // guards peers / sessions / pairing / handlers
+            struct peer_state
+            {
+                std::string id, name, addr;
+                std::uint16_t port = 0;
+                long long last_seen = 0;
+                bool pairing_open = false;
+                // what the announce carried: shown in "Scan Links" before pairing
+                std::string os, tz, lang;
+            };
+            std::map<std::string, peer_state> discovered;
+            std::map<std::string, std::shared_ptr<conn>> sessions;
+            // A flat (contiguous) map is the right shape here: a handful of methods,
+            // looked up on every inbound RPC frame, never erased. Values are shared
+            // so a dispatch copies a pointer instead of a std::function.
+            std::flat_map<std::string, std::shared_ptr<const std::function<json(const json &, std::string &)>>> handlers;
+
+            struct pairing_state
+            {
+                bool open = false;
+                std::string code;     // normalized (no separators)
+                std::string display;  // grouped, for the UI
+                long long expires = 0;
+                int fails = 0;
+                std::string state = "idle"; // idle | waiting | paired | failed
+                std::string peer;           // client_id once paired
+            } pairing;
+
+            explicit impl(options o) : opt(std::move(o)), st{opt.root} {}
+            ~impl() { stop(); }
+
+            // ---- lifecycle ----------------------------------------------------
+            bool start(std::string &err);
+            void stop();
+            void log(const std::string &level, const std::string &msg)
+            {
+                if (opt.on_log)
+                    opt.on_log(level, msg);
+            }
+            void emit(json ev)
+            {
+                if (opt.on_event)
+                    opt.on_event(ev);
+            }
+            bool is_pairing_open()
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                return pairing.open && (long long)std::time(nullptr) < pairing.expires;
+            }
+
+            // ---- discovery ----------------------------------------------------
+            void build_announce_targets();
+            void announce_loop();
+            void announce_once(bool probe_reply, const udp::endpoint *to);
+            void start_receive();
+            void on_datagram(const std::string &text, const udp::endpoint &from);
+            void probe_now();
+
+            // ---- inbound connections -----------------------------------------
+            void accept_loop();
+            std::shared_ptr<conn> make_conn(tcp::socket s);
+
+            // ---- sessions -----------------------------------------------------
+            std::shared_ptr<conn> session_for(const std::string &peer, int timeout_ms, std::string &err);
+            void register_session(const std::shared_ptr<conn> &c);
+            void drop_session(const std::string &peer, const std::shared_ptr<conn> &c);
+            void sweep_loop();
+            void pair_expire_loop();
+
+            // ---- handlers -----------------------------------------------------
+            json dispatch(const std::string &method, const json &params, std::string &err);
+            json deliver_transmission(const json &params, std::string &err);
+
+            // ---- views --------------------------------------------------------
+            json status();
+            json peers_json();
+            json link_workspaces_json();
+        };
+
+        // -------------------------------------------------------------------------
+        //  conn — handshake
+        // -------------------------------------------------------------------------
+        inline void impl::conn::start_inbound()
+        {
+            auto self = shared_from_this();
+            sock.set_option(tcp::no_delay(true));
+            last_rx = (long long)std::time(nullptr);
+            read_header();
+        }
+
+        inline void impl::conn::start_outbound(const std::string &mode, const std::string &code)
+        {
+            auto self = shared_from_this();
+            sock.set_option(tcp::no_delay(true));
+            last_rx = (long long)std::time(nullptr);
+            pair_mode = (mode == "pair");
+            pairing_code = code;
+            x25519_pair k = x25519_new();
+            my_eph_pub = k.pub;
+            my_eph_sec = k.sec;
+            json hello{{"t", "hello"},
+                       {"m", kProto},
+                       {"v", kVersion},
+                       {"id", svc->client_id},
+                       {"name", svc->name},
+                       {"eph", b64_encode(my_eph_pub)},
+                       {"port", svc->bound_port},
+                       {"os", os_name()},
+                       {"tz", tz_name()},
+                       {"lang", lang_name()},
+                       {"mode", pair_mode ? "pair" : "resume"},
+                       {"ts", (long long)std::time(nullptr)}};
+            hello_sent = true;
+            send_raw(hello.dump());
+            read_header();
+        }
+
+        // Wire order is big-endian. <bit> makes that explicit and lets the
+        // compiler emit a single bswap (or nothing on a big-endian host).
+        [[nodiscard]] inline std::uint32_t frame_len(const std::array<unsigned char, 4> &h) noexcept
+        {
+            std::uint32_t v = 0;
+            std::memcpy(&v, h.data(), sizeof v);
+            if constexpr (std::endian::native == std::endian::little)
+                v = std::byteswap(v);
+            return v;
+        }
+
+        inline void impl::conn::read_header()
+        {
+            if (closed.load())
+                return;
+            auto self = shared_from_this();
+            asio::async_read(sock, asio::buffer(hdr),
+                             asio::bind_executor(strand, [self](const boost::system::error_code &ec, std::size_t)
+                                                 {
+                    if (ec) { self->close("read failed"); return; }
+                    const std::uint32_t len = frame_len(self->hdr);
+                    if (len == 0 || len > kMaxFrame) { self->close("frame too large"); return; }
+                    self->read_body(len); }));
+        }
+
+        inline void impl::conn::read_body(std::uint32_t len)
+        {
+            auto self = shared_from_this();
+            auto buf = std::make_shared<std::string>(len, '\0');
+            asio::async_read(sock, asio::buffer(*buf),
+                             asio::bind_executor(strand, [self, buf](const boost::system::error_code &ec, std::size_t)
+                                                 {
+                    if (ec) { self->close("read failed"); return; }
+                    self->last_rx = (long long)std::time(nullptr);
+                    self->on_frame(*buf);
+                    if (!self->closed.load()) self->read_header(); }));
+        }
+
+        inline void impl::conn::send_raw(std::string text)
+        {
+            if (closed.load() || text.size() > kMaxFrame)
+                return;
+            std::string frame(4, '\0');
+            std::uint32_t len = static_cast<std::uint32_t>(text.size());
+            if constexpr (std::endian::native == std::endian::little)
+                len = std::byteswap(len);
+            std::memcpy(frame.data(), &len, sizeof len);
+            frame += text;
+            const bool idle = wq.empty();
+            wq.push_back(std::move(frame));
+            if (idle && !writing)
+            {
+                writing = true;
+                do_write();
+            }
+        }
+
+        inline void impl::conn::do_write()
+        {
+            if (closed.load() || wq.empty())
+            {
+                writing = false;
+                return;
+            }
+            auto self = shared_from_this();
+            asio::async_write(sock, asio::buffer(wq.front()),
+                              asio::bind_executor(strand, [self](const boost::system::error_code &ec, std::size_t)
+                                                  {
+                    if (ec) { self->close("write failed"); return; }
+                    self->wq.pop_front();
+                    if (self->wq.empty()) { self->writing = false; return; }
+                    self->do_write(); }));
+        }
+
+        inline void impl::conn::send_encrypted(const json &payload)
+        {
+            if (!ready || closed.load())
+                return;
+            json frame{{"t", "enc"}, {"b", aead_seal(app_tx, "fl-data", payload.dump())}};
+            send_raw(frame.dump());
+        }
+
+        inline void impl::conn::close(const std::string &why)
+        {
+            if (closed.exchange(true))
+                return;
+            close_reason = why;
+            boost::system::error_code ec;
+            sock.shutdown(tcp::socket::shutdown_both, ec);
+            sock.close(ec);
+            finish_wait(-1, why);
+            kill_pending(why);
+            auto svc_ = svc;
+            const std::string pid = peer_id;
+            asio::post(svc->io, [svc_, pid, self = shared_from_this()]
+                       { svc_->drop_session(pid, self); });
+        }
+
+        inline void impl::conn::finish_wait(int st, const std::string &why)
+        {
+            {
+                std::lock_guard<std::mutex> lk(wmx);
+                if (state != 0)
+                    return;
+                state = st;
+                if (st < 0)
+                    fail_reason = why;
+            }
+            wcv.notify_all();
+        }
+
+        inline void impl::conn::kill_pending(const std::string &why)
+        {
+            std::map<std::uint64_t, std::shared_ptr<pending_rpc>> take;
+            {
+                std::lock_guard<std::mutex> lk(rmx);
+                take.swap(pend);
+            }
+            for (auto &[id, p] : take)
+                p->finish(false, json{}, why);
+        }
+
+        inline bool impl::conn::wait_ready(int timeout_ms, std::string &err)
+        {
+            std::unique_lock<std::mutex> lk(wmx);
+            if (!wcv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]
+                              { return state != 0; }))
+            {
+                err = "handshake timed out";
+                return false;
+            }
+            if (state < 0)
+            {
+                err = fail_reason.empty() ? "handshake failed" : fail_reason;
+                return false;
+            }
+            return true;
+        }
+
+        inline void impl::conn::fail(const std::string &why)
+        {
+            json err{{"t", "error"}, {"msg", why}};
+            send_raw(err.dump());
+            finish_wait(-1, why);
+            close(why);
+        }
+
+        // The transcript hash both sides must agree on. Built from an explicit
+        // ordered field list (not from JSON text) so key order can never matter.
+        // Ports are in initiator/responder order so both sides derive the same
+        // string, and they are covered by the MAC: a forged port would otherwise
+        // poison the address remembered for reconnects.
+        static inline std::string transcript_hash(const std::string &a_id, const std::string &b_id,
+                                                  const std::string &a_eph, const std::string &b_eph,
+                                                  const std::string &mode,
+                                                  std::uint16_t a_port, std::uint16_t b_port)
+        {
+            return sha256("fl1|" + a_id + "|" + b_id + "|" + a_eph + "|" + b_eph + "|" + mode +
+                          "|" + std::to_string(a_port) + "|" + std::to_string(b_port));
+        }
+
+        inline void impl::conn::on_hello(const json &j)
+        {
+            if (ready)
+                return;
+            const std::string their_id = j.value("id", "");
+            if (!is_hex_id(their_id, 32))
+                return fail("bad client id");
+            if (their_id == svc->client_id)
+                return fail("refusing a connection from ourselves");
+            const std::string mode = j.value("mode", "resume");
+            peer_id = their_id;
+            peer_name = clean_name(j.value("name", ""));
+            peer_port = (std::uint16_t)std::clamp(j.value("port", 0), 0, 65535);
+            peer_os = clean_name(jstr(j, "os"), 24);
+            peer_tz = clean_name(jstr(j, "tz"), 48);
+            peer_lang = clean_name(jstr(j, "lang"), 24);
+            if (!b64_decode(j.value("eph", ""), peer_eph_pub) ||
+                peer_eph_pub.size() != crypto_kx_PUBLICKEYBYTES)
+                return fail("bad ephemeral key");
+
+            std::string link;
+            if (mode == "pair")
+            {
+                pair_mode = true;
+                std::string code;
+                {
+                    std::lock_guard<std::mutex> lk(svc->mx);
+                    if (!svc->pairing.open || (long long)std::time(nullptr) >= svc->pairing.expires)
+                        return fail("pairing is not open on this cell");
+                    code = svc->pairing.code;
+                }
+                psk = argon2id(code, pair_salt(svc->client_id, their_id));
+                if (psk.empty())
+                    return fail("key derivation failed");
+            }
+            else
+            {
+                if (!svc->st.load_key(their_id, link) || link.size() != kKeyBytes)
+                    return fail("unknown peer: pair first");
+                psk = link;
+            }
+
+            x25519_pair k = x25519_new();
+            my_eph_pub = k.pub;
+            my_eph_sec = k.sec;
+            std::string dh;
+            if (!x25519_shared(my_eph_sec, peer_eph_pub, dh))
+                return fail("bad ephemeral key");
+            const std::string prk = hkdf_extract(psk, dh);
+            const std::string th = transcript_hash(their_id, svc->client_id, peer_eph_pub, my_eph_pub, mode,
+                                                   peer_port, svc->bound_port);
+            const std::string mac_key = hkdf_expand(prk, "fl hs mac", 32);
+            const std::string mac = hmac_sha256(mac_key, th);
+
+            json ack{{"t", "hello_ack"},
+                     {"m", kProto},
+                     {"v", kVersion},
+                     {"id", svc->client_id},
+                     {"name", svc->name},
+                     {"eph", b64_encode(my_eph_pub)},
+                     {"port", svc->bound_port},
+                     {"os", os_name()},
+                     {"tz", tz_name()},
+                     {"lang", lang_name()},
+                     {"mode", mode},
+                     {"mac", b64_encode(mac)}};
+            send_raw(ack.dump());
+
+            hs_tx = hkdf_expand(prk, "fl hs s2c", 32);
+            hs_rx = hkdf_expand(prk, "fl hs c2s", 32);
+            app_tx = hkdf_expand(prk, "fl app s2c", 32);
+            app_rx = hkdf_expand(prk, "fl app c2s", 32);
+            // our CONFIRM proves we derived the same secret; the initiator answers
+            // with its own (and, when pairing, the link key)
+            json confirm{{"t", "confirm"}, {"th", hex_encode(th)}};
+            json sealed{{"t", "enc"}, {"b", aead_seal(hs_tx, "fl-hs", confirm.dump())}};
+            send_raw(sealed.dump());
+            hello_sent = true;
+            (void)link;
+        }
+
+        inline void impl::conn::on_hello_ack(const json &j)
+        {
+            if (!hello_sent || ready)
+                return;
+            const std::string their_id = j.value("id", "");
+            if (!is_hex_id(their_id, 32))
+                return fail("bad client id");
+            peer_id = their_id;
+            peer_name = clean_name(j.value("name", ""));
+            peer_port = (std::uint16_t)std::clamp(j.value("port", 0), 0, 65535);
+            peer_os = clean_name(jstr(j, "os"), 24);
+            peer_tz = clean_name(jstr(j, "tz"), 48);
+            peer_lang = clean_name(jstr(j, "lang"), 24);
+            if (!b64_decode(j.value("eph", ""), peer_eph_pub) || peer_eph_pub.size() != crypto_kx_PUBLICKEYBYTES)
+                return fail("bad ephemeral key");
+
+            std::string psk_local;
+            if (pair_mode)
+            {
+                if (pairing_code.empty())
+                    return fail("no pairing code");
+                psk_local = argon2id(pairing_code, pair_salt(svc->client_id, their_id));
+                if (psk_local.empty())
+                    return fail("key derivation failed");
+            }
+            else
+            {
+                if (!svc->st.load_key(their_id, psk_local) || psk_local.size() != kKeyBytes)
+                    return fail("unknown peer: pair first");
+            }
+            psk = psk_local;
+
+            std::string dh;
+            if (!x25519_shared(my_eph_sec, peer_eph_pub, dh))
+                return fail("bad ephemeral key");
+            const std::string prk = hkdf_extract(psk, dh);
+            const std::string mode = pair_mode ? "pair" : "resume";
+            const std::string th = transcript_hash(svc->client_id, their_id, my_eph_pub, peer_eph_pub, mode,
+                                                   svc->bound_port, peer_port);
+            const std::string mac_key = hkdf_expand(prk, "fl hs mac", 32);
+            std::string their_mac;
+            if (!b64_decode(j.value("mac", ""), their_mac) || !const_eq(their_mac, hmac_sha256(mac_key, th)))
+                return fail("pairing code mismatch");
+
+            hs_tx = hkdf_expand(prk, "fl hs c2s", 32);
+            hs_rx = hkdf_expand(prk, "fl hs s2c", 32);
+            app_tx = hkdf_expand(prk, "fl app c2s", 32);
+            app_rx = hkdf_expand(prk, "fl app s2c", 32);
+
+            json confirm{{"t", "confirm"}, {"th", hex_encode(th)}};
+            if (pair_mode)
+            {
+                link_key = random_bytes(kKeyBytes);
+                confirm["link"] = b64_encode(link_key);
+            }
+            json sealed{{"t", "enc"}, {"b", aead_seal(hs_tx, "fl-hs", confirm.dump())}};
+            send_raw(sealed.dump());
+        }
+
+        inline void impl::conn::on_confirm(const json &j)
+        {
+            const std::string mode = pair_mode ? "pair" : "resume";
+            const std::string expect = hex_encode(
+                inbound ? transcript_hash(peer_id, svc->client_id, peer_eph_pub, my_eph_pub, mode,
+                                          peer_port, svc->bound_port)
+                        : transcript_hash(svc->client_id, peer_id, my_eph_pub, peer_eph_pub, mode,
+                                          svc->bound_port, peer_port));
+            if (j.value("th", "") != expect)
+                return fail("handshake confirmation mismatch");
+
+            if (inbound && pair_mode)
+            {
+                // the initiator hands over the long-term key inside the encrypted
+                // handshake; from now on this pair reconnects without a code
+                std::string link;
+                if (!b64_decode(j.value("link", ""), link) || link.size() != kKeyBytes)
+                    return fail("pairing did not deliver a link key");
+                if (!svc->st.save_key(peer_id, link))
+                    return fail("could not store the link key");
+                peer_meta m;
+                m.id = peer_id;
+                m.name = peer_name.empty() ? peer_id.substr(0, 8) : peer_name;
+                boost::system::error_code rec;
+                const tcp::endpoint remote = sock.remote_endpoint(rec);
+                if (!rec)
+                {
+                    m.addr = remote.address().to_string();
+                    // the LISTENING port, not the ephemeral source port of this
+                    // connection: the peer must be reachable in the other direction
+                    m.port = peer_port ? peer_port : remote.port();
+                }
+                m.paired_at = (long long)std::time(nullptr);
+                m.last_seen = m.paired_at;
+                m.via = "code";
+                m.paired = true;
+                m.os = peer_os;
+                m.tz = peer_tz;
+                m.lang = peer_lang;
+                (void)svc->st.save_meta(m); // pairing already succeeded; the record
+                                            // is rewritten on every reconnect anyway
+                svc->log("info", std::format("paired with {} ({})", m.name, peer_id));
+                {
+                    std::lock_guard<std::mutex> lk(svc->mx);
+                    svc->pairing.state = "paired";
+                    svc->pairing.peer = peer_id;
+                    svc->pairing.open = false;
+                    svc->pairing.code.clear();
+                }
+                svc->emit({{"type", "paired"}, {"client_id", peer_id}, {"name", m.name}});
+            }
+            if (!inbound && pair_mode)
+            {
+                if (!svc->st.save_key(peer_id, link_key))
+                    return fail("could not store the link key");
+                peer_meta m;
+                m.id = peer_id;
+                m.name = peer_name.empty() ? peer_id.substr(0, 8) : peer_name;
+                boost::system::error_code rec;
+                const tcp::endpoint remote = sock.remote_endpoint(rec);
+                if (!rec)
+                {
+                    m.addr = remote.address().to_string();
+                    // the LISTENING port, not the ephemeral source port of this
+                    // connection: the peer must be reachable in the other direction
+                    m.port = peer_port ? peer_port : remote.port();
+                }
+                m.paired_at = (long long)std::time(nullptr);
+                m.last_seen = m.paired_at;
+                m.via = "entered";
+                m.paired = true;
+                m.os = peer_os;
+                m.tz = peer_tz;
+                m.lang = peer_lang;
+                (void)svc->st.save_meta(m); // the link key is already stored;
+                                            // the record is a convenience
+                svc->log("info", std::format("paired with {} ({})", m.name, peer_id));
+                svc->emit({{"type", "paired"}, {"client_id", peer_id}, {"name", m.name}});
+            }
+            handshake_done();
+        }
+
+        inline void impl::conn::handshake_done()
+        {
+            if (ready)
+                return;
+            ready = true;
+            // refresh the peer's last-known address so a reconnect needs no discovery
+            if (auto m = svc->st.load_meta(peer_id))
+            {
+                boost::system::error_code ec;
+                const tcp::endpoint remote = sock.remote_endpoint(ec);
+                if (!ec)
+                    m->addr = remote.address().to_string();
+                m->port = peer_port ? peer_port : remote.port();
+                m->last_seen = (long long)std::time(nullptr);
+                m->paired = true;
+                if (!peer_os.empty())
+                    m->os = peer_os;
+                if (!peer_tz.empty())
+                    m->tz = peer_tz;
+                if (!peer_lang.empty())
+                    m->lang = peer_lang;
+                if (!m->name.empty() && peer_name.empty())
+                    peer_name = m->name;
+                (void)svc->st.save_meta(*m); // address cache: rebuilt on the next connect
+            }
+            svc->register_session(shared_from_this());
+            finish_wait(1, {});
+            svc->emit({{"type", "online"}, {"client_id", peer_id}, {"name", peer_name}});
+            send_encrypted(json{{"t", "hello"}, {"name", svc->name}, {"client_id", svc->client_id},
+                                {"port", svc->bound_port},
+                                {"accept_remote", svc->opt.accept_remote}});
+        }
+
+        inline void impl::conn::on_frame(const std::string &text)
+        {
+            json j = json::parse(text, nullptr, false);
+            if (!j.is_object())
+                return close("malformed frame");
+            const std::string t = j.value("t", "");
+            if (t == "hello" && inbound && !ready)
+                return on_hello(j);
+            if (t == "hello_ack" && !inbound && !ready)
+                return on_hello_ack(j);
+            if (t == "error")
+                return fail(j.value("msg", "peer error"));
+            if (t == "enc")
+            {
+                std::string plain;
+                // CONFIRM rides the handshake keys, everything after it the app keys
+                if (!ready)
+                {
+                    if (!aead_open(hs_rx, "fl-hs", j.value("b", json::object()), plain))
+                        return fail("handshake frame did not decrypt");
+                    json c = json::parse(plain, nullptr, false);
+                    if (!c.is_object() || c.value("t", "") != "confirm")
+                        return fail("unexpected handshake frame");
+                    return on_confirm(c);
+                }
+                if (!aead_open(app_rx, "fl-data", j.value("b", json::object()), plain))
+                    return close("frame did not decrypt");
+                json p = json::parse(plain, nullptr, false);
+                if (!p.is_object())
+                    return close("malformed payload");
+                const std::string pt = p.value("t", "");
+                if (pt == "hello")
+                {
+                    peer_name = clean_name(p.value("name", peer_name));
+                    const int port = p.value("port", 0);
+                    if (port > 0 && port <= 65535)
+                        peer_port = (std::uint16_t)port;
+                    return;
+                }
+                if (pt == "ping")
+                {
+                    send_encrypted(json{{"t", "pong"}});
+                    return;
+                }
+                if (pt == "pong")
+                    return;
+                if (pt == "req")
+                {
+                    const std::uint64_t id = p.value("id", (std::uint64_t)0);
+                    const std::string method = p.value("m", "");
+                    json params = p.contains("p") ? p["p"] : json::object();
+                    // the handler needs to know who is asking: a remote turn
+                    // streams its events back to this peer
+                    if (params.is_object())
+                        params["_from"] = peer_id;
+                    auto self = shared_from_this();
+                    // handlers may block for minutes (a remote teamwork run): run
+                    // them off the io thread, answer back on the strand
+                    std::thread([self, id, method, params]
+                                {
+                        std::string err;
+                        json r;
+                        bool ok = true;
+                        try { r = self->svc->dispatch(method, params, err); }
+                        catch (const std::exception &e) { ok = false; err = e.what(); }
+                        if (!err.empty()) ok = false;
+                        json res{{"t", "res"}, {"id", id}, {"ok", ok}};
+                        if (ok) res["r"] = r; else res["e"] = err;
+                        auto c = self;
+                        asio::post(c->strand, [c, res] { c->send_encrypted(res); }); })
+                        .detach();
+                    return;
+                }
+                if (pt == "res")
+                {
+                    const std::uint64_t id = p.value("id", (std::uint64_t)0);
+                    std::shared_ptr<pending_rpc> pd;
+                    {
+                        std::lock_guard<std::mutex> lk(rmx);
+                        auto it = pend.find(id);
+                        if (it == pend.end())
+                            return;
+                        pd = it->second;
+                        pend.erase(it);
+                    }
+                    const bool ok = p.value("ok", false);
+                    pd->finish(ok, p.contains("r") ? p["r"] : json{}, p.value("e", std::string{}));
+                    return;
+                }
+                if (pt == "evt")
+                {
+                    json ev{{"type", "peer_event"}, {"client_id", peer_id},
+                            {"method", p.value("m", "")}, {"params", p.contains("p") ? p["p"] : json{}}};
+                    svc->emit(ev);
+                    return;
+                }
+                return;
+            }
+            if (t == "ping")
+                return send_raw(json{{"t", "pong"}}.dump());
+            if (t == "pong")
+                return;
+            close("unexpected frame");
+        }
+
+        inline bool impl::conn::request(const std::string &method, const json &params, int timeout_ms,
+                                        json &out, std::string &err)
+        {
+            if (!ready || closed.load())
+            {
+                err = "not connected";
+                return false;
+            }
+            auto pd = std::make_shared<pending_rpc>();
+            std::uint64_t id = 0;
+            {
+                std::lock_guard<std::mutex> lk(rmx);
+                id = next_id++;
+                pend[id] = pd;
+            }
+            send_encrypted(json{{"t", "req"}, {"id", id}, {"m", method}, {"p", params}});
+            std::unique_lock<std::mutex> lk(pd->mx);
+            if (!pd->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]
+                                 { return pd->done; }))
+            {
+                std::lock_guard<std::mutex> g(rmx);
+                pend.erase(id);
+                err = "request timed out";
+                return false;
+            }
+            if (!pd->ok)
+            {
+                err = pd->error.empty() ? "peer refused the request" : pd->error;
+                return false;
+            }
+            out = pd->result;
+            return true;
+        }
+
+        // -------------------------------------------------------------------------
+        //  impl — lifecycle
+        // -------------------------------------------------------------------------
+        inline bool impl::start(std::string &err)
+        {
+            if (alive.load())
+            {
+                err = "already running";
+                return false;
+            }
+            if (sodium_init() < 0)
+            {
+                err = "libsodium initialisation failed";
+                return false;
+            }
+            const json ident = st.identity(opt.name.empty() ? default_name() : opt.name);
+            client_id = ident.value("client_id", "");
+            name = clean_name(opt.name.empty() ? ident.value("name", default_name()) : opt.name);
+            if (!is_hex_id(client_id, 32))
+            {
+                err = "identity file is corrupt (client_id)";
+                return false;
+            }
+            std::error_code fec;
+            std::filesystem::create_directories(st.links(), fec);
+            boost::system::error_code ec;
+
+            // ---- inbound TCP ------------------------------------------------
+            try
+            {
+                acceptor = std::make_unique<tcp::acceptor>(io);
+                acceptor->open(tcp::v4(), ec);
+                if (ec)
+                {
+                    err = "could not open the transport socket: " + ec.message();
+                    return false;
+                }
+    #ifndef _WIN32
+                // SO_REUSEADDR on a Windows TCP listener lets another process bind
+                // the same port and take the connections over — exactly the wrong
+                // property for a service that carries keys. POSIX needs it only to
+                // survive TIME_WAIT after a restart.
+                acceptor->set_option(tcp::acceptor::reuse_address(true), ec);
+    #endif
+                acceptor->bind(tcp::endpoint(tcp::v4(), opt.port), ec);
+                if (ec)
+                {
+                    err = std::format("could not bind TCP port {}: {}", opt.port, ec.message());
+                    acceptor.reset();
+                    return false;
+                }
+                acceptor->listen(asio::socket_base::max_listen_connections, ec);
+                if (ec)
+                {
+                    err = "could not listen: " + ec.message();
+                    acceptor.reset();
+                    return false;
+                }
+                bound_port = acceptor->local_endpoint(ec).port();
+            }
+            catch (const std::exception &e)
+            {
+                err = std::string("transport setup failed: ") + e.what();
+                return false;
+            }
+
+            // ---- UDP discovery ----------------------------------------------
+            if (opt.announce)
+            {
+                try
+                {
+                    udp_sock = std::make_unique<udp::socket>(io);
+                    udp_sock->open(udp::v4(), ec);
+                    if (!ec)
+                    {
+                        udp_sock->set_option(asio::socket_base::reuse_address(true), ec);
+                        udp_sock->set_option(asio::socket_base::broadcast(true), ec);
+                        udp_sock->bind(udp::endpoint(udp::v4(), opt.discovery_port), ec);
+                        if (ec)
+                        {
+                            // another instance on this host may already hold the
+                            // port: keep the transport, drop discovery
+                            log("warn", std::format("discovery disabled: bind {} failed: {}",
+                                                    opt.discovery_port, ec.message()));
+                            udp_sock.reset();
+                        }
+                        else
+                        {
+                            boost::system::error_code jec;
+                            udp_sock->set_option(asio::ip::multicast::join_group(
+                                                     asio::ip::make_address_v4(kGroup)),
+                                                 jec);
+                            udp_sock->set_option(asio::ip::multicast::enable_loopback(true), jec);
+                            group_endpoint = udp::endpoint(asio::ip::make_address_v4(kGroup), opt.discovery_port);
+                            build_announce_targets();
+                        }
+                    }
+                    else
+                    {
+                        udp_sock.reset();
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    udp_sock.reset();
+                    log("warn", std::string("discovery disabled: ") + e.what());
+                }
+            }
+
+            alive.store(true);
+            work.emplace(asio::make_work_guard(io));
+            accept_loop();
+            if (udp_sock)
+            {
+                start_receive();
+                announce_loop();
+            }
+            sweep_loop();
+            pair_expire_loop();
+            const unsigned n = std::max(1u, std::min(4u, std::thread::hardware_concurrency() / 2));
+            threads.reserve(n);
+            for (unsigned i = 0; i < n; i++)
+                threads.emplace_back([this](std::stop_token)
+                                     {
+                    try { io.run(); } catch (const std::exception &) {} });
+            log("info", std::format("flowlink started: id={} port={} discovery={} name={}",
+                                    client_id, bound_port, udp_sock ? opt.discovery_port : 0, name));
+            return true;
+        }
+
+        inline void impl::stop()
+        {
+            if (!alive.exchange(false))
+                return;
+            boost::system::error_code ec;
+            if (acceptor)
+            {
+                acceptor->close(ec);
+                acceptor.reset();
+            }
+            if (udp_sock)
+            {
+                udp_sock->close(ec);
+                udp_sock.reset();
+            }
+            announce_timer.cancel();
+            sweep_timer.cancel();
+            pair_timer.cancel();
+            std::map<std::string, std::shared_ptr<conn>> drop;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                drop.swap(sessions);
+                discovered.clear();
+                pairing = pairing_state{};
+            }
+            for (auto &[id, c] : drop)
+                c->close("service stopping");
+            work.reset();
+            io.stop();
+            for (auto &t : threads)
+            {
+                t.request_stop();
+                if (t.joinable())
+                    t.join(); // jthread would do this on destruction; be explicit so
+                              // io.stop() is already visible to every worker
+            }
+            threads.clear();
+            io.restart();
+            log("info", "flowlink stopped");
+        }
+
+        // -------------------------------------------------------------------------
+        //  impl — discovery
+        // -------------------------------------------------------------------------
+        inline void impl::build_announce_targets()
+        {
+            announce_targets.clear();
+            announce_targets.emplace_back(asio::ip::address_v4::broadcast(), opt.discovery_port);
+            if (group_endpoint.port() != 0)
+                announce_targets.push_back(group_endpoint);
+            // Every local IPv4 subnet gets its own broadcast address: a host with a
+            // docker bridge, a VPN or two NICs does not route 255.255.255.255 to all
+            // of them. Resolving the host name is portable and needs no platform
+            // adapter enumeration; the /24 guess is what makes it useful.
+            boost::system::error_code ec;
+            tcp::resolver res(io);
+            auto results = res.resolve(asio::ip::host_name(ec), "", ec);
+            if (ec)
+                return;
+            std::set<std::string> seen;
+            for (const auto &entry : results)
+            {
+                const auto addr = entry.endpoint().address();
+                if (!addr.is_v4())
+                    continue;
+                auto bytes = addr.to_v4().to_bytes();
+                if (bytes[0] == 127)                              // loopback
+                    continue;
+                if (bytes[0] == 169 && bytes[1] == 254)           // link-local
+                    continue;
+                if (!seen.insert(addr.to_string()).second)
+                    continue;
+                bytes[3] = 255;
+                announce_targets.emplace_back(asio::ip::address_v4(bytes), opt.discovery_port);
+            }
+        }
+
+        inline void impl::announce_once(bool probe_reply, const udp::endpoint *to)
+        {
+            if (!udp_sock || !alive.load())
+                return;
+            json p{{"m", kProto},
+                   {"v", kVersion},
+                   {"t", "announce"},
+                   {"id", client_id},
+                   {"name", name},
+                   {"port", bound_port},
+                   {"pair", is_pairing_open()},
+                   {"os", os_name()},
+                   {"tz", tz_name()},
+                   {"lang", lang_name()},
+                   {"accept", opt.accept_remote},
+                   {"ts", (long long)std::time(nullptr)}};
+            const std::string text = p.dump();
+            boost::system::error_code ec;
+            if (to)
+            {
+                udp_sock->send_to(asio::buffer(text), *to, 0, ec);
+                return;
+            }
+            for (const auto &target : announce_targets)
+                udp_sock->send_to(asio::buffer(text), target, 0, ec);
+            (void)probe_reply;
+        }
+
+        inline void impl::announce_loop()
+        {
+            if (!alive.load())
+                return;
+            auto self = shared_from_this();
+            const auto jitter = std::chrono::milliseconds{static_cast<int>(randombytes_uniform(1200))};
+            announce_timer.expires_after(kAnnouncePeriod + jitter);
+            announce_timer.async_wait([self](const boost::system::error_code &ec)
+                                      {
+                if (ec || !self->alive.load()) return;
+                self->announce_once(false, nullptr);
+                self->announce_loop(); });
+        }
+
+        inline void impl::start_receive()
+        {
+            if (!udp_sock || !alive.load())
+                return;
+            auto self = shared_from_this();
+            auto buf = std::make_shared<std::string>(kMaxDatagram, '\0');
+            auto from = std::make_shared<udp::endpoint>();
+            udp_sock->async_receive_from(asio::buffer(*buf), *from,
+                                         [self, buf, from](const boost::system::error_code &ec, std::size_t n)
+                                         {
+                                             if (ec || !self->alive.load())
+                                             {
+                                                 if (self->alive.load() && ec != asio::error::operation_aborted)
+                                                     self->start_receive();
+                                                 return;
+                                             }
+                                             buf->resize(n);
+                                             self->on_datagram(*buf, *from);
+                                             self->start_receive();
+                                         });
+        }
+
+        inline void impl::on_datagram(const std::string &text, const udp::endpoint &from)
+        {
+            json j = json::parse(text, nullptr, false);
+            if (!j.is_object() || j.value("m", "") != kProto)
+                return;
+            if (j.value("v", 0) != kVersion)
+                return;
+            const std::string t = j.value("t", "");
+            const std::string their_id = j.value("id", "");
+            if (!is_hex_id(their_id, 32) || their_id == client_id)
+                return;
+            const std::string their_name = clean_name(j.value("name", ""));
+            const std::uint16_t port = (std::uint16_t)std::clamp(j.value("port", 0), 0, 65535);
+            if (port == 0)
+                return;
+            if (t == "probe")
+            {
+                announce_once(true, &from);
+                return;
+            }
+            if (t != "announce")
+                return;
+            const bool pair_open = j.value("pair", false);
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                peer_state &p = discovered[their_id];
+                const bool fresh = p.last_seen == 0;
+                p.id = their_id;
+                p.name = their_name;
+                p.addr = from.address().to_string();
+                p.port = port;
+                p.last_seen = (long long)std::time(nullptr);
+                p.pairing_open = pair_open;
+                p.os = clean_name(jstr(j, "os"), 24);
+                p.tz = clean_name(jstr(j, "tz"), 48);
+                p.lang = clean_name(jstr(j, "lang"), 24);
+                if (!fresh)
+                    return; // already known: refresh only, no event storm
+            }
+            emit({{"type", "discovered"}, {"client_id", their_id}, {"name", their_name},
+                  {"addr", from.address().to_string()}, {"port", port}, {"pairing", pair_open},
+                  {"os", clean_name(jstr(j, "os"), 24)}, {"tz", clean_name(jstr(j, "tz"), 48)},
+                  {"lang", clean_name(jstr(j, "lang"), 24)}});
+        }
+
+        inline void impl::probe_now()
+        {
+            if (!udp_sock || !alive.load())
+                return;
+            json p{{"m", kProto}, {"v", kVersion}, {"t", "probe"}, {"id", client_id},
+                   {"name", name}, {"port", bound_port},
+                   {"os", os_name()}, {"tz", tz_name()}, {"lang", lang_name()},
+                   {"ts", (long long)std::time(nullptr)}};
+            const std::string text = p.dump();
+            boost::system::error_code ec;
+            for (const auto &target : announce_targets)
+                udp_sock->send_to(asio::buffer(text), target, 0, ec);
+        }
+
+        // -------------------------------------------------------------------------
+        //  impl — inbound connections and sessions
+        // -------------------------------------------------------------------------
+        inline std::shared_ptr<impl::conn> impl::make_conn(tcp::socket s)
+        {
+            return std::make_shared<conn>(shared_from_this(), std::move(s));
+        }
+
+        inline void impl::accept_loop()
+        {
+            if (!acceptor || !alive.load())
+                return;
+            auto self = shared_from_this();
+            auto s = std::make_shared<tcp::socket>(io);
+            acceptor->async_accept(*s, [self, s](const boost::system::error_code &ec)
+                                   {
+                if (!self->alive.load()) return;
+                if (!ec)
+                {
+                    auto c = self->make_conn(std::move(*s));
+                    c->inbound = true;
+                    c->start_inbound();
+                }
+                self->accept_loop(); });
+        }
+
+        inline void impl::register_session(const std::shared_ptr<conn> &c)
+        {
+            std::shared_ptr<conn> old;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                auto it = sessions.find(c->peer_id);
+                if (it != sessions.end() && it->second != c)
+                    old = it->second;
+                sessions[c->peer_id] = c;
+            }
+            if (old)
+                old->close("superseded by a new session");
+        }
+
+        inline void impl::drop_session(const std::string &peer, const std::shared_ptr<conn> &c)
+        {
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                auto it = sessions.find(peer);
+                if (it != sessions.end() && it->second == c)
+                {
+                    sessions.erase(it);
+                    removed = true;
+                }
+            }
+            if (removed)
+                emit({{"type", "offline"}, {"client_id", peer}});
+        }
+
+        inline std::shared_ptr<impl::conn> impl::session_for(const std::string &peer, int timeout_ms, std::string &err)
+        {
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                auto it = sessions.find(peer);
+                if (it != sessions.end())
+                {
+                    // a live session, or one another caller is already handshaking
+                    // with: wait on the same attempt instead of opening a second one
+                    if (it->second->ready)
+                        return it->second;
+                    auto joining = it->second;
+                    std::string why;
+                    if (joining->wait_ready(timeout_ms, why))
+                        return joining;
+                    err = why;
+                    return nullptr;
+                }
+            }
+            // where is it? discovery first, then the address remembered at pairing
+            std::string addr;
+            std::uint16_t port = 0;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (auto it = discovered.find(peer); it != discovered.end())
+                {
+                    addr = it->second.addr;
+                    port = it->second.port;
+                }
+            }
+            if (addr.empty() || port == 0)
+            {
+                if (auto m = st.load_meta(peer))
+                {
+                    addr = m->addr;
+                    port = m->port;
+                }
+            }
+            if (addr.empty() || port == 0)
+            {
+                err = "peer address unknown: it is not on the network right now";
+                return nullptr;
+            }
+            auto c = make_conn(tcp::socket(io));
+            c->inbound = false;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                sessions[peer] = c; // provisional: concurrent callers join this attempt
+            }
+            boost::system::error_code ec;
+            const auto address = asio::ip::make_address(addr, ec);
+            if (ec)
+            {
+                drop_session(peer, c);
+                err = "bad peer address: " + addr;
+                return nullptr;
+            }
+            const tcp::endpoint ep(address, port);
+            auto self = shared_from_this();
+            c->sock.async_connect(ep, asio::bind_executor(c->strand, [c](const boost::system::error_code &e)
+                                                         {
+                if (e) { c->fail("connect failed: " + e.message()); return; }
+                c->start_outbound("resume", ""); }));
+            std::string why;
+            if (!c->wait_ready(timeout_ms, why))
+            {
+                drop_session(peer, c);
+                c->close("handshake failed");
+                err = why;
+                return nullptr;
+            }
+            return c;
+        }
+
+        inline void impl::sweep_loop()
+        {
+            if (!alive.load())
+                return;
+            auto self = shared_from_this();
+            sweep_timer.expires_after(kSweepPeriod);
+            sweep_timer.async_wait([self](const boost::system::error_code &ec)
+                                   {
+                if (ec || !self->alive.load()) return;
+                const long long now = (long long)std::time(nullptr);
+                std::vector<std::shared_ptr<impl::conn>> idle;
+                {
+                    std::lock_guard<std::mutex> lk(self->mx);
+                    for (auto it = self->discovered.begin(); it != self->discovered.end();)
+                        if (now - it->second.last_seen > kPeerTtl.count())
+                            it = self->discovered.erase(it);
+                        else
+                            ++it;
+                    for (auto &[id, c] : self->sessions)
+                        if (c->ready && now - c->last_rx > kSessionIdle.count())
+                            idle.push_back(c);
+                }
+                for (auto &c : idle)
+                    c->close("idle timeout");
+                self->sweep_loop(); });
+        }
+
+        inline void impl::pair_expire_loop()
+        {
+            if (!alive.load())
+                return;
+            auto self = shared_from_this();
+            pair_timer.expires_after(kPairSweepPeriod);
+            pair_timer.async_wait([self](const boost::system::error_code &ec)
+                                  {
+                if (ec || !self->alive.load()) return;
+                {
+                    std::lock_guard<std::mutex> lk(self->mx);
+                    if (self->pairing.open && (long long)std::time(nullptr) >= self->pairing.expires)
+                    {
+                        self->pairing.open = false;
+                        self->pairing.code.clear();
+                        if (self->pairing.state == "waiting")
+                            self->pairing.state = "expired";
+                        self->emit({{"type", "pairing_expired"}});
+                    }
+                }
+                self->pair_expire_loop(); });
+        }
+
+        // -------------------------------------------------------------------------
+        //  impl — rpc dispatch
+        // -------------------------------------------------------------------------
+        inline json impl::dispatch(const std::string &method, const json &params, std::string &err)
+        {
+            std::shared_ptr<const std::function<json(const json &, std::string &)>> h;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (const auto it = handlers.find(method); it != handlers.end())
+                    h = it->second;
+            }
+            if (h)
+                return (*h)(params, err);
+            if (method == "transfer.deliver" || method == "mail.deliver")
+                return deliver_transmission(params, err);
+            if (method == "ping")
+                return json{{"ok", true}, {"ts", (long long)std::time(nullptr)}, {"name", name},
+                            {"client_id", client_id}};
+            if (opt.on_call)
+                return opt.on_call(method, params, err);
+            err = "unknown method: " + method;
+            return json{};
+        }
+
+        // A peer sent us a transfer: the JSONL file lands in links/<sender>/ and
+        // the index in links/transmission.json gets one row for it.
+        inline json impl::deliver_transmission(const json &params, std::string &err)
+        {
+            transmission t;
+            t.id = jstr(params, "id");
+            if (t.id.empty())
+                t.id = store::new_transmission_id();
+            t.from = jstr(params, "from");
+            t.from_name = clean_name(jstr(params, "from_name"));
+            t.subject = jstr(params, "subject");
+            t.note = jstr(params, "note");
+            t.kind = jstr(params, "kind", "session");
+            t.session = jstr(params, "session");
+            t.created = jint(params, "created");
+            if (t.created == 0)
+                t.created = (long long)std::time(nullptr);
+            if (t.subject.empty())
+                t.subject = "(no subject)";
+            if (!is_hex_id(t.from, 32))
+            {
+                err = "transfer without a valid sender";
+                return json{};
+            }
+            json messages = params.contains("messages") ? params["messages"] : json::array();
+            if (!messages.is_array())
+            {
+                err = "transfer payload must be a list of messages";
+                return json{};
+            }
+            const std::string stored = st.store_transmission(t, messages);
+            if (stored.empty())
+            {
+                err = "could not store the transfer";
+                return json{};
+            }
+            emit({{"type", "transmission"},
+                  {"id", t.id},
+                  {"from", t.from},
+                  {"from_name", t.from_name},
+                  {"subject", t.subject},
+                  {"kind", t.kind}});
+            log("info", std::format("transfer {} from {} ({})", t.id, t.from_name, t.from));
+            return json{{"ok", true}, {"id", t.id}, {"bytes", (long long)messages.dump().size()}};
+        }
+
+        // -------------------------------------------------------------------------
+        //  impl — views
+        // -------------------------------------------------------------------------
+        inline json impl::peers_json()
+        {
+            json out = json::array();
+            auto metas = st.all_meta();
+            std::map<std::string, peer_state> disc;
+            std::map<std::string, bool> online;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                disc = discovered;
+                for (auto &[id, c] : sessions)
+                    online[id] = c->ready;
+            }
+            const long long now = (long long)std::time(nullptr);
+            std::set<std::string> seen;
+            for (auto &m : metas)
+            {
+                seen.insert(m.id);
+                const bool on = online.count(m.id) && online[m.id];
+                const auto it = disc.find(m.id);
+                json e{{"client_id", m.id},
+                       {"name", m.name.empty() ? m.id.substr(0, 8) : m.name},
+                       {"paired", true},
+                       {"online", on},
+                       {"addr", on ? (it != disc.end() ? it->second.addr : m.addr) : m.addr},
+                       {"port", on ? (it != disc.end() ? it->second.port : m.port) : m.port},
+                       {"paired_at", m.paired_at},
+                       {"last_seen", on ? now : m.last_seen},
+                       {"via", m.via},
+                       {"os", m.os},
+                       {"tz", m.tz},
+                       {"lang", m.lang},
+                       {"trusted", st.has_key(m.id)},
+                       {"discovered", it != disc.end()},
+                       {"pairing", it != disc.end() && it->second.pairing_open}};
+                out.push_back(std::move(e));
+            }
+            for (auto &[id, p] : disc)
+            {
+                if (seen.count(id))
+                    continue;
+                out.push_back({{"client_id", id},
+                               {"name", p.name.empty() ? id.substr(0, 8) : p.name},
+                               {"paired", false},
+                               {"online", false},
+                               {"addr", p.addr},
+                               {"port", p.port},
+                               {"paired_at", 0},
+                               {"last_seen", p.last_seen},
+                               {"via", ""},
+                               {"os", p.os},
+                               {"tz", p.tz},
+                               {"lang", p.lang},
+                               {"trusted", false},
+                               {"discovered", true},
+                               {"pairing", p.pairing_open}});
+            }
+            return out;
+        }
+
+        // the user's pinned FlowLink workspaces (links.json), newest last
+        inline json impl::link_workspaces_json() { return st.workspaces_json(); }
+
+        inline json impl::status()
+        {
+            json pair;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                pair = {{"open", pairing.open},
+                        {"state", pairing.state},
+                        {"code", pairing.display},
+                        {"expires", pairing.expires},
+                        {"peer", pairing.peer},
+                        {"fails", pairing.fails}};
+            }
+            auto [unread, total] = st.transmission_counts();
+            return json{{"enabled", alive.load()},
+                        {"client_id", client_id},
+                        {"name", name},
+                        {"port", bound_port},
+                        {"discovery_port", udp_sock ? opt.discovery_port : 0},
+                        {"announce", opt.announce},
+                        {"accept_remote", opt.accept_remote},
+                        {"settings", st.settings()},
+                        {"pairing", pair},
+                        {"peers", peers_json()},
+                        {"workspaces", link_workspaces_json()},
+                        {"transmissions", {{"unread", unread}, {"total", total}}}};
+        }
+
+        // =========================================================================
+        //  service — the public face (pimpl: the header stays readable and impl
+        //  internals never leak into the shell)
+        // =========================================================================
+        class service
+        {
+        public:
+            using options = impl::options;
+            using handler = std::function<json(const json &, std::string &)>;
+
+            explicit service(options o) : p_(std::make_shared<impl>(std::move(o))) {}
+            service(const service &) = delete;
+            service &operator=(const service &) = delete;
+            ~service() { p_->stop(); }
+
+            bool start(std::string &err) { return p_->start(err); }
+            void stop() { p_->stop(); }
+            bool running() const { return p_->alive.load(); }
+            json status() { return p_->status(); }
+            std::string client_id() const { return p_->client_id; }
+            std::string name() const { return p_->name; }
+
+            void on(std::string method, handler h)
+            {
+                auto shared = std::make_shared<const handler>(std::move(h));
+                std::lock_guard<std::mutex> lk(p_->mx);
+                p_->handlers.insert_or_assign(std::move(method), std::move(shared));
+            }
+
+            // ---- pairing -------------------------------------------------------
+            json pair_begin(int ttl_seconds)
+            {
+                if (!running())
+                    return json{{"ok", false}, {"error", "flowlink is not running"}};
+                const int ttl = std::clamp(ttl_seconds <= 0 ? kPairTtlSeconds : ttl_seconds, 30, 3600);
+                impl::pairing_state ps;
+                ps.open = true;
+                ps.code = pairing_normalize(pairing_code_new());
+                ps.display = pairing_display(ps.code);
+                ps.expires = (long long)std::time(nullptr) + ttl;
+                ps.state = "waiting";
+                {
+                    std::lock_guard<std::mutex> lk(p_->mx);
+                    p_->pairing = ps;
+                }
+                // make sure the other side can find us even if announce is off
+                p_->probe_now();
+                p_->announce_once(true, nullptr);
+                return json{{"ok", true}, {"code", ps.display}, {"raw", ps.code},
+                            {"expires", ps.expires}, {"client_id", p_->client_id}, {"name", p_->name}};
+            }
+
+            json pair_cancel()
+            {
+                std::lock_guard<std::mutex> lk(p_->mx);
+                const bool was = p_->pairing.open;
+                p_->pairing = impl::pairing_state{};
+                return json{{"ok", true}, {"was_open", was}};
+            }
+
+            // `code` is what the user typed (grouping spaces are ignored); `addr`
+            // is "ip" or "ip:port", empty = find the peer through discovery
+            json pair_join(const std::string &code, const std::string &addr, std::string &err)
+            {
+                if (!running())
+                {
+                    err = "flowlink is not running";
+                    return json{};
+                }
+                const std::string norm = pairing_normalize(code);
+                std::string raw;
+                if (!pairing_code_decode(norm, raw))
+                {
+                    err = "the pairing code is malformed (512-bit, base62)";
+                    return json{};
+                }
+                std::vector<tcp::endpoint> targets;
+                boost::system::error_code ec;
+                std::string host = addr;
+                std::uint16_t port = 0;
+                const auto colon = host.rfind(':');
+                if (colon != std::string::npos && host.find(':') == colon)
+                {
+                    port = (std::uint16_t)std::atoi(host.c_str() + colon + 1);
+                    host = host.substr(0, colon);
+                }
+                if (!host.empty())
+                {
+                    const auto a = asio::ip::make_address(host, ec);
+                    if (ec)
+                    {
+                        err = "bad address: " + addr;
+                        return json{};
+                    }
+                    targets.emplace_back(a, port ? port : kDefaultPort);
+                }
+                else
+                {
+                    // ask the network: cells with a pairing window open answer
+                    p_->probe_now();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+                    std::vector<impl::peer_state> cand;
+                    {
+                        std::lock_guard<std::mutex> lk(p_->mx);
+                        for (auto &[id, ps] : p_->discovered)
+                            if (ps.pairing_open)
+                                cand.push_back(ps);
+                    }
+                    for (auto &c : cand)
+                    {
+                        const auto a = asio::ip::make_address(c.addr, ec);
+                        if (!ec)
+                            targets.emplace_back(a, c.port);
+                    }
+                    if (targets.empty())
+                    {
+                        err = "no cell is offering a pairing window on this network — enter its address instead";
+                        return json{};
+                    }
+                }
+                std::string last;
+                for (auto &ep : targets)
+                {
+                    auto c = p_->make_conn(tcp::socket(p_->io));
+                    c->inbound = false;
+                    boost::system::error_code cec;
+                    c->sock.connect(ep, cec);
+                    if (cec)
+                    {
+                        last = std::format("{}:{} unreachable: {}", ep.address().to_string(), ep.port(), cec.message());
+                        continue;
+                    }
+                    c->start_outbound("pair", norm);
+                    std::string why;
+                    if (!c->wait_ready(15000, why))
+                    {
+                        last = why;
+                        c->close("pairing failed");
+                        continue;
+                    }
+                    return json{{"ok", true},
+                                {"client_id", c->peer_id},
+                                {"name", c->peer_name},
+                                {"addr", ep.address().to_string()},
+                                {"port", ep.port()}};
+                }
+                err = last.empty() ? "pairing failed" : last;
+                return json{};
+            }
+
+            // ---- peers ---------------------------------------------------------
+            json peers() { return p_->peers_json(); }
+
+            // "forget": remove the link record, its credential and everything it
+            // sent us. "disconnect" only removes the trust credential.
+            bool forget(const std::string &id, std::string &err)
+            {
+                close_session(id, "forgotten");
+                if (!p_->st.forget(id))
+                {
+                    err = "unknown peer";
+                    return false;
+                }
+                std::lock_guard<std::mutex> lk(p_->mx);
+                p_->discovered.erase(id);
+                return true;
+            }
+            bool disconnect(const std::string &id, std::string &err)
+            {
+                if (!is_hex_id(id, 32))
+                {
+                    err = "bad client id";
+                    return false;
+                }
+                close_session(id, "disconnected by the user");
+                if (!p_->st.disconnect(id))
+                {
+                    err = "could not remove the link key";
+                    return false;
+                }
+                p_->log("info", std::format("link disconnected: {}", id));
+                return true;
+            }
+            void close_session(const std::string &id, const std::string &why)
+            {
+                std::shared_ptr<impl::conn> c;
+                {
+                    std::lock_guard<std::mutex> lk(p_->mx);
+                    auto it = p_->sessions.find(id);
+                    if (it != p_->sessions.end())
+                        c = it->second;
+                }
+                if (c)
+                    c->close(why);
+            }
+
+            // ---- transfers -----------------------------------------------------
+            // The session's messages travel as JSONL; the peer writes the file and
+            // indexes it in links/transmission.json.
+            json send_transfer(const std::string &peer, const json &item, std::string &err)
+            {
+                std::string why;
+                auto c = p_->session_for(peer, 8000, why);
+                if (!c)
+                {
+                    err = why;
+                    return json{};
+                }
+                json r;
+                if (!c->request("transfer.deliver", item, 20000, r, why))
+                {
+                    err = why;
+                    return json{};
+                }
+                return r;
+            }
+            json transmissions() { return p_->st.transmissions_json(); }
+            json read_transmission(const std::string &id)
+            {
+                for (auto &t : p_->st.list_transmissions())
+                {
+                    if (t.id != id)
+                        continue;
+                    json msgs;
+                    p_->st.read_transmission_messages(t, msgs);
+                    (void)p_->st.mark_transmission(id, true); // read flag only
+                    return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
+                            {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
+                            {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
+                            {"read", true}, {"session", t.session}, {"messages", msgs}};
+                }
+                return json{};
+            }
+            bool drop_transmission(const std::string &id) { return p_->st.drop_transmission(id); }
+            json mark_transmission(const std::string &id, bool read)
+            {
+                return json{{"ok", p_->st.mark_transmission(id, read)}};
+            }
+
+            // ---- settings / FlowLink workspaces (links.json) --------------------
+            json settings() { return p_->st.settings(); }
+            json update_settings(const json &patch)
+            {
+                (void)p_->st.patch_settings(patch);
+                return p_->st.settings();
+            }
+            json workspaces() { return p_->link_workspaces_json(); }
+            bool add_workspace(const std::string &cell, const std::string &cwd,
+                               const std::string &name, std::string &err)
+            {
+                if (!is_hex_id(cell, 32))
+                {
+                    err = "bad client id";
+                    return false;
+                }
+                if (cwd.empty())
+                {
+                    err = "cwd is required";
+                    return false;
+                }
+                link_workspace w;
+                w.cell = cell;
+                w.cwd = cwd;
+                w.name = clean_name(name, 96);
+                if (!p_->st.add_link_workspace(w))
+                {
+                    err = "already in the FlowLink workspace list";
+                    return false;
+                }
+                p_->emit({{"type", "workspaces"}});
+                return true;
+            }
+            bool remove_workspace(const std::string &cell, const std::string &cwd)
+            {
+                const bool ok = p_->st.remove_link_workspace(cell, cwd);
+                if (ok)
+                    p_->emit({{"type", "workspaces"}});
+                return ok;
+            }
+
+            // fire-and-forget event to one peer (remote turn streaming, workspace
+            // notifications): the peer sees it as a "peer_event"
+            bool notify(const std::string &peer, const std::string &method, const json &params)
+            {
+                std::shared_ptr<impl::conn> c;
+                {
+                    std::lock_guard<std::mutex> lk(p_->mx);
+                    auto it = p_->sessions.find(peer);
+                    if (it != p_->sessions.end())
+                        c = it->second;
+                }
+                if (!c || !c->ready)
+                    return false;
+                json payload{{"t", "evt"}, {"m", method}, {"p", params}};
+                asio::post(c->strand, [c, payload]
+                           { c->send_encrypted(payload); });
+                return true;
+            }
+
+            // ---- generic rpc (fs.*, tw.*, …) -----------------------------------
+            json call(const std::string &peer, const std::string &method, const json &params,
+                      int timeout_ms, std::string &err)
+            {
+                std::string why;
+                auto c = p_->session_for(peer, 10000, why);
+                if (!c)
+                {
+                    err = why;
+                    return json{};
+                }
+                json r;
+                if (!c->request(method, params, timeout_ms, r, why))
+                {
+                    err = why;
+                    return json{};
+                }
+                return r;
+            }
+
+            json probe()
+            {
+                p_->probe_now();
+                return json{{"ok", true}};
+            }
+            json discovered()
+            {
+                json out = json::array();
+                std::lock_guard<std::mutex> lk(p_->mx);
+                for (auto &[id, ps] : p_->discovered)
+                    out.push_back({{"client_id", id}, {"name", ps.name}, {"addr", ps.addr},
+                                   {"port", ps.port}, {"last_seen", ps.last_seen},
+                                   {"pairing", ps.pairing_open}});
+                return out;
+            }
+            void log(const std::string &level, const std::string &msg) { p_->log(level, msg); }
+            void emit(const json &ev) { p_->emit(ev); }
+
+        private:
+            std::shared_ptr<impl> p_;
+        };
+    } // namespace flowlink
+
+    // ===== end of FlowLink =======================================================
+
+    // =========================================================================
     //  link — the /link command's bridge to a FlowLink service.
     //
     //  The peer network (UDP discovery, pairing codes, end-to-end encrypted
@@ -8503,20 +11664,17 @@ namespace cell
             std::function<nlohmann::json(const std::string &, const nlohmann::json &, std::string &)> on_call;
         };
 
-        inline std::mutex &mx()
+        // The one service slot. An atomic shared_ptr gives readers a
+        // lock-free load (service() is called on every status/UI refresh) and
+        // still keeps the object alive while a caller is using it.
+        inline std::atomic<std::shared_ptr<flowlink::service>> &slot()
         {
-            static std::mutex m;
-            return m;
-        }
-        inline std::shared_ptr<flowlink::service> &slot()
-        {
-            static std::shared_ptr<flowlink::service> s;
+            static std::atomic<std::shared_ptr<flowlink::service>> s;
             return s;
         }
         inline std::shared_ptr<flowlink::service> service()
         {
-            std::lock_guard<std::mutex> lk(mx());
-            return slot();
+            return slot().load(std::memory_order_acquire);
         }
         inline bool running()
         {
@@ -8546,26 +11704,127 @@ namespace cell
             auto svc = std::make_shared<flowlink::service>(std::move(fo));
             if (!svc->start(err))
                 return false;
-            std::shared_ptr<flowlink::service> old;
-            {
-                std::lock_guard<std::mutex> lk(mx());
-                old = std::move(slot());
-                slot() = svc;
-            }
+            // exchange keeps the previous service alive until we stop it, so a
+            // concurrent reader never sees a destroyed object
+            auto old = slot().exchange(std::move(svc), std::memory_order_acq_rel);
             if (old)
                 old->stop();
             return true;
         }
         inline void disable()
         {
-            std::shared_ptr<flowlink::service> old;
-            {
-                std::lock_guard<std::mutex> lk(mx());
-                old = std::move(slot());
-                slot().reset();
-            }
+            auto old = slot().exchange(nullptr, std::memory_order_acq_rel);
             if (old)
                 old->stop();
+        }
+
+        // ---- settings: .cell/links/links.json -------------------------------
+        // FlowLink's own settings, links and workspace list live with the
+        // feature (not in the agent's config.json). These helpers work whether
+        // or not the service is running, so the UI can edit them while off.
+        inline flowlink::store store_for(const std::filesystem::path &root_dir = {})
+        {
+            return flowlink::store{root_dir.empty() ? root : root_dir};
+        }
+        inline nlohmann::json settings(const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            return st.settings();
+        }
+        inline bool patch_settings(const nlohmann::json &patch, const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            return st.patch_settings(patch);
+        }
+        inline bool set_enabled(bool on, const std::filesystem::path &root_dir = {})
+        {
+            return patch_settings({{"enabled", on}}, root_dir);
+        }
+        // identity / links / workspaces / transfers straight from the store:
+        // the management page has to render while the service is off
+        inline nlohmann::json identity(const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            return st.identity(flowlink::default_name());
+        }
+        inline nlohmann::json links(const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            nlohmann::json out = nlohmann::json::array();
+            for (const auto &m : st.all_meta())
+                out.push_back(m.to_json());
+            return out;
+        }
+        inline nlohmann::json workspaces(const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            return st.workspaces_json();
+        }
+        inline nlohmann::json transfers(const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            return st.transmissions_json();
+        }
+        inline nlohmann::json read_transfer(const std::string &id, const std::filesystem::path &root_dir = {})
+        {
+            auto st = store_for(root_dir);
+            for (const auto &t : st.list_transmissions())
+            {
+                if (t.id != id)
+                    continue;
+                nlohmann::json msgs;
+                st.read_transmission_messages(t, msgs);
+                return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
+                        {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
+                        {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
+                        {"read", t.read}, {"session", t.session}, {"messages", msgs}};
+            }
+            return nlohmann::json{};
+        }
+
+        // One-shot move of the pre-links.json keys out of config.json. Runs at
+        // boot; a links.json that already exists wins (nothing is overwritten).
+        inline void migrate_legacy_settings(const std::filesystem::path &root_dir = {})
+        {
+            const auto dir = root_dir.empty() ? root : root_dir;
+            auto st = store_for(dir);
+            std::error_code ec;
+            if (std::filesystem::exists(st.links_file(), ec))
+                return; // links.json is authoritative already
+            std::ifstream f(dir / "config.json", std::ios::binary);
+            if (!f)
+                return;
+            auto j = nlohmann::json::parse(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>(),
+                                           nullptr, false);
+            if (!j.is_object())
+                return;
+            auto take = [&](const char *key) -> std::optional<nlohmann::json>
+            {
+                auto it = j.find(key);
+                if (it == j.end())
+                    return std::nullopt;
+                return *it;
+            };
+            nlohmann::json patch = nlohmann::json::object();
+            if (auto v = take("link_enabled"); v && v->is_boolean())
+                patch["enabled"] = *v;
+            if (auto v = take("link_name"); v && v->is_string())
+                patch["name"] = *v;
+            if (auto v = take("link_port"); v && v->is_number())
+                patch["port"] = *v;
+            if (auto v = take("link_discovery"); v && v->is_number())
+                patch["discovery"] = *v;
+            if (auto v = take("link_announce"); v && v->is_boolean())
+                patch["announce"] = *v;
+            if (auto v = take("link_accept"); v && v->is_boolean())
+                patch["accept"] = *v;
+            if (auto v = take("link_workspace"); v && v->is_string())
+                patch["workspace"] = *v;
+            patch["version"] = 2;
+            auto merged = st.get_links();
+            for (auto it = patch.begin(); it != patch.end(); ++it)
+                merged[it.key()] = *it;
+            (void)st.save_links(merged);
         }
 
         // How THIS frontend mounts the service (it owns on_call, and only it
@@ -8591,7 +11850,7 @@ namespace cell
                         {"client_id", ""},
                         {"name", ""},
                         {"peers", nlohmann::json::array()},
-                        {"inbox", {{"unread", 0}, {"total", 0}}}};
+                        {"transmissions", {{"unread", 0}, {"total", 0}}}};
             try
             {
                 return svc->status();
@@ -8868,17 +12127,42 @@ namespace cell
                         return {{"ok", false}, {"error", err.empty() ? "unknown peer" : err}};
                     return {{"ok", true}, {"forgotten", true}};
                 }
-                if (name == "inbox")
-                    return {{"ok", true}, {"items", svc->inbox()}};
+                if (name == "inbox" || name == "transfers")
+                    return {{"ok", true}, {"items", svc->transmissions()}};
                 if (name == "read")
                 {
-                    nlohmann::json m = svc->read_mail(args.value("id", ""));
+                    nlohmann::json m = svc->read_transmission(args.value("id", ""));
                     if (m.empty())
-                        return {{"ok", false}, {"error", "no such message"}};
+                        return {{"ok", false}, {"error", "no such transfer"}};
                     return {{"ok", true}, {"mail", m}};
                 }
                 if (name == "drop")
-                    return {{"ok", true}, {"dropped", svc->drop_mail(args.value("id", ""))}};
+                    return {{"ok", true}, {"dropped", svc->drop_transmission(args.value("id", ""))}};
+                if (name == "disconnect")
+                {
+                    std::string err;
+                    if (!svc->disconnect(args.value("client_id", ""), err))
+                        return {{"ok", false}, {"error", err.empty() ? "unknown link" : err}};
+                    return {{"ok", true}, {"disconnected", true}};
+                }
+                if (name == "settings")
+                {
+                    if (args.contains("patch"))
+                        return {{"ok", true}, {"settings", svc->update_settings(args["patch"])}};
+                    return {{"ok", true}, {"settings", svc->settings()}};
+                }
+                if (name == "workspaces")
+                    return {{"ok", true}, {"workspaces", svc->workspaces()}};
+                if (name == "ws.add")
+                {
+                    std::string err;
+                    if (!svc->add_workspace(args.value("cell", ""), args.value("cwd", ""),
+                                            args.value("name", ""), err))
+                        return {{"ok", false}, {"error", err}};
+                    return {{"ok", true}, {"workspaces", svc->workspaces()}};
+                }
+                if (name == "ws.remove")
+                    return {{"ok", true}, {"removed", svc->remove_workspace(args.value("cell", ""), args.value("cwd", ""))}};
                 if (name == "share")
                 {
                     const std::string sid = args.value("session", "");
@@ -8891,10 +12175,11 @@ namespace cell
                                         {"from_name", svc->name()},
                                         {"subject", args.value("subject", std::string("Shared conversation"))},
                                         {"note", args.value("note", "")},
-                                        {"kind", "session"},
-                                        {"payload", {{"session", sid}, {"messages", msgs}}}};
+                                        {"kind", args.value("kind", std::string("session"))},
+                                        {"session", sid},
+                                        {"messages", msgs}};
                     std::string err;
-                    nlohmann::json r = svc->send_mail(args.value("cell", ""), item, err);
+                    nlohmann::json r = svc->send_transfer(args.value("cell", ""), item, err);
                     if (!err.empty())
                         return {{"ok", false}, {"error", err}};
                     r["ok"] = true;
@@ -8911,9 +12196,11 @@ namespace cell
                                         {"subject", args.value("subject", std::string("(no subject)"))},
                                         {"note", ""},
                                         {"kind", "text"},
-                                        {"payload", {{"text", body}}}};
+                                        {"session", ""},
+                                        {"messages", nlohmann::json::array(
+                                                         {{{"role", "user"}, {"text", body}}})}};
                     std::string err;
-                    nlohmann::json r = svc->send_mail(args.value("cell", ""), item, err);
+                    nlohmann::json r = svc->send_transfer(args.value("cell", ""), item, err);
                     if (!err.empty())
                         return {{"ok", false}, {"error", err}};
                     r["ok"] = true;
@@ -9052,10 +12339,10 @@ namespace cell
                     args["ttl"] = std::atoi(toks[2].c_str());
             }
             else if (sub != "status" && sub != "on" && sub != "off" && sub != "peers" &&
-                     sub != "cancel" && sub != "inbox" && sub != "probe")
+                     sub != "cancel" && sub != "inbox" && sub != "transfers" && sub != "probe")
             {
                 line("usage: /link [status|on|off|peers|pair [TTL]|join CODE [ADDR]|");
-                line("             cancel|share CELL [SID]|send CELL TEXT|inbox|read ID|");
+                line("             cancel|share CELL [SID]|send CELL TEXT|transfers|read ID|");
                 line("             forget CELL|probe]");
                 return out;
             }
@@ -9092,8 +12379,8 @@ namespace cell
                 for (const auto &p : peers)
                     if (p.value("online", false))
                         online++;
-                const nlohmann::json inbox = r.contains("inbox") ? r["inbox"] : nlohmann::json::object();
-                line(std::format("  peers {} ({} online)   inbox {} unread / {}",
+                const nlohmann::json inbox = r.contains("transmissions") ? r["transmissions"] : nlohmann::json::object();
+                line(std::format("  peers {} ({} online)   transfers {} unread / {}",
                                  peers.size(), online, inbox.value("unread", 0), inbox.value("total", 0)));
                 return out;
             }
@@ -9153,18 +12440,19 @@ namespace cell
                 line(std::format("delivered ({})", r.value("id", "?")));
                 return out;
             }
-            if (sub == "inbox")
+            if (sub == "inbox" || sub == "transfers")
             {
                 const nlohmann::json items = r.contains("items") ? r["items"] : nlohmann::json::array();
                 if (items.empty())
                 {
-                    line("the mailbox is empty");
+                    line("no transfers yet");
                     return out;
                 }
                 for (const auto &m : items)
-                    line(std::format("  {}  {}{}  from {}  {}", m.value("id", ""), m.value("subject", ""),
+                    line(std::format("  {}  {}{}  from {}  {}  {}B", m.value("id", ""), m.value("subject", ""),
                                      m.value("read", false) ? "" : " [unread]", m.value("from_name", ""),
-                                     flowlink::now_iso(m.value("created", (long long)0))));
+                                     flowlink::now_iso(m.value("created", (long long)0)),
+                                     m.value("bytes", (long long)0)));
                 line("read one with /link read ID");
                 return out;
             }
@@ -9176,13 +12464,10 @@ namespace cell
                 const std::string note = m.value("note", "");
                 if (!note.empty())
                     line("Note:    " + note);
-                const nlohmann::json payload = m.contains("payload") ? m["payload"] : nlohmann::json::object();
+                const nlohmann::json messages = m.contains("messages") ? m["messages"] : nlohmann::json::array();
                 line("");
-                if (m.value("kind", "") == "session" && payload.contains("messages"))
-                    for (const auto &msg : payload["messages"])
-                        line(std::format("### {}\n\n{}", msg.value("role", ""), msg.value("text", "")));
-                else
-                    line(payload.value("text", ""));
+                for (const auto &msg : messages)
+                    line(std::format("### {}\n\n{}", msg.value("role", ""), msg.value("text", "")));
                 return out;
             }
             return out;
@@ -18879,7 +22164,7 @@ static void print_help()
     cell::sys::println("  /notices seen [list]        list the accumulated notice audit trail (seen.jsonl)");
     cell::sys::println("  /notices seen clear         archive seen.jsonl to saved/notice-<UTC time>.jsonl and empty it");
     cell::sys::println("  /notices seen rm ID         delete one accumulated notice by id");
-    cell::sys::println("  /link                       FlowLink status: identity, pairing window, peers, mailbox");
+    cell::sys::println("  /link                       FlowLink status: identity, pairing window, peers, transfers");
     cell::sys::println("  /link on | off              mount / unmount the FlowLink service (desktop shell only)");
     cell::sys::println("  /link peers                 list the cells on this network (paired and discovered)");
     cell::sys::println("  /link pair [TTL]            open a pairing window and print the 512-bit code");
@@ -18887,8 +22172,8 @@ static void print_help()
     cell::sys::println("  /link cancel                close the pairing window");
     cell::sys::println("  /link share CELL [SID]      send a session's conversation to a paired cell");
     cell::sys::println("  /link send CELL TEXT...     send a short message to a paired cell");
-    cell::sys::println("  /link inbox                 list the mailbox");
-    cell::sys::println("  /link read ID               read one mailbox item");
+    cell::sys::println("  /link transfers             list received transfers (shared / archived sessions)");
+    cell::sys::println("  /link read ID               read one transfer");
     cell::sys::println("  /link forget CELL           drop a pairing (deletes the stored link key)");
     cell::sys::println("  /link probe                 broadcast a discovery probe");
     cell::sys::println("  /save                       save the current session");
@@ -25345,13 +28630,15 @@ int repl::run()
     // exactly this hook, so the CLI has the full feature set — no shell needed.
     cell::link::mount_hook() = [&cfg, &h, &eng](std::string &err) -> bool
     {
+        // settings come from .cell/links/links.json, not from config.json
+        const nlohmann::json fl = cell::link::settings();
         cell::link::mount_options o;
         o.root = cell::root;
-        o.name = cfg.link_name;
-        o.port = (std::uint16_t)std::clamp(cfg.link_port, 0, 65535);
-        o.discovery = (std::uint16_t)std::clamp(cfg.link_discovery, 0, 65535);
-        o.announce = cfg.link_announce;
-        o.accept_remote = cfg.link_accept;
+        o.name = fl.value("name", "");
+        o.port = (std::uint16_t)std::clamp(fl.value("port", 47822), 0, 65535);
+        o.discovery = (std::uint16_t)std::clamp(fl.value("discovery", 47821), 0, 65535);
+        o.announce = fl.value("announce", true);
+        o.accept_remote = fl.value("accept", false);
         o.on_event = [](const nlohmann::json &ev)
         {
             const std::string type = ev.value("type", "");
@@ -25364,14 +28651,15 @@ int repl::run()
         };
         o.on_call = [&cfg, &h, &eng](const std::string &method, const nlohmann::json &p, std::string &e) -> nlohmann::json
         {
-            if (!cfg.link_accept)
+            const nlohmann::json fls = cell::link::settings();
+            if (!fls.value("accept", false))
             {
-                e = "this cell does not accept remote work (link_accept is off)";
+                e = "this cell does not accept remote work (FlowLink settings)";
                 return nlohmann::json{};
             }
-            const std::filesystem::path base = cfg.link_workspace.empty()
-                                                   ? cell::workdir()
-                                                   : std::filesystem::path(cfg.link_workspace);
+            const std::string ws_dir = fls.value("workspace", "");
+            const std::filesystem::path base = ws_dir.empty() ? cell::workdir()
+                                                              : std::filesystem::path(ws_dir);
             if (method == "fs.ls" || method == "fs.read" || method == "fs.stat")
                 return cell::link::serve_files(base, method, p, e);
             if (method == "tw.new" || method == "tw.run")
@@ -25410,16 +28698,15 @@ int repl::run()
         };
         if (!cell::link::enable(o, err))
             return false;
-        cfg.link_enabled = true;
-        cell::config::save(cfg);
+        cell::link::set_enabled(true);
         return true;
     };
-    cell::link::unmount_hook() = [&cfg]
+    cell::link::unmount_hook() = []
     {
-        cfg.link_enabled = false;
-        cell::config::save(cfg);
+        cell::link::set_enabled(false);
     };
-    if (cfg.link_enabled)
+    cell::link::migrate_legacy_settings();
+    if (cell::link::settings().value("enabled", false))
     {
         std::string err;
         if (!cell::link::mount_hook()(err))

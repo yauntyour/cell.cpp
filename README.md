@@ -169,7 +169,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
   `<span>`, `<concepts>` and `std::move_only_function` — e.g. GCC 15+ (MSYS2 UCRT64) or a recent
   MSVC/Clang. This is bleeding-edge: use a recent standard library, not an LTS one.
 - **libcurl** (any recent backend), **libsodium**, **nlohmann/json** (header-only).
-- **Boost.Asio** (header-only) for FlowLink — the peer network in `flowlink.hpp`
+- **Boost.Asio** (header-only) for FlowLink — the peer network inside `cell.cpp`
   (`boost/asio.hpp`, `boost/asio/ip/multicast.hpp`). No Boost library is linked;
   headers are enough.
 - Recommended package manager: [vcpkg](https://github.com/microsoft/vcpkg)
