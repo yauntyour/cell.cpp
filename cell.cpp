@@ -7376,6 +7376,10 @@ namespace cell
                 return e;
             }
         };
+        // 旧版本把内置默认句持久化进了配置（config.json 的 "system"）：读到它
+        // 就当作"用户没设过"，否则默认零注入对老配置不生效
+        inline constexpr std::string_view legacy_system_prompt =
+            "You are a helpful assistant. Do not multiply entities beyond necessity.";
         struct settings
         {
             std::vector<provider_entry> providers;    // empty until the user adds one
@@ -7388,7 +7392,9 @@ namespace cell
             bool compact_auto = true;                 // auto-compress after long agent runs (default on)
             std::string compact_provider;             // compression provider name (empty => session provider)
             std::string compact_model;                // compression model name (empty => session model)
-            std::string system_prompt = "You are a helpful assistant. Do not multiply entities beyond necessity.";
+            // 空串 = 不向模型发送任何 system 消息（默认）。只有用户在设置页
+            // （或 --system）显式写了内容才会注入。
+            std::string system_prompt;
             std::string session_id;
             size_t teamwork_max_children = 5;                             // child agents per Teamwork job (1..100)
             size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
@@ -7601,7 +7607,9 @@ namespace cell
                         s.current_model = json_str(j, "model", "");
                     }
                 }
-                s.system_prompt = json_str(j, "system", s.system_prompt);
+                s.system_prompt = json_str(j, "system", "");
+                if (s.system_prompt == legacy_system_prompt)
+                    s.system_prompt.clear(); // 旧版的持久化默认句不算用户设置
                 s.session_id = json_str(j, "session", s.session_id);
                 s.teamwork_max_children = std::clamp(num_arg(j, "teamwork_max_children", 5), (size_t)1, (size_t)100);
                 // clamped: an unclamped SIZE_MAX (which is what "-1" or a garbage
@@ -22381,29 +22389,23 @@ namespace cell
             long long llm_requests() const { return llm_requests_.load(); }
             long long tool_calls() const { return tool_calls_.load(); }
 
-            // inject the base system prompt + skills metadata into an empty session
             struct prompt_info
             {
                 size_t prompt_chars = 0, skills_chars = 0, skill_count = 0;
                 bool injected = false;
             };
+            // 默认零注入：只有用户显式写了 system_prompt 才推一条 system 消息。
+            // 技能列表不再自动进提示词（需要时由用户 /skill 加载正文）。
             prompt_info ensure_prompt()
             {
                 prompt_info info;
                 cell::chat::session &sess = h_.now();
-                if (!sess.msg().empty())
+                if (!sess.msg().empty() || cfg_.system_prompt.empty())
                     return info;
                 sess.msg().push_back({{"role", "system"}, {"content", cfg_.system_prompt}});
-                auto skills_all = cell::skills::list();
-                std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
-                if (!skills_prompt.empty())
-                    sess.msg().push_back({{"role", "system"}, {"content", skills_prompt}});
-                cell::sys::logger::instance().debug("ctx", std::format("inject system_prompt={}chars{}", cfg_.system_prompt.size(),
-                                                                       skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
+                cell::sys::logger::instance().debug("ctx", std::format("inject system_prompt={}chars", cfg_.system_prompt.size()));
                 info.injected = true;
                 info.prompt_chars = cfg_.system_prompt.size();
-                info.skills_chars = skills_prompt.size();
-                info.skill_count = skills_all.size();
                 return info;
             }
 

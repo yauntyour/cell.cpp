@@ -326,7 +326,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/notices seen clear` | Archive `seen.jsonl` to `saved/notice-<UTC time>.jsonl` and empty it |
 | `/notices seen rm ID` | Delete one accumulated notice by id |
 | `/save` | Persist the current session now (flushes the async writer) |
-| `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt and skill list |
+| `/clear` | Empty the current session's messages but keep its id; re-injects the system prompt (when one is configured) |
 | `/new` | Save the current session, then start a fresh one (old files stay on disk) and re-probe the provider |
 | `/exit`, `/quit` | Exit |
 
