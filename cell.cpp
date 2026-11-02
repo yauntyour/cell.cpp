@@ -10206,9 +10206,20 @@ namespace cell
                         {
                             usage["input_tokens"] = (long long)num_arg(ev["message"]["usage"], "input_tokens", 0);
                             usage["cache_read_input_tokens"] = (long long)num_arg(ev["message"]["usage"], "cache_read_input_tokens", 0);
+                            // cache WRITES count towards the prompt total as well: a
+                            // hit rate computed without them reports 100% on the very
+                            // first cached round (nothing read, everything written)
+                            usage["cache_creation_input_tokens"] = (long long)num_arg(ev["message"]["usage"], "cache_creation_input_tokens", 0);
                         }
                         else if (type == "message_delta" && ev.contains("usage"))
+                        {
                             usage["output_tokens"] = (long long)num_arg(ev["usage"], "output_tokens", 0);
+                            // some gateways only report the prompt counters on the
+                            // final delta: adopt them when message_start had none
+                            for (const char *k : {"input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"})
+                                if (ev["usage"].contains(k) && ev["usage"][k].is_number_integer())
+                                    usage[k] = ev["usage"][k].get<long long>();
+                        }
                         else if (type == "error" && ev.contains("error"))
                         {
                             // an error event can arrive mid-stream (200 status) and
@@ -22265,6 +22276,7 @@ namespace cell
         // cache hit rate = cached prompt tokens / total prompt tokens
         // OpenAI: usage.prompt_tokens_details.cached_tokens within usage.prompt_tokens (total incl. cache)
         // Anthropic (llama.cpp): usage.cache_read_input_tokens disjoint from usage.input_tokens, so total = cache + input
+        // DeepSeek: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens, a disjoint hit/miss pair
         static std::optional<double> usage_cache_hit(const nlohmann::json &u)
         {
             if (!u.is_object())
@@ -22290,6 +22302,19 @@ namespace cell
                 cached = u["cache_read_input_tokens"].get<long long>();
                 if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
                     total = cached + u["input_tokens"].get<long long>() + (long long)num_arg(u, "cache_creation_input_tokens", 0);
+            }
+            else if (u.contains("prompt_cache_hit_tokens") && u["prompt_cache_hit_tokens"].is_number_integer())
+            {
+                // DeepSeek (and gateways that copy it): the cache counters sit at the
+                // top level as a hit/miss pair and prompt_tokens may be absent. The
+                // pair is disjoint, so the prompt total is hit + miss; prompt_tokens
+                // is only the fallback for a server that sends the hit count alone.
+                cached = u["prompt_cache_hit_tokens"].get<long long>();
+                const long long miss = (long long)num_arg(u, "prompt_cache_miss_tokens", -1);
+                if (miss >= 0)
+                    total = cached + miss;
+                else if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                    total = u["prompt_tokens"].get<long long>();
             }
             if (cached < 0 || total <= 0)
                 return std::nullopt;
@@ -23004,6 +23029,12 @@ namespace cell
 
             bool done = false;
             bool natural_end = true; // false when the turn aborted early (error, cancel, refusal)
+            // The round cap aborts the turn too, but unlike an error or a cancel it
+            // stops on a clean boundary: every tool call of the last round already
+            // has its result in the transcript and nothing is pending. That makes it
+            // the one abort whose context is safe to auto-compact (see the end of
+            // this function) — a 200-round run is exactly the context that needs it.
+            bool limit_hit = false;
             int rounds = 0;
             long long turn_tool_calls = 0;
             long long turn_thinking_entries = 0;
@@ -23023,6 +23054,7 @@ namespace cell
                     if (ev.on_error)
                         ev.on_error(std::format("[aborted] this turn hit the {} round limit - the model kept requesting tools", kMaxRoundsPerTurn));
                     natural_end = false;
+                    limit_hit = true;
                     break;
                 }
                 const cell::config::provider_entry *p = cfg_.current_provider_entry();
@@ -23611,20 +23643,25 @@ namespace cell
             // simply grown past a character budget — a pure chat turn produces
             // neither tool calls nor reasoning, and previously grew without bound
             // until it hit the provider's window (the one path that could lose
-            // history). only after turns that ended naturally — an aborted turn
+            // history). only after turns that ended on a boundary — an aborted turn
             // (request error, cancel, approval refusal) may be retried or resumed
-            // as-is, so compacting it automatically would rewrite history under it
+            // as-is, so compacting it automatically would rewrite history under it.
+            // The round-cap abort IS such a boundary (see limit_hit above): its
+            // transcript is complete and nothing can resume it, and a run that
+            // burned 200 rounds is the one context that most needs compacting —
+            // skipping it left the very next turn reading the same huge context.
             constexpr long long kAutoCompactChars = 400 * 1024; // ≈100k tokens
             bool long_run = turn_tool_calls + turn_thinking_entries >= 3;
-            long long ctx_chars = natural_end ? content_chars(h_.now().msg()) : 0;
+            bool boundary_end = natural_end || limit_hit;
+            long long ctx_chars = boundary_end ? content_chars(h_.now().msg()) : 0;
             bool oversized = ctx_chars >= kAutoCompactChars;
-            if (cfg_.compact_auto && natural_end && (long_run || oversized))
+            if (cfg_.compact_auto && boundary_end && (long_run || oversized))
             {
                 std::string result = compact(h_.now(), ev);
                 if (result.find("context compacted") != std::string::npos)
                 {
-                    log.info("ctx", std::format("auto_compact tool_calls={} thinking={} chars={} msgs={} result={}",
-                                                turn_tool_calls, turn_thinking_entries, ctx_chars, (long long)h_.now().msg().size(), result));
+                    log.info("ctx", std::format("auto_compact tool_calls={} thinking={} chars={} msgs={} round_limit={} result={}",
+                                                turn_tool_calls, turn_thinking_entries, ctx_chars, (long long)h_.now().msg().size(), limit_hit, result));
                     if (ev.on_status)
                         ev.on_status(std::format("[auto-compact] {}", result));
                     cell::box::reset_read_log(h_.box_context());
