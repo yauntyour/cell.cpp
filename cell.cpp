@@ -63,6 +63,10 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <wincrypt.h>
+// GetAdaptersAddresses: FlowLink discovery has to see every NIC (WSL's
+// vEthernet, Hyper-V switches, VPN tunnels), and only this API reports the
+// real prefix length next to each address.
+#include <iphlpapi.h>
 #else
 #include <unistd.h>
 #include <sys/wait.h>
@@ -70,6 +74,9 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -8873,6 +8880,207 @@ namespace cell
     #endif
         }
 
+        // ---- local IPv4 interfaces ----------------------------------------------
+        // Discovery needs the *directed broadcast* address of every subnet this
+        // host sits on, and a /24 guess is wrong the moment the mask is not /24 —
+        // which is exactly the case that matters: WSL2 hands its vEthernet a /20,
+        // Hyper-V switches a /20, and plenty of LANs run /16 or /18. With a /18,
+        // "100.2.22.255" is an ordinary host address, so the datagram is a unicast
+        // to nobody and discovery silently finds nothing.
+        //
+        // Two more things only real enumeration can give us:
+        //  * adapters the hostname does not resolve to (vEthernet (WSL) is the
+        //    one that matters — the Windows side never announced into the WSL
+        //    subnet, so WSL and the host could never see each other);
+        //  * the default gateway. A gateway is a real host on the same segment,
+        //    and for WSL2 it *is* the Windows host: unicasting an announce there
+        //    is the one path that survives the NAT boundary.
+        struct iface_v4
+        {
+            std::string name;   // adapter name, for logs and the UI
+            std::string addr;   // dotted quad
+            std::string bcast;  // addr | ~mask
+            std::string gw;     // first gateway, "" when there is none
+            unsigned prefix = 0;
+        };
+
+        inline std::string v4_text(std::uint32_t host_order)
+        {
+            return std::format("{}.{}.{}.{}", (host_order >> 24) & 0xffu, (host_order >> 16) & 0xffu,
+                               (host_order >> 8) & 0xffu, host_order & 0xffu);
+        }
+
+        // loopback and link-local (169.254/16) subnets carry no peers
+        inline bool v4_ignored(std::uint32_t host_order)
+        {
+            return ((host_order >> 24) & 0xffu) == 127 || ((host_order >> 16) & 0xffffu) == 0xa9feu;
+        }
+
+        inline std::vector<iface_v4> local_ifaces_v4()
+        {
+            std::vector<iface_v4> out;
+    #ifdef _WIN32
+            ULONG size = 16u * 1024u;
+            std::vector<unsigned char> buf;
+            IP_ADAPTER_ADDRESSES *addrs = nullptr;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                buf.resize(size);
+                addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buf.data());
+                const ULONG rc = GetAdaptersAddresses(
+                    AF_INET,
+                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
+                        GAA_FLAG_INCLUDE_GATEWAYS,
+                    nullptr, addrs, &size);
+                if (rc == NO_ERROR)
+                    break;
+                addrs = nullptr;
+                if (rc != ERROR_BUFFER_OVERFLOW)
+                    return out;
+            }
+            for (auto *a = addrs; a; a = a->Next)
+            {
+                if (a->OperStatus != IfOperStatusUp)
+                    continue;
+                std::string gw;
+                if (a->FirstGatewayAddress)
+                {
+                    const auto *sa = reinterpret_cast<const sockaddr_in *>(a->FirstGatewayAddress->Address.lpSockaddr);
+                    if (sa && sa->sin_family == AF_INET)
+                    {
+                        const std::uint32_t g = ntohl(sa->sin_addr.s_addr);
+                        if (g != 0 && !v4_ignored(g))
+                            gw = v4_text(g);
+                    }
+                }
+                for (auto *u = a->FirstUnicastAddress; u; u = u->Next)
+                {
+                    const auto *sa = reinterpret_cast<const sockaddr_in *>(u->Address.lpSockaddr);
+                    if (!sa || sa->sin_family != AF_INET)
+                        continue;
+                    const std::uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                    if (v4_ignored(ip))
+                        continue;
+                    const unsigned prefix = std::min<unsigned>(u->OnLinkPrefixLength, 32u);
+                    const std::uint32_t mask = prefix == 0 ? 0u : 0xffffffffu << (32u - prefix);
+                    iface_v4 i;
+                    i.name = a->FriendlyName ? clean_name(plat::wide_to_utf8(std::wstring_view(a->FriendlyName)), 48)
+                                             : std::string{};
+                    i.addr = v4_text(ip);
+                    i.bcast = v4_text(ip | ~mask);
+                    i.gw = gw;
+                    i.prefix = prefix;
+                    out.push_back(std::move(i));
+                }
+            }
+    #else
+            ifaddrs *list = nullptr;
+            if (getifaddrs(&list) != 0)
+                return out;
+            for (auto *ifa = list; ifa; ifa = ifa->ifa_next)
+            {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                    continue;
+                if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+                    continue;
+                const auto *sa = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr);
+                const std::uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                if (v4_ignored(ip))
+                    continue;
+                std::uint32_t mask = 0xffffffffu;
+                unsigned prefix = 32;
+                if (ifa->ifa_netmask)
+                {
+                    mask = ntohl(reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr);
+                    prefix = 0;
+                    for (std::uint32_t m = mask; m & 0x80000000u; m <<= 1)
+                        ++prefix;
+                }
+                iface_v4 i;
+                i.name = ifa->ifa_name ? clean_name(ifa->ifa_name, 48) : std::string{};
+                i.addr = v4_text(ip);
+                i.bcast = v4_text(ip | ~mask);
+                i.prefix = prefix;
+                out.push_back(std::move(i));
+            }
+            freeifaddrs(list);
+            // Default gateway per interface. On Linux this is /proc/net/route;
+            // under WSL2 it is the Windows host, which makes it the only address
+            // an announce can use to cross the NAT boundary.
+    #ifdef __linux__
+            if (std::ifstream rt("/proc/net/route"); rt)
+            {
+                std::string line;
+                std::getline(rt, line); // header
+                while (std::getline(rt, line))
+                {
+                    std::istringstream ss(line);
+                    std::string dev, dest, gw, flags;
+                    if (!(ss >> dev >> dest >> gw >> flags))
+                        continue;
+                    if (dest != "00000000")
+                        continue;
+                    std::uint32_t g = 0;
+                    try
+                    {
+                        g = (std::uint32_t)std::stoul(gw, nullptr, 16);
+                    }
+                    catch (...)
+                    {
+                        continue;
+                    }
+                    // /proc/net/route prints the address in host byte order of a
+                    // little-endian kernel, i.e. the dotted quad read backwards
+                    const std::uint32_t host = ((g & 0xffu) << 24) | ((g & 0xff00u) << 8) |
+                                               ((g >> 8) & 0xff00u) | ((g >> 24) & 0xffu);
+                    if (host == 0 || v4_ignored(host))
+                        continue;
+                    for (auto &i : out)
+                        if (i.name == clean_name(dev, 48) && i.gw.empty())
+                            i.gw = v4_text(host);
+                }
+            }
+    #endif
+    #endif
+            return out;
+        }
+
+        // "10.0.0.5" / "10.0.0.5:47821" — the manual probe target a user types when
+        // broadcast cannot reach the peer (WSL2 NAT, client-isolated Wi-Fi).
+        inline bool parse_endpoint_v4(const std::string &raw, std::uint16_t default_port, udp::endpoint &out)
+        {
+            std::string host = text::trim(raw);
+            std::uint16_t port = default_port;
+            if (const auto at = host.find_last_of(':'); at != std::string::npos && host.find(':') == at)
+            {
+                const std::string tail = host.substr(at + 1);
+                host = host.substr(0, at);
+                if (!tail.empty())
+                {
+                    try
+                    {
+                        const long v = std::stol(tail);
+                        if (v <= 0 || v > 65535)
+                            return false;
+                        port = (std::uint16_t)v;
+                    }
+                    catch (...)
+                    {
+                        return false;
+                    }
+                }
+            }
+            host = text::trim(host);
+            if (host.empty())
+                return false;
+            boost::system::error_code ec;
+            const auto a = asio::ip::make_address_v4(host, ec);
+            if (ec)
+                return false;
+            out = udp::endpoint(a, port);
+            return true;
+        }
+
         // ---- crypto -------------------------------------------------------------
         inline std::string sha256(std::string_view in)
         {
@@ -9932,9 +10140,15 @@ namespace cell
             asio::steady_timer pair_timer{io};
             udp::endpoint group_endpoint;
             // every address an announce goes to: 255.255.255.255, the multicast
-            // group, and the /24 broadcast of each local IPv4 (a host with a docker
-            // bridge or two NICs does not route 255.255.255.255 to every subnet)
+            // group, the real directed broadcast of every local subnet, and each
+            // interface's gateway (see local_ifaces_v4). Rebuilt on every beacon.
             std::vector<udp::endpoint> announce_targets;
+            // what the last build saw, for the management page's "本机地址"
+            std::vector<iface_v4> local_ifaces;
+            // datagrams that made it through the firewall, for the same page
+            unsigned long long rx_announce = 0;
+            unsigned long long rx_probe = 0;
+            std::string rx_last_from;
             std::atomic<bool> alive{false};
             std::uint16_t bound_port = 0;
 
@@ -9944,6 +10158,14 @@ namespace cell
                 std::string id, name, addr;
                 std::uint16_t port = 0;
                 long long last_seen = 0;
+                // last time we answered this peer with a unicast announce: a
+                // multi-homed peer arrives with a different source address on each
+                // interface, so without a cooldown two peers would bounce replies
+                // off each other forever
+                long long last_reflect = 0;
+                // timestamp of the beacon last applied, so the copies that arrive
+                // on every interface are not processed (or counted) again
+                long long last_ts = 0;
                 bool pairing_open = false;
                 // what the announce carried: shown in "Scan Links" before pairing
                 std::string os, tz, lang;
@@ -9990,11 +10212,12 @@ namespace cell
 
             // ---- discovery ----------------------------------------------------
             void build_announce_targets();
+            std::vector<udp::endpoint> targets_snapshot();
             void announce_loop();
             void announce_once(bool probe_reply, const udp::endpoint *to);
             void start_receive();
             void on_datagram(const std::string &text, const udp::endpoint &from);
-            void probe_now();
+            void probe_now(const udp::endpoint *to = nullptr);
 
             // ---- inbound connections -----------------------------------------
             void accept_loop();
@@ -10786,34 +11009,56 @@ namespace cell
         // -------------------------------------------------------------------------
         inline void impl::build_announce_targets()
         {
-            announce_targets.clear();
-            announce_targets.emplace_back(asio::ip::address_v4::broadcast(), opt.discovery_port);
-            if (group_endpoint.port() != 0)
-                announce_targets.push_back(group_endpoint);
-            // Every local IPv4 subnet gets its own broadcast address: a host with a
-            // docker bridge, a VPN or two NICs does not route 255.255.255.255 to all
-            // of them. Resolving the host name is portable and needs no platform
-            // adapter enumeration; the /24 guess is what makes it useful.
-            boost::system::error_code ec;
-            tcp::resolver res(io);
-            auto results = res.resolve(asio::ip::host_name(ec), "", ec);
-            if (ec)
-                return;
-            std::set<std::string> seen;
-            for (const auto &entry : results)
+            std::vector<udp::endpoint> targets;
+            const std::uint16_t port = opt.discovery_port;
+            auto add = [&targets, port](const std::string &text)
             {
-                const auto addr = entry.endpoint().address();
-                if (!addr.is_v4())
+                if (text.empty())
+                    return;
+                boost::system::error_code aec;
+                const auto a = asio::ip::make_address_v4(text, aec);
+                if (aec || a.is_unspecified())
+                    return;
+                const udp::endpoint ep(a, port);
+                if (std::find(targets.begin(), targets.end(), ep) != targets.end())
+                    return;
+                targets.push_back(ep);
+            };
+
+            // 255.255.255.255 is not routed to every NIC on a multi-homed host, so
+            // it is only the first of several targets, never the only one.
+            targets.emplace_back(asio::ip::address_v4::broadcast(), port);
+            if (group_endpoint.port() != 0)
+                targets.push_back(group_endpoint);
+
+            const std::vector<iface_v4> ifaces = local_ifaces_v4();
+            for (const auto &i : ifaces)
+            {
+                add(i.bcast); // the subnet's real directed broadcast
+                add(i.gw);    // unicast to the gateway: survives NAT (WSL2) and APs
+                              // that drop broadcast between clients
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                announce_targets.swap(targets);
+                local_ifaces = ifaces;
+            }
+
+            // Join the group on every interface as well: a Wi-Fi AP with client
+            // isolation or a switch that filters broadcast may still pass multicast.
+            // Repeated joins of the same (group, interface) fail harmlessly.
+            if (!udp_sock)
+                return;
+            for (const auto &i : ifaces)
+            {
+                boost::system::error_code jec;
+                const auto local = asio::ip::make_address_v4(i.addr, jec);
+                if (jec)
                     continue;
-                auto bytes = addr.to_v4().to_bytes();
-                if (bytes[0] == 127)                              // loopback
-                    continue;
-                if (bytes[0] == 169 && bytes[1] == 254)           // link-local
-                    continue;
-                if (!seen.insert(addr.to_string()).second)
-                    continue;
-                bytes[3] = 255;
-                announce_targets.emplace_back(asio::ip::address_v4(bytes), opt.discovery_port);
+                udp_sock->set_option(asio::ip::multicast::join_group(
+                                         asio::ip::make_address_v4(kGroup), local),
+                                     jec);
             }
         }
 
@@ -10840,9 +11085,15 @@ namespace cell
                 udp_sock->send_to(asio::buffer(text), *to, 0, ec);
                 return;
             }
-            for (const auto &target : announce_targets)
+            for (const auto &target : targets_snapshot())
                 udp_sock->send_to(asio::buffer(text), target, 0, ec);
             (void)probe_reply;
+        }
+
+        inline std::vector<udp::endpoint> impl::targets_snapshot()
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            return announce_targets;
         }
 
         inline void impl::announce_loop()
@@ -10855,6 +11106,11 @@ namespace cell
             announce_timer.async_wait([self](const boost::system::error_code &ec)
                                       {
                 if (ec || !self->alive.load()) return;
+                // Re-enumerate before every beacon: adapters appear and vanish while
+                // we run (WSL starts after us, a VPN connects, a dock is plugged in),
+                // and a target list frozen at start() is exactly why a WSL host and
+                // its Windows host never found each other.
+                self->build_announce_targets();
                 self->announce_once(false, nullptr);
                 self->announce_loop(); });
         }
@@ -10898,35 +11154,65 @@ namespace cell
                 return;
             if (t == "probe")
             {
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    ++rx_probe;
+                    rx_last_from = from.address().to_string();
+                }
                 announce_once(true, &from);
                 return;
             }
             if (t != "announce")
                 return;
             const bool pair_open = j.value("pair", false);
+            const long long ts = jint(j, "ts", 0);
+            bool fresh = false;
+            bool reflect = false;
             {
                 std::lock_guard<std::mutex> lk(mx);
                 peer_state &p = discovered[their_id];
-                const bool fresh = p.last_seen == 0;
+                // One beacon reaches us once per interface it was broadcast on
+                // (255.255.255.255 and each subnet's directed broadcast can all
+                // land here). Same peer, same timestamp: same beacon, count it once.
+                if (ts != 0 && ts == p.last_ts)
+                    return;
+                p.last_ts = ts;
+                ++rx_announce;
+                rx_last_from = from.address().to_string();
+                const long long now = (long long)std::time(nullptr);
+                fresh = p.last_seen == 0;
+                const bool moved = !fresh && p.addr != from.address().to_string();
+                if ((fresh || moved) && now - p.last_reflect >= 10)
+                {
+                    p.last_reflect = now;
+                    reflect = true;
+                }
                 p.id = their_id;
                 p.name = their_name;
                 p.addr = from.address().to_string();
                 p.port = port;
-                p.last_seen = (long long)std::time(nullptr);
+                p.last_seen = now;
                 p.pairing_open = pair_open;
                 p.os = clean_name(jstr(j, "os"), 24);
                 p.tz = clean_name(jstr(j, "tz"), 48);
                 p.lang = clean_name(jstr(j, "lang"), 24);
-                if (!fresh)
-                    return; // already known: refresh only, no event storm
             }
+            // Answer a *new* peer (or one that moved) with a unicast announce.
+            // Discovery is otherwise one-way when one side's broadcast cannot cross
+            // to the other — WSL2's NAT, an AP with client isolation, a firewall
+            // that allows replies but not inbound broadcast. The peer reached us,
+            // so a reply to its source address is the one direction we know works.
+            if (reflect)
+                announce_once(true, &from);
+            if (!fresh)
+                return; // already known: refresh only, no event storm
             emit({{"type", "discovered"}, {"client_id", their_id}, {"name", their_name},
                   {"addr", from.address().to_string()}, {"port", port}, {"pairing", pair_open},
                   {"os", clean_name(jstr(j, "os"), 24)}, {"tz", clean_name(jstr(j, "tz"), 48)},
                   {"lang", clean_name(jstr(j, "lang"), 24)}});
         }
 
-        inline void impl::probe_now()
+        inline void impl::probe_now(const udp::endpoint *to)
         {
             if (!udp_sock || !alive.load())
                 return;
@@ -10936,7 +11222,14 @@ namespace cell
                    {"ts", (long long)std::time(nullptr)}};
             const std::string text = p.dump();
             boost::system::error_code ec;
-            for (const auto &target : announce_targets)
+            if (to)
+            {
+                // a typed address: probe that one host only, so a peer behind NAT
+                // or a firewall that eats broadcast can still be reached
+                udp_sock->send_to(asio::buffer(text), *to, 0, ec);
+                return;
+            }
+            for (const auto &target : targets_snapshot())
                 udp_sock->send_to(asio::buffer(text), target, 0, ec);
         }
 
@@ -11268,6 +11561,21 @@ namespace cell
                         {"fails", pairing.fails}};
             }
             auto [unread, total] = st.transmission_counts();
+            // discovery diagnostics: which addresses a beacon goes to, which
+            // adapters we see, and whether anything arrives at all. "0 台设备" is
+            // otherwise indistinguishable from "the firewall eats the broadcast".
+            json targets = json::array();
+            json ifaces = json::array();
+            json rx;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                for (const auto &t : announce_targets)
+                    targets.push_back(std::format("{}:{}", t.address().to_string(), t.port()));
+                for (const auto &i : local_ifaces)
+                    ifaces.push_back({{"name", i.name}, {"addr", i.addr}, {"prefix", i.prefix},
+                                      {"broadcast", i.bcast}, {"gateway", i.gw}});
+                rx = {{"announce", rx_announce}, {"probe", rx_probe}, {"last_from", rx_last_from}};
+            }
             return json{{"enabled", alive.load()},
                         {"client_id", client_id},
                         {"name", name},
@@ -11278,6 +11586,9 @@ namespace cell
                         {"settings", st.settings()},
                         {"pairing", pair},
                         {"peers", peers_json()},
+                        {"interfaces", ifaces},
+                        {"targets", targets},
+                        {"rx", rx},
                         {"workspaces", link_workspaces_json()},
                         {"transmissions", {{"unread", unread}, {"total", total}}}};
         }
@@ -11601,10 +11912,23 @@ namespace cell
                 return r;
             }
 
-            json probe()
+            // no address: broadcast a probe to every target. With one: unicast to
+            // exactly that host, which is the fallback when discovery's broadcast
+            // cannot cross a NAT or a firewall.
+            json probe(const std::string &addr = {})
             {
-                p_->probe_now();
-                return json{{"ok", true}};
+                if (!running())
+                    return json{{"ok", false}, {"error", "flowlink is not running"}};
+                if (addr.empty())
+                {
+                    p_->probe_now();
+                    return json{{"ok", true}};
+                }
+                udp::endpoint ep;
+                if (!parse_endpoint_v4(addr, p_->opt.discovery_port, ep))
+                    return json{{"ok", false}, {"error", std::format("cannot parse address: {}", addr)}};
+                p_->probe_now(&ep);
+                return json{{"ok", true}, {"addr", ep.address().to_string()}, {"port", ep.port()}};
             }
             json discovered()
             {
