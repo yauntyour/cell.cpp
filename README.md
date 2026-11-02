@@ -169,10 +169,13 @@ exported 5 message(s) to cell-export-20260921-065306.html
   `<span>`, `<concepts>` and `std::move_only_function` — e.g. GCC 15+ (MSYS2 UCRT64) or a recent
   MSVC/Clang. This is bleeding-edge: use a recent standard library, not an LTS one.
 - **libcurl** (any recent backend), **libsodium**, **nlohmann/json** (header-only).
+- **Boost.Asio** (header-only) for FlowLink — the peer network in `flowlink.hpp`
+  (`boost/asio.hpp`, `boost/asio/ip/multicast.hpp`). No Boost library is linked;
+  headers are enough.
 - Recommended package manager: [vcpkg](https://github.com/microsoft/vcpkg)
 
 ```bash
-vcpkg install curl nlohmann-json libsodium
+vcpkg install curl nlohmann-json libsodium boost-asio
 ```
 
 ### Build
@@ -181,11 +184,12 @@ vcpkg install curl nlohmann-json libsodium
 # POSIX
 g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
 
-# Windows / MSYS2 (the CA-bundle export walks the system certificate store: crypt32)
-g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32
+# Windows / MSYS2 (the CA-bundle export walks the system certificate store: crypt32;
+# ws2_32 is the winsock library Asio uses)
+g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32 -lws2_32 -lmswsock -lole32
 
 # MSVC
-cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib
+cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib ws2_32.lib mswsock.lib ole32.lib
 ```
 
 ### Run

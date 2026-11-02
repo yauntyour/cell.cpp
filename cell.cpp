@@ -62,6 +62,12 @@
 #endif
 #endif
 
+// FlowLink — the peer network (UDP discovery, pairing codes, end-to-end
+// encrypted messaging, remote cells). It lives in the CORE, not in a frontend:
+// the CLI and the desktop shell mount the same service and use the same
+// commands. Header-only; nothing is constructed until cell::link::enable().
+#include "flowlink.hpp"
+
 // Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
 // Never throws and never returns a wrapped-around value: strtoull reports ERANGE
 // for "-1" (-> ULLONG_MAX) and for anything above ULLONG_MAX, and an out-of-range
@@ -7760,6 +7766,17 @@ namespace cell
             size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
             size_t max_threads = 16;                                      // concurrent read-only tool workers (1..16)
             std::unordered_map<std::string, std::string> active_sessions; // cwd key -> last active session id
+            // ---- FlowLink（局域网互联）--------------------------------------
+            // 服务本体在核心里（flowlink.hpp），CLI 与桌面外壳共用同一份设置，
+            // 所以它存在 config.json 而不是某个前端的偏好文件里。默认关闭：
+            // 不开就不挂载服务，不开端口、不起线程。
+            bool link_enabled = false;   // 进程启动时是否自动挂载
+            std::string link_name;       // 设备名（空 = 主机名）
+            int link_port = 47822;       // TCP 传输端口
+            int link_discovery = 47821;  // UDP 发现端口
+            bool link_announce = true;   // 广播自身，允许被同网段发现
+            bool link_accept = false;    // 接受远程 tw 作业与远程文件读取
+            std::string link_workspace;  // 远程作业落地目录（空 = 当前工作目录）
 
             // An empty current_provider means "the first provider is active"; a
             // non-empty name that matches nothing means the user's selection is
@@ -7993,6 +8010,14 @@ namespace cell
                     for (auto &[k, v] : j["active_sessions"].items())
                         if (v.is_string())
                             s.active_sessions[k] = v.get<std::string>();
+                // FlowLink：端口来自手改过的文件也要夹到合法范围
+                s.link_enabled = json_bool(j, "link_enabled", false);
+                s.link_name = json_str(j, "link_name", "");
+                s.link_port = std::clamp((int)num_arg(j, "link_port", 47822), 0, 65535);
+                s.link_discovery = std::clamp((int)num_arg(j, "link_discovery", 47821), 0, 65535);
+                s.link_announce = json_bool(j, "link_announce", true);
+                s.link_accept = json_bool(j, "link_accept", false);
+                s.link_workspace = json_str(j, "link_workspace", "");
             }
             catch (const std::exception &e)
             {
@@ -8029,6 +8054,13 @@ namespace cell
             if (track_active && !s.session_id.empty())
                 s.active_sessions[cwd_id()] = s.session_id;
             j["active_sessions"] = s.active_sessions;
+            j["link_enabled"] = s.link_enabled;
+            j["link_name"] = s.link_name;
+            j["link_port"] = s.link_port;
+            j["link_discovery"] = s.link_discovery;
+            j["link_announce"] = s.link_announce;
+            j["link_accept"] = s.link_accept;
+            j["link_workspace"] = s.link_workspace;
             // atomic replace: a crash mid-save can no longer truncate config.json.
             // that mattered: a failed load falls back to defaults, and the next save
             // would then persist an empty provider list over the real one.
@@ -8432,6 +8464,756 @@ namespace cell
             }
         };
     } // namespace encrypt
+
+    // =========================================================================
+    //  link — the /link command's bridge to a FlowLink service.
+    //
+    //  The peer network (UDP discovery, pairing codes, end-to-end encrypted
+    //  messaging) is a HOST service: it needs its own io_context, sockets and
+    //  session state, and it must be mountable independently of the agent (the
+    //  desktop shell mounts it beside — not inside — the webview service). The
+    //  core therefore owns only the command: it parses /link, formats the answer
+    //  and hands the operation to whoever provides the service. With no provider
+    //  installed (the standalone CLI) /link says where the service lives instead
+    //  of pretending.
+    // =========================================================================
+    namespace link
+    {
+        // =====================================================================
+        //  FlowLink, mounted by the core.
+        //
+        //  One service per process. The CLI mounts it from `/link on`, the
+        //  desktop shell from its settings page — same object, same calls, same
+        //  protocol. Nothing exists (no thread, no socket, no allocation) until
+        //  enable() runs, and stop() joins everything again.
+        // =====================================================================
+        struct mount_options
+        {
+            std::filesystem::path root;
+            std::string name;
+            std::uint16_t port = 47822;
+            std::uint16_t discovery = 47821;
+            bool announce = true;
+            bool accept_remote = false;
+            // where events (mail arrived, peer online, paired) go; a frontend
+            // wires this to its own event stream
+            std::function<void(const nlohmann::json &)> on_event;
+            // fs.* / tw.* from a paired peer: only the frontend knows its
+            // workspaces, so it answers these (see serve_files / serve_teamwork)
+            std::function<nlohmann::json(const std::string &, const nlohmann::json &, std::string &)> on_call;
+        };
+
+        inline std::mutex &mx()
+        {
+            static std::mutex m;
+            return m;
+        }
+        inline std::shared_ptr<flowlink::service> &slot()
+        {
+            static std::shared_ptr<flowlink::service> s;
+            return s;
+        }
+        inline std::shared_ptr<flowlink::service> service()
+        {
+            std::lock_guard<std::mutex> lk(mx());
+            return slot();
+        }
+        inline bool running()
+        {
+            auto s = service();
+            return s && s->running();
+        }
+
+        // mount (or re-mount) the service; "" on success
+        inline bool enable(const mount_options &o, std::string &err)
+        {
+            flowlink::service::options fo;
+            fo.root = o.root.empty() ? root : o.root;
+            fo.name = o.name;
+            fo.port = o.port;
+            fo.discovery_port = o.discovery;
+            fo.announce = o.announce;
+            fo.accept_remote = o.accept_remote;
+            fo.on_event = o.on_event;
+            fo.on_call = o.on_call;
+            fo.on_log = [](const std::string &level, const std::string &msg)
+            {
+                if (level == "warn")
+                    sys::logger::instance().warn("flowlink", msg);
+                else
+                    sys::logger::instance().info("flowlink", msg);
+            };
+            auto svc = std::make_shared<flowlink::service>(std::move(fo));
+            if (!svc->start(err))
+                return false;
+            std::shared_ptr<flowlink::service> old;
+            {
+                std::lock_guard<std::mutex> lk(mx());
+                old = std::move(slot());
+                slot() = svc;
+            }
+            if (old)
+                old->stop();
+            return true;
+        }
+        inline void disable()
+        {
+            std::shared_ptr<flowlink::service> old;
+            {
+                std::lock_guard<std::mutex> lk(mx());
+                old = std::move(slot());
+                slot().reset();
+            }
+            if (old)
+                old->stop();
+        }
+
+        // How THIS frontend mounts the service (it owns on_call, and only it
+        // knows its workspaces). Unset = /link on cannot mount here.
+        inline std::function<bool(std::string &)> &mount_hook()
+        {
+            static std::function<bool(std::string &)> fn;
+            return fn;
+        }
+        // ...and how it remembers that the service is off (each frontend keeps
+        // its own settings: config.json for the CLI, the same file for the shell)
+        inline std::function<void()> &unmount_hook()
+        {
+            static std::function<void()> fn;
+            return fn;
+        }
+
+        inline nlohmann::json status()
+        {
+            auto svc = service();
+            if (!svc)
+                return {{"enabled", false},
+                        {"client_id", ""},
+                        {"name", ""},
+                        {"peers", nlohmann::json::array()},
+                        {"inbox", {{"unread", 0}, {"total", 0}}}};
+            try
+            {
+                return svc->status();
+            }
+            catch (const std::exception &e)
+            {
+                return {{"enabled", false}, {"error", e.what()}};
+            }
+        }
+
+        // ---- transcript packaging for the mailbox ---------------------------
+        // A shared conversation is what the user and the agent said — tool
+        // traffic is dropped on purpose (it is noise and often sensitive).
+        inline std::string message_text(const nlohmann::json &m)
+        {
+            if (!m.is_object() || !m.contains("content"))
+                return {};
+            const auto &c = m["content"];
+            if (c.is_string())
+                return c.get<std::string>();
+            if (!c.is_array())
+                return {};
+            std::string out;
+            for (const auto &b : c)
+            {
+                if (!b.is_object())
+                    continue;
+                if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                {
+                    if (!out.empty())
+                        out += "\n\n";
+                    out += b["text"].get<std::string>();
+                }
+            }
+            return out;
+        }
+
+        // [{role, text}] oldest first, bounded by count and characters
+        inline nlohmann::json transcript_json(const std::string &sid,
+                                              std::size_t max_msgs = 200,
+                                              std::size_t max_chars = 200000)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            if (sid.empty())
+                return out;
+            std::ifstream f(session_dir(sid) / "messages.jsonl", std::ios::binary);
+            if (!f)
+                return out;
+            std::vector<nlohmann::json> rows;
+            std::string line;
+            while (std::getline(f, line))
+            {
+                if (line.empty())
+                    continue;
+                auto j = nlohmann::json::parse(line, nullptr, false);
+                if (!j.is_object())
+                    continue;
+                const std::string role = j.value("role", "");
+                if (role != "user" && role != "assistant")
+                    continue;
+                std::string text = message_text(j);
+                if (text.empty())
+                    continue;
+                rows.push_back({{"role", role}, {"text", std::move(text)}});
+            }
+            const std::size_t start = rows.size() > max_msgs ? rows.size() - max_msgs : 0;
+            std::size_t chars = 0;
+            for (std::size_t i = start; i < rows.size(); i++)
+            {
+                chars += rows[i]["text"].get_ref<const std::string &>().size();
+                if (chars > max_chars)
+                    break;
+                out.push_back(rows[i]);
+            }
+            return out;
+        }
+
+        inline std::string render_transcript(const nlohmann::json &msgs)
+        {
+            std::string out;
+            if (!msgs.is_array())
+                return out;
+            for (const auto &m : msgs)
+            {
+                if (!m.is_object())
+                    continue;
+                out += "### " + m.value("role", std::string("user")) + "\n\n";
+                out += m.value("text", std::string{});
+                out += "\n\n";
+            }
+            return out;
+        }
+
+        // ---- remote file access (fs.*) --------------------------------------
+        // `root_dir` is the only subtree a peer may read; the check is on the
+        // canonical path, so ../ and symlinks cannot escape it.
+        inline bool inside(const std::filesystem::path &root_dir, const std::filesystem::path &p)
+        {
+            std::error_code ec;
+            const auto r = std::filesystem::weakly_canonical(root_dir, ec);
+            if (ec)
+                return false;
+            const auto q = std::filesystem::weakly_canonical(p, ec);
+            if (ec)
+                return false;
+            auto ri = r.begin();
+            auto qi = q.begin();
+            for (; ri != r.end(); ++ri, ++qi)
+                if (qi == q.end() || *ri != *qi)
+                    return false;
+            return true;
+        }
+
+        inline bool resolve_in(const std::filesystem::path &root_dir, const std::string &rel,
+                               std::filesystem::path &out, std::string &err)
+        {
+            std::string path = text::trim(rel);
+            if (path.empty())
+                path = ".";
+            std::filesystem::path p(path);
+            if (p.is_relative())
+                p = root_dir / p;
+            if (!inside(root_dir, p))
+            {
+                err = "path is outside the shared workspace";
+                return false;
+            }
+            out = p;
+            return true;
+        }
+
+        inline nlohmann::json serve_files(const std::filesystem::path &root_dir,
+                                          const std::string &method,
+                                          const nlohmann::json &params, std::string &err)
+        {
+            std::filesystem::path target;
+            if (!resolve_in(root_dir, params.value("path", "."), target, err))
+                return nlohmann::json{};
+            std::error_code ec;
+            if (method == "fs.ls")
+            {
+                if (!std::filesystem::is_directory(target, ec))
+                {
+                    err = "not a directory: " + target.string();
+                    return nlohmann::json{};
+                }
+                nlohmann::json items = nlohmann::json::array();
+                std::size_t n = 0;
+                auto it = std::filesystem::directory_iterator(target, ec);
+                for (; !ec && it != std::filesystem::directory_iterator() && n < 500; it.increment(ec), ++n)
+                {
+                    std::error_code e2;
+                    const bool dir = it->is_directory(e2);
+                    const long long size = dir ? 0 : (long long)it->file_size(e2);
+                    items.push_back({{"name", it->path().filename().string()}, {"dir", dir}, {"size", size}});
+                }
+                std::sort(items.begin(), items.end(), [](const nlohmann::json &a, const nlohmann::json &b)
+                          {
+                              const bool ad = a.value("dir", false), bd = b.value("dir", false);
+                              if (ad != bd)
+                                  return ad;
+                              return a.value("name", "") < b.value("name", ""); });
+                return {{"path", target.string()}, {"items", items}};
+            }
+            if (method == "fs.stat")
+            {
+                const bool dir = std::filesystem::is_directory(target, ec);
+                const bool file = !dir && std::filesystem::is_regular_file(target, ec);
+                if (!dir && !file)
+                {
+                    err = "no such path: " + target.string();
+                    return nlohmann::json{};
+                }
+                return {{"path", target.string()},
+                        {"dir", dir},
+                        {"size", file ? (long long)std::filesystem::file_size(target, ec) : 0}};
+            }
+            // fs.read
+            if (!std::filesystem::is_regular_file(target, ec))
+            {
+                err = "not a file: " + target.string();
+                return nlohmann::json{};
+            }
+            const auto size = (long long)std::filesystem::file_size(target, ec);
+            if (ec)
+            {
+                err = "could not stat: " + target.string();
+                return nlohmann::json{};
+            }
+            constexpr long long kMax = 512 * 1024;
+            if (size > kMax)
+            {
+                err = std::format("file too large to transfer ({} bytes, limit {})", size, kMax);
+                return nlohmann::json{};
+            }
+            std::ifstream f(target, std::ios::binary);
+            if (!f)
+            {
+                err = "could not open: " + target.string();
+                return nlohmann::json{};
+            }
+            std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (body.find('\0') != std::string::npos)
+            {
+                err = "binary file";
+                return nlohmann::json{};
+            }
+            return {{"path", target.string()}, {"size", size}, {"text", body}};
+        }
+
+        // ---- the operation set ----------------------------------------------
+        // One implementation for the CLI's /link and every frontend's command
+        // bus. Returns the same shape a command returns: {"ok":...} plus data.
+        inline nlohmann::json op(const std::string &name, const nlohmann::json &args)
+        {
+            if (name == "status")
+            {
+                nlohmann::json r = status();
+                r["ok"] = true;
+                return r;
+            }
+            if (name == "on")
+            {
+                if (!mount_hook())
+                    return {{"ok", false}, {"error", "this frontend cannot mount FlowLink"}};
+                std::string err;
+                if (!mount_hook()(err))
+                    return {{"ok", false}, {"error", err}};
+                nlohmann::json r = status();
+                r["ok"] = true;
+                return r;
+            }
+            if (name == "off")
+            {
+                disable();
+                if (unmount_hook())
+                    unmount_hook();
+                nlohmann::json r = status();
+                r["ok"] = true;
+                return r;
+            }
+            auto svc = service();
+            if (!svc || !svc->running())
+                return {{"ok", false}, {"error", "FlowLink is off — enable it with /link on"}};
+            try
+            {
+                if (name == "peers")
+                    return {{"ok", true}, {"peers", svc->peers()}, {"discovered", svc->discovered()}};
+                if (name == "pair")
+                {
+                    nlohmann::json r = svc->pair_begin(args.value("ttl", 0));
+                    if (!r.value("ok", false))
+                        return {{"ok", false}, {"error", r.value("error", std::string("pairing could not start"))}};
+                    r["ok"] = true;
+                    return r;
+                }
+                if (name == "join")
+                {
+                    std::string err;
+                    nlohmann::json r = svc->pair_join(args.value("code", ""), args.value("addr", ""), err);
+                    if (!err.empty())
+                        return {{"ok", false}, {"error", err}};
+                    r["ok"] = true;
+                    return r;
+                }
+                if (name == "cancel")
+                    return svc->pair_cancel();
+                if (name == "probe")
+                    return svc->probe();
+                if (name == "forget")
+                {
+                    std::string err;
+                    if (!svc->forget(args.value("client_id", ""), err))
+                        return {{"ok", false}, {"error", err.empty() ? "unknown peer" : err}};
+                    return {{"ok", true}, {"forgotten", true}};
+                }
+                if (name == "inbox")
+                    return {{"ok", true}, {"items", svc->inbox()}};
+                if (name == "read")
+                {
+                    nlohmann::json m = svc->read_mail(args.value("id", ""));
+                    if (m.empty())
+                        return {{"ok", false}, {"error", "no such message"}};
+                    return {{"ok", true}, {"mail", m}};
+                }
+                if (name == "drop")
+                    return {{"ok", true}, {"dropped", svc->drop_mail(args.value("id", ""))}};
+                if (name == "share")
+                {
+                    const std::string sid = args.value("session", "");
+                    if (sid.empty())
+                        return {{"ok", false}, {"error", "no session to share"}};
+                    nlohmann::json msgs = transcript_json(sid);
+                    if (msgs.empty())
+                        return {{"ok", false}, {"error", "this session has no shareable messages yet"}};
+                    nlohmann::json item{{"from", svc->client_id()},
+                                        {"from_name", svc->name()},
+                                        {"subject", args.value("subject", std::string("Shared conversation"))},
+                                        {"note", args.value("note", "")},
+                                        {"kind", "session"},
+                                        {"payload", {{"session", sid}, {"messages", msgs}}}};
+                    std::string err;
+                    nlohmann::json r = svc->send_mail(args.value("cell", ""), item, err);
+                    if (!err.empty())
+                        return {{"ok", false}, {"error", err}};
+                    r["ok"] = true;
+                    r["shared"] = (long long)msgs.size();
+                    return r;
+                }
+                if (name == "send")
+                {
+                    const std::string body = args.value("body", "");
+                    if (body.empty())
+                        return {{"ok", false}, {"error", "send needs a body"}};
+                    nlohmann::json item{{"from", svc->client_id()},
+                                        {"from_name", svc->name()},
+                                        {"subject", args.value("subject", std::string("(no subject)"))},
+                                        {"note", ""},
+                                        {"kind", "text"},
+                                        {"payload", {{"text", body}}}};
+                    std::string err;
+                    nlohmann::json r = svc->send_mail(args.value("cell", ""), item, err);
+                    if (!err.empty())
+                        return {{"ok", false}, {"error", err}};
+                    r["ok"] = true;
+                    return r;
+                }
+                if (name == "call")
+                {
+                    // raw rpc to a paired cell (fs.*, tw.*, or anything a peer
+                    // registers) — used by the fl tool and by tests
+                    std::string err;
+                    nlohmann::json r = svc->call(args.value("cell", ""), args.value("method", ""),
+                                                 args.contains("params") ? args["params"] : nlohmann::json::object(),
+                                                 args.value("timeout_ms", 30000), err);
+                    if (!err.empty())
+                        return {{"ok", false}, {"error", err}};
+                    return {{"ok", true}, {"result", r}};
+                }
+            }
+            catch (const std::exception &e)
+            {
+                return {{"ok", false}, {"error", e.what()}};
+            }
+            return {{"ok", false}, {"error", "unknown FlowLink operation: " + name}};
+        }
+
+        // "cell" may be a client_id or a display name (first match wins)
+        inline std::string resolve_cell(const std::string &ref)
+        {
+            auto svc = service();
+            if (!svc)
+                return {};
+            const std::string want = text::trim(ref);
+            if (want.empty())
+                return {};
+            try
+            {
+                const nlohmann::json peers = svc->peers();
+                for (const auto &p : peers)
+                    if (p.value("client_id", "") == want)
+                        return want;
+                std::string lower = want;
+                lower_ascii(lower);
+                for (const auto &p : peers)
+                {
+                    if (!p.value("paired", false))
+                        continue;
+                    std::string name = p.value("name", "");
+                    lower_ascii(name);
+                    if (name == lower)
+                        return p.value("client_id", "");
+                }
+            }
+            catch (const std::exception &)
+            {
+            }
+            return {};
+        }
+
+        // ---- /link text rendering -------------------------------------------
+        // Kept out of the REPL so every frontend shares one parser and one
+        // formatting (the desktop's flowlink.exec command uses it verbatim).
+        inline std::string run(const std::vector<std::string> &raw_toks, const std::string &default_session, bool &ok)
+        {
+            ok = true;
+            // Normalize: whatever the caller's splitter produced (it may or may
+            // not keep the command token, and a piped line can carry a stray
+            // \r), the result is always {"/link", args...}.
+            std::vector<std::string> toks;
+            toks.reserve(raw_toks.size() + 1);
+            toks.emplace_back("/link");
+            for (const auto &t : raw_toks)
+            {
+                if (t.empty() || t == "\r")
+                    continue;
+                if (toks.size() == 1 && t.rfind("/link", 0) == 0)
+                    continue; // the command token itself
+                toks.push_back(t);
+            }
+            std::string out;
+            auto line = [&](const std::string &s)
+            {
+                if (!out.empty())
+                    out += '\n';
+                out += s;
+            };
+            auto fail = [&](const std::string &s)
+            {
+                ok = false;
+                line(s);
+                return out;
+            };
+            const std::string sub = toks.size() > 1 ? toks[1] : "status";
+            nlohmann::json args = nlohmann::json::object();
+            auto rest = [&](std::size_t from) -> std::string
+            {
+                std::string joined;
+                for (std::size_t i = from; i < toks.size(); i++)
+                {
+                    if (!joined.empty())
+                        joined += ' ';
+                    joined += toks[i];
+                }
+                return joined;
+            };
+            if (sub == "join")
+            {
+                if (toks.size() < 3)
+                    return fail("usage: /link join CODE [IP[:PORT]]");
+                args["code"] = toks[2];
+                if (toks.size() > 3)
+                    args["addr"] = toks[3];
+            }
+            else if (sub == "share")
+            {
+                if (toks.size() < 3)
+                    return fail("usage: /link share CELL [SESSION_ID]");
+                args["cell"] = resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2]);
+                args["session"] = toks.size() > 3 ? toks[3] : default_session;
+            }
+            else if (sub == "send")
+            {
+                if (toks.size() < 4)
+                    return fail("usage: /link send CELL TEXT...");
+                args["cell"] = resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2]);
+                args["body"] = rest(3);
+            }
+            else if (sub == "read" || sub == "forget")
+            {
+                if (toks.size() < 3)
+                    return fail("usage: /link " + sub + " ID");
+                args[sub == "read" ? "id" : "client_id"] = sub == "forget" ? (resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2])) : toks[2];
+            }
+            else if (sub == "pair")
+            {
+                if (toks.size() > 2)
+                    args["ttl"] = std::atoi(toks[2].c_str());
+            }
+            else if (sub != "status" && sub != "on" && sub != "off" && sub != "peers" &&
+                     sub != "cancel" && sub != "inbox" && sub != "probe")
+            {
+                line("usage: /link [status|on|off|peers|pair [TTL]|join CODE [ADDR]|");
+                line("             cancel|share CELL [SID]|send CELL TEXT|inbox|read ID|");
+                line("             forget CELL|probe]");
+                return out;
+            }
+
+            nlohmann::json r = op(sub, args);
+            if (!r.value("ok", false))
+                return fail(r.value("error", std::string("FlowLink command failed")));
+
+            if (sub == "status" || sub == "on" || sub == "off")
+            {
+                const bool on = r.value("enabled", false);
+                line(std::format("FlowLink: {}", on ? "on" : "off"));
+                if (!on)
+                {
+                    line("  mount it with /link on (settings live in config.json)");
+                    return out;
+                }
+                line(std::format("  id    {}", r.value("client_id", "")));
+                line(std::format("  name  {}  transport {}  discovery {}",
+                                 r.value("name", ""), r.value("port", 0), r.value("discovery_port", 0)));
+                const nlohmann::json pair = r.contains("pairing") ? r["pairing"] : nlohmann::json::object();
+                if (pair.value("open", false))
+                {
+                    const long long left = pair.value("expires", (long long)0) - (long long)std::time(nullptr);
+                    line(std::format("  pairing window open, {}s left", left > 0 ? left : 0));
+                    line(std::format("  code  {}", pair.value("code", "")));
+                }
+                else if (pair.value("state", "") == "paired")
+                {
+                    line(std::format("  pairing: paired with {}", pair.value("peer", "")));
+                }
+                const nlohmann::json peers = r.contains("peers") ? r["peers"] : nlohmann::json::array();
+                int online = 0;
+                for (const auto &p : peers)
+                    if (p.value("online", false))
+                        online++;
+                const nlohmann::json inbox = r.contains("inbox") ? r["inbox"] : nlohmann::json::object();
+                line(std::format("  peers {} ({} online)   inbox {} unread / {}",
+                                 peers.size(), online, inbox.value("unread", 0), inbox.value("total", 0)));
+                return out;
+            }
+            if (sub == "peers")
+            {
+                const nlohmann::json peers = r.contains("peers") ? r["peers"] : nlohmann::json::array();
+                if (peers.empty())
+                {
+                    line("no cells yet — /link pair on one side, /link join CODE on the other");
+                    return out;
+                }
+                for (const auto &p : peers)
+                    line(std::format("  {}{}  {}{}  {}{}", p.value("name", ""),
+                                     p.value("online", false) ? "" : " (offline)",
+                                     p.value("client_id", ""),
+                                     p.value("paired", false) ? "" : "  [unpaired]",
+                                     p.value("addr", ""),
+                                     p.value("port", 0) ? ":" + std::to_string(p.value("port", 0)) : ""));
+                return out;
+            }
+            if (sub == "pair")
+            {
+                const int ttl = args.value("ttl", 0) > 0 ? args.value("ttl", 0) : 300;
+                line(std::format("pairing code (single use, {} minutes):", ttl / 60));
+                line("  " + r.value("code", std::string{}));
+                line("the other cell runs: /link join <that code> — nothing else is needed");
+                return out;
+            }
+            if (sub == "join")
+            {
+                line(std::format("paired with {} ({})", r.value("name", ""), r.value("client_id", "")));
+                return out;
+            }
+            if (sub == "cancel")
+            {
+                line("pairing window closed");
+                return out;
+            }
+            if (sub == "probe")
+            {
+                line("probe sent — /link peers in a second");
+                return out;
+            }
+            if (sub == "forget")
+            {
+                line(std::format("forgotten {} (link key deleted)", toks.size() > 2 ? toks[2] : ""));
+                return out;
+            }
+            if (sub == "share")
+            {
+                line(std::format("shared {} message(s) — the peer stored it as {}",
+                                 r.value("shared", (long long)0), r.value("id", "?")));
+                return out;
+            }
+            if (sub == "send")
+            {
+                line(std::format("delivered ({})", r.value("id", "?")));
+                return out;
+            }
+            if (sub == "inbox")
+            {
+                const nlohmann::json items = r.contains("items") ? r["items"] : nlohmann::json::array();
+                if (items.empty())
+                {
+                    line("the mailbox is empty");
+                    return out;
+                }
+                for (const auto &m : items)
+                    line(std::format("  {}  {}{}  from {}  {}", m.value("id", ""), m.value("subject", ""),
+                                     m.value("read", false) ? "" : " [unread]", m.value("from_name", ""),
+                                     flowlink::now_iso(m.value("created", (long long)0))));
+                line("read one with /link read ID");
+                return out;
+            }
+            if (sub == "read")
+            {
+                const nlohmann::json m = r.contains("mail") ? r["mail"] : nlohmann::json::object();
+                line(std::format("From:    {} ({})", m.value("from_name", ""), m.value("from", "")));
+                line(std::format("Subject: {}", m.value("subject", "")));
+                const std::string note = m.value("note", "");
+                if (!note.empty())
+                    line("Note:    " + note);
+                const nlohmann::json payload = m.contains("payload") ? m["payload"] : nlohmann::json::object();
+                line("");
+                if (m.value("kind", "") == "session" && payload.contains("messages"))
+                    for (const auto &msg : payload["messages"])
+                        line(std::format("### {}\n\n{}", msg.value("role", ""), msg.value("text", "")));
+                else
+                    line(payload.value("text", ""));
+                return out;
+            }
+            return out;
+        }
+
+        // whitespace split, the same rule the REPL applies to every command
+        inline std::vector<std::string> tokenize(const std::string &line)
+        {
+            std::vector<std::string> toks;
+            std::string cur;
+            for (char c : line)
+            {
+                if (c == ' ' || c == '\t')
+                {
+                    if (!cur.empty())
+                    {
+                        toks.push_back(cur);
+                        cur.clear();
+                    }
+                }
+                else
+                {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty())
+                toks.push_back(cur);
+            return toks;
+        }
+    } // namespace link
+
     // =========================================================================
     //  tools — the tool abstraction: execution policy (Deny / Ask / Allow), the
     //  abstract base class and callable_tool, which applies the sandbox gates
@@ -8530,6 +9312,12 @@ namespace cell
             // full request machinery for teamwork runs (tw run / run_bg): only
             // main can assemble it, so the tw tool reaches it through here
             std::function<teamwork::runtime_context()> team_rt;
+            // 远程 cell（宿主提供的互联层，核心不认识它的协议）：
+            // remote_cells 返回 [{id,name,online,paired}]，tw 的 cells 操作原样列出；
+            // remote_teamwork(cell, {operation, config, id}) 把作业整包发给远端执行，
+            // 返回 {ok, id, text}。两个都为空 = 这个前端没有远程能力（CLI、测试）。
+            std::function<nlohmann::json()> remote_cells;
+            std::function<nlohmann::json(const std::string &, const nlohmann::json &)> remote_teamwork;
             // The workspace this runtime's tools operate in: relative path
             // arguments resolve against it, and box_ctx carries the sandbox
             // boundary plus the per-context box caches. Empty/null = the
@@ -18091,6 +18879,18 @@ static void print_help()
     cell::sys::println("  /notices seen [list]        list the accumulated notice audit trail (seen.jsonl)");
     cell::sys::println("  /notices seen clear         archive seen.jsonl to saved/notice-<UTC time>.jsonl and empty it");
     cell::sys::println("  /notices seen rm ID         delete one accumulated notice by id");
+    cell::sys::println("  /link                       FlowLink status: identity, pairing window, peers, mailbox");
+    cell::sys::println("  /link on | off              mount / unmount the FlowLink service (desktop shell only)");
+    cell::sys::println("  /link peers                 list the cells on this network (paired and discovered)");
+    cell::sys::println("  /link pair [TTL]            open a pairing window and print the 512-bit code");
+    cell::sys::println("  /link join CODE [IP[:PORT]] pair with the cell that shows CODE (address optional)");
+    cell::sys::println("  /link cancel                close the pairing window");
+    cell::sys::println("  /link share CELL [SID]      send a session's conversation to a paired cell");
+    cell::sys::println("  /link send CELL TEXT...     send a short message to a paired cell");
+    cell::sys::println("  /link inbox                 list the mailbox");
+    cell::sys::println("  /link read ID               read one mailbox item");
+    cell::sys::println("  /link forget CELL           drop a pairing (deletes the stored link key)");
+    cell::sys::println("  /link probe                 broadcast a discovery probe");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /tasks                      list background tasks (processes started by exec with background=true)");
     cell::sys::println("  /tasks show ID              print the captured output tail of a background task");
@@ -18349,7 +19149,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             {"background", bool_prop("run: execute the job in the background and return immediately; progress then arrives as notices (the notice tool's wait blocks token-free). Job-level switch — distinct from the per-child 'background' field inside list items")},
             {"all", bool_prop("list/history/reports: query every session of this working directory, not just the current one")},
             {"editable", {{"type", "array"}, {"description", "job-level default: existing files every child may modify"}}},
-            {"edit_rules", str_prop("job-level default: the constraint such modifications are reviewed against (required whenever editable is given)")}};
+            {"edit_rules", str_prop("job-level default: the constraint such modifications are reviewed against (required whenever editable is given)")},
+            {"cell", str_prop("client_id (or display name) of a paired remote cell: the job configuration is sent there, that cell runs it with its own providers and returns the consolidated report. Valid with operation=new, run and workflow; the returned id belongs to the remote cell. See operation=cells for the available cells")}};
         add("tw", "Manage Teamwork child-agent jobs — supervised child agents that run as a workflow of stages.\n"
                   "Operations (operation):\n"
                   "  new — create a job. Provide one of: (a) work-type=serial|parallel with list=[{works, ...}] (see the 'list' parameter), (b) an inline workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or (c) path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory. Returns the new job id.\n"
@@ -18358,6 +19159,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                   "  remove — delete a pending/failed job (requires id).\n"
                   "  reuse — create a new job with one child continuing a previously executed child (from='tw-ID/worker_N'; optional overrides: works, provider, model, think, name, reuse_context). Returns the new job id.\n"
                   "  list — list jobs (all=true also scans the other sessions of this working directory).\n"
+                  "  cells — list the remote cells this app can reach (paired peers of the FlowLink network, with their client_id). Pass the client_id as the 'cell' field to run a job on that cell.\n"
                   "  history — list past child-agent tasks with status, rounds, tool calls and model.\n"
                   "  report — return one child's report (requires id + worker).\n"
                   "  reports — return several child reports (id/worker are optional filters; limit/full control output).\n"
@@ -18367,7 +19169,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                   "  2. File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
                   "  3. Configuration may be given inline and/or via 'path' (inline wins); passing config fields to run/edit replaces the whole job configuration — refused while the job is running or completed.\n"
                   "  4. new only creates a job — reports exist only after run; for a long job use background=true and collect progress with the notice tool (wait consumes no tokens). Children run without a round cap and auto-compact their own context (each compaction is reported via a notice).\n"
-                  "  5. Every tw call may require user approval; a declined call comes back rejected with the reason — adjust the request or ask the user instead of retrying the same call.\n",
+                  "  5. Every tw call may require user approval; a declined call comes back rejected with the reason — adjust the request or ask the user instead of retrying the same call.\n"
+                  "  6. Remote cells: operation=cells lists them; cell=<client_id> on new/run/workflow ships the job to that cell, which runs it with its own providers and keys and sends back only the report. The returned job id lives on the remote cell — pass it back together with the same cell to continue a gated job. The remote cell must have FlowLink enabled and remote work accepted.\n",
             props, {"operation"}, Policy::Ask, ToolKind::Teamwork, [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
             {
                 cell::ToolOutput out;
@@ -18402,6 +19205,58 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                             config[k] = v;
                 }
                 bool has_config = !config.empty();
+                // ---- remote cell: the job runs there, only the report comes back
+                const std::string cell_ref = j.value("cell", "");
+                if (!cell_ref.empty())
+                {
+                    if (!rt.remote_teamwork)
+                        return cell::ToolOutput::fail("remote cells are unavailable in this frontend (no FlowLink bridge)");
+                    if (operation != "new" && operation != "run" && operation != "workflow")
+                        return cell::ToolOutput::fail("the cell field is only valid with operation=new, run or workflow — the job runs on the remote cell, so there is nothing to list, edit or remove locally");
+                    if (j.value("background", false))
+                        return cell::ToolOutput::fail("background runs are local only: run the job remotely and wait for its report");
+                    if (operation == "run" && !has_config && job_id.empty())
+                        return cell::ToolOutput::fail("a remote run needs either id (a job previously created on that cell) or a configuration");
+                    nlohmann::json req{{"operation", operation == "workflow" ? "new" : operation}};
+                    if (has_config)
+                        req["config"] = config; // the file config was merged in above, so no path travels
+                    if (!job_id.empty())
+                        req["id"] = job_id;
+                    nlohmann::json r = rt.remote_teamwork(cell_ref, req);
+                    out.ok = r.value("ok", false);
+                    const std::string rid = r.value("id", "");
+                    const std::string text = r.value("text", "");
+                    if (!out.ok)
+                    {
+                        out.text = text.empty() ? "the remote cell refused the job" : text;
+                        return out;
+                    }
+                    if (operation == "new" || operation == "workflow")
+                        out.text = std::format("remote job {} created on cell {} — run it with operation=run, cell={}, id={}",
+                                               rid.empty() ? "?" : rid, cell_ref, cell_ref, rid.empty() ? "?" : rid);
+                    else
+                        out.text = rid.empty() ? text : std::format("{}\n(remote job {} on cell {})", text, rid, cell_ref);
+                    return out;
+                }
+                if (operation == "cells")
+                {
+                    if (!rt.remote_cells)
+                        return cell::ToolOutput::fail("remote cells are unavailable in this frontend (no FlowLink bridge)");
+                    nlohmann::json cells = rt.remote_cells();
+                    if (!cells.is_array() || cells.empty())
+                    {
+                        out.text = "no remote cells: pair another cell first (Settings → 互联, or the fl tool's pair operation)";
+                        return out;
+                    }
+                    std::string text = std::format("{} remote cell(s)\n", cells.size());
+                    for (const auto &c : cells)
+                        text += std::format("- {}  {}  {}{}\n", c.value("id", ""), c.value("name", ""),
+                                            c.value("paired", false) ? "paired" : "unpaired",
+                                            c.value("online", false) ? ", online" : "");
+                    text += "pass cell=<id> with new/run/workflow to run a job there";
+                    out.text = text;
+                    return out;
+                }
                 // prefer the live settings the REPL already holds (no disk round-trip)
                 size_t max_children = cell::teamwork::kDefaultMaxChildren;
                 if (rt.team_rt)
@@ -18543,7 +19398,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out.ok = cell::teamwork::run_job(std::move(team_rt), job_id, out.text);
                     return out;
                 }
-                return cell::ToolOutput::fail("operation must be new, run, edit, remove, reuse, list, history, report, reports, or workflow"); }, Phase::Deferred);
+                return cell::ToolOutput::fail("operation must be new, run, edit, remove, reuse, list, cells, history, report, reports, or workflow"); }, Phase::Deferred);
     }
     {
         // notice — the cross-session message bus. Teamwork children report
@@ -22782,6 +23637,17 @@ namespace cell
                 mark_tools_dirty();
             }
 
+            // 远程 cell 桥（互联层由宿主实现）：cells 列出对端，work 把 tw 作业
+            // 整包送过去执行。两个都为空 = 没有远程能力。
+            void set_remote_hooks(std::function<nlohmann::json()> cells,
+                                  std::function<nlohmann::json(const std::string &, const nlohmann::json &)> work)
+            {
+                remote_cells_ = std::move(cells);
+                remote_work_ = std::move(work);
+                install_runtime();
+                mark_tools_dirty();
+            }
+
             // 工具表是可以重建的：act 的参数表跟着当前模型的动作组 / 表情名走，
             // 宿主换模型或模型报回新清单时调 mark_tools_dirty()，下一回合开头
             // 在 turn 线程上重建一次（换的是 shared_ptr 快照，不原地改 map，后台作业
@@ -22999,6 +23865,9 @@ namespace cell
             // 工具表按快照换：teamwork 的后台作业拿的是 shared_ptr，重建不会踩到旧读者
             std::shared_ptr<const std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>>> tool_list_;
             cell::tools::host_tools_provider host_tools_;
+            // 远程 cell 桥（宿主注入，见 set_remote_hooks）
+            std::function<nlohmann::json()> remote_cells_;
+            std::function<nlohmann::json(const std::string &, const nlohmann::json &)> remote_work_;
             nlohmann::json tool_defs_openai_, tool_defs_anthropic_, tool_defs_responses_;
             cell::tools::runtime tool_rt_;
             cell::teamwork::runtime_context team_rt_;
@@ -23085,6 +23954,9 @@ namespace cell
             { return h_.now().id(); };
             tool_rt_.team_rt = [this]() -> cell::teamwork::runtime_context
             { return team_rt_; };
+            // 远程 cell 桥：宿主没装就是空的，tw 的 cell 字段随之不可用
+            tool_rt_.remote_cells = remote_cells_;
+            tool_rt_.remote_teamwork = remote_work_;
 
             // teamwork needs the same provider/request machinery as the main
             // agent, but runs child requests non-streaming. Every child builds its
@@ -24465,6 +25337,97 @@ int repl::run()
     // every turn / compaction / notice delivery below goes through it — the
     // REPL is a frontend now: it drives the runner and renders its `events`.
     cell::engine::runner eng(cfg, vault, h);
+
+    // ---- FlowLink (CLI) ---------------------------------------------------
+    // The core owns the service; this frontend only says HOW to mount it: files
+    // come from the working directory, remote teamwork runs through the same
+    // runner the REPL drives, and events print on the console. `/link on` uses
+    // exactly this hook, so the CLI has the full feature set — no shell needed.
+    cell::link::mount_hook() = [&cfg, &h, &eng](std::string &err) -> bool
+    {
+        cell::link::mount_options o;
+        o.root = cell::root;
+        o.name = cfg.link_name;
+        o.port = (std::uint16_t)std::clamp(cfg.link_port, 0, 65535);
+        o.discovery = (std::uint16_t)std::clamp(cfg.link_discovery, 0, 65535);
+        o.announce = cfg.link_announce;
+        o.accept_remote = cfg.link_accept;
+        o.on_event = [](const nlohmann::json &ev)
+        {
+            const std::string type = ev.value("type", "");
+            if (type == "mail")
+                cell::sys::println("flowlink: new message from {} — {}", ev.value("from_name", ""), ev.value("subject", ""));
+            else if (type == "paired")
+                cell::sys::println("flowlink: paired with {}", ev.value("name", ""));
+            else if (type == "discovered")
+                cell::sys::println("flowlink: found {} ({})", ev.value("name", ""), ev.value("client_id", ""));
+        };
+        o.on_call = [&cfg, &h, &eng](const std::string &method, const nlohmann::json &p, std::string &e) -> nlohmann::json
+        {
+            if (!cfg.link_accept)
+            {
+                e = "this cell does not accept remote work (link_accept is off)";
+                return nlohmann::json{};
+            }
+            const std::filesystem::path base = cfg.link_workspace.empty()
+                                                   ? cell::workdir()
+                                                   : std::filesystem::path(cfg.link_workspace);
+            if (method == "fs.ls" || method == "fs.read" || method == "fs.stat")
+                return cell::link::serve_files(base, method, p, e);
+            if (method == "tw.new" || method == "tw.run")
+            {
+                // a remote job runs in THIS session's teamwork store, so its
+                // reports show up in /teamworks like a local job's
+                const std::string sid = h.now().id();
+                std::string out;
+                std::string job = p.value("id", "");
+                if (job.empty())
+                {
+                    nlohmann::json config = p.contains("config") ? p["config"] : nlohmann::json::object();
+                    if (!config.is_object() || config.empty())
+                    {
+                        e = "a remote job needs a configuration (work-type/list, workflow, or path)";
+                        return nlohmann::json{};
+                    }
+                    if (!cell::teamwork::new_job(config, cell::teamwork::max_children(cfg), out, sid))
+                    {
+                        e = out;
+                        return nlohmann::json{};
+                    }
+                    job = cell::text::trim(out);
+                }
+                if (method == "tw.new")
+                    return {{"ok", true}, {"id", job}, {"text", out}};
+                if (!cell::teamwork::run_job(eng.team_rt(), job, out))
+                {
+                    e = out;
+                    return nlohmann::json{};
+                }
+                return {{"ok", true}, {"id", job}, {"text", out}};
+            }
+            e = "unknown method: " + method;
+            return nlohmann::json{};
+        };
+        if (!cell::link::enable(o, err))
+            return false;
+        cfg.link_enabled = true;
+        cell::config::save(cfg);
+        return true;
+    };
+    cell::link::unmount_hook() = [&cfg]
+    {
+        cfg.link_enabled = false;
+        cell::config::save(cfg);
+    };
+    if (cfg.link_enabled)
+    {
+        std::string err;
+        if (!cell::link::mount_hook()(err))
+        {
+            log.warn("flowlink", "could not mount: " + err);
+            cell::sys::warn("flowlink: could not start: {}", err);
+        }
+    }
 
     // inject the base system prompt + skills metadata into the live session
     // (engine-owned); the console line stays here so the REPL look is unchanged
@@ -25982,6 +26945,21 @@ int repl::run()
                  cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), h.now().msg().size());
                  return cmd_flow::handled;
              }},
+            {"/link", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+             {
+                 // /link — FlowLink：局域网里的其他 cell（发现 / 配对 / 邮箱 /
+                 // 远程工作区 / 远程工作流）。服务本体由宿主提供，核心只做命令
+                 // 解析与排版（见 cell::link::run），所以 CLI 与桌面外壳共用一套。
+                 bool ok = true;
+                 std::string text = cell::link::run(toks, h.now().id(), ok);
+                 if (text.empty())
+                     return cmd_flow::handled;
+                 if (ok)
+                     cell::sys::println("{}", text);
+                 else
+                     cell::sys::error("{}", text);
+                 return cmd_flow::handled;
+             }},
             {"/notices", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
              {
                  const std::string cur_sid = h.now().id();
@@ -26541,6 +27519,9 @@ int repl::run()
         return 1;
     }
 
+    // FlowLink joins its threads before anything else is torn down: a remote
+    // handler may still be reading the session or the workspace.
+    cell::link::disable();
     log.info("exit", std::format("uptime={:.2f}s llm_requests={} tool_calls={}",
                                  cell::sys::elapsed_ms(t_start) / 1000.0, eng.llm_requests(), eng.tool_calls()));
     return 0;
