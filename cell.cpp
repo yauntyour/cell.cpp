@@ -8413,7 +8413,10 @@ namespace cell
         inline constexpr auto kHeartbeat = 10s;        // ping when idle this long
         inline constexpr auto kHeartbeatTimeout = 31s; // no frame for this long = dead
         inline constexpr auto kSweepPeriod = 2s;       // expiry/heartbeat sweep
-        inline constexpr auto kQueryPeriod = 45s;      // browse refresh
+        // 45s left a peer that had just booted invisible for the better part of a
+        // minute; 20s is still far below the 120s TTL (no packet storm) but the
+        // list fills in while the user is still looking at it.
+        inline constexpr auto kQueryPeriod = 20s;      // browse refresh
         inline constexpr auto kPairSweepPeriod = 2s;   // pairing window expiry check
         inline constexpr int kPairTtlSeconds = 300;    // default pairing window
         inline constexpr int kPairWaitSeconds = 300;   // a half-finished code exchange
@@ -10358,6 +10361,7 @@ namespace cell
             std::string mdns_tx_key;
             std::vector<local_addr> locals;
             long long locals_at = 0;
+            long long sweep_at = 0;             // last unicast /24 sweep (see unicast_sweep)
             asio::steady_timer mdns_timer{io};  // periodic re-announce
             asio::steady_timer query_timer{io}; // periodic browse query
             asio::steady_timer burst_timer{io}; // initial announce/query burst
@@ -10459,6 +10463,10 @@ namespace cell
             std::vector<dns::rr> my_records(std::uint32_t ttl);
             void announce(int times);
             void discovery_query(int times);
+            // unicast PTR query to every host of this machine's /24s: mDNS
+            // multicast stops at a NAT (WSL2), a VPN or an AP that isolates
+            // clients, and a manual "scan" then finds nothing at all
+            void unicast_sweep();
             void send_multicast(const std::string &text);
             void send_browse(const std::string &text);
             void send_unicast(const std::string &text, const udp::endpoint &to);
@@ -11809,6 +11817,47 @@ namespace cell
                 self->burst_kind = 2;
                 self->burst_left = times;
                 self->burst_loop(); });
+            unicast_sweep();
+        }
+
+        // Every host of this machine's /24s gets one unicast PTR query. Cheap
+        // (254 datagrams per subnet), private (no multicast group needed) and the
+        // only path that works when WSL2 / a VPN / client isolation swallows the
+        // multicast. Answers arrive through the normal on_response path.
+        inline void impl::unicast_sweep()
+        {
+            if (!alive.load() || !discovery_on.load())
+                return;
+            const long long now = (long long)std::time(nullptr);
+            if (now - sweep_at < 15)
+                return; // a scan button cannot be used as a packet amplifier
+            sweep_at = now;
+            auto pkt = dns::query(0, kServiceType, dns::t_ptr);
+            if (pkt.empty())
+                return;
+            std::set<std::uint32_t> nets;
+            for (const auto &la : locals)
+            {
+                if (la.v6 || la.loopback)
+                    continue;
+                boost::system::error_code ec;
+                const auto v4 = asio::ip::make_address_v4(la.addr, ec);
+                if (ec)
+                    continue;
+                const std::uint32_t self = v4.to_uint();
+                if ((self >> 16) == 0xA9FE) // 169.254/16: nothing worth probing
+                    continue;
+                if (!nets.insert(self & 0xFFFFFF00u).second)
+                    continue; // one sweep per /24
+                for (std::uint32_t i = 1; i < 255; i++)
+                {
+                    const std::uint32_t ip = (self & 0xFFFFFF00u) | i;
+                    if (ip == self)
+                        continue;
+                    send_unicast(pkt, udp::endpoint(asio::ip::address_v4(ip), opt.mdns_port));
+                    ++tx_query;
+                }
+            }
         }
 
         inline void impl::burst_loop()
@@ -11848,7 +11897,10 @@ namespace cell
             if (--burst_left > 0)
             {
                 auto self = shared_from_this();
-                burst_timer.expires_after(900ms);
+                // a query round only needs a second chance at a lossy link (the
+                // answers are small and the io thread is idle) — an announce
+                // burst stays slow so a busy network is not spammed
+                burst_timer.expires_after(burst_kind == 2 ? 250ms : 900ms);
                 burst_timer.async_wait([self](const boost::system::error_code &ec)
                                        {
                     if (ec || !self->discovery_on.load()) return;
@@ -11881,8 +11933,23 @@ namespace cell
             query_timer.async_wait([self](const boost::system::error_code &ec)
                                    {
                 if (ec || !self->alive.load() || !self->discovery_on.load()) return;
+                self->refresh_locals(); // a vNIC may have come up since the last round
                 auto pkt = dns::query(0, kServiceType, dns::t_ptr);
-                if (!pkt.empty()) { self->send_browse(pkt); ++self->tx_query; }
+                if (!pkt.empty())
+                {
+                    self->send_browse(pkt);
+                    ++self->tx_query;
+                    for (const auto &raw : self->opt.extra_targets)
+                    {
+                        udp::endpoint ep;
+                        if (parse_endpoint(raw, self->opt.mdns_port, ep))
+                            self->send_unicast(pkt, ep);
+                    }
+                }
+                // the periodic round sweeps too: a peer whose multicast never
+                // reaches us (WSL2 / VPN / isolated AP) still shows up within
+                // kQueryPeriod instead of never
+                self->unicast_sweep();
                 self->query_loop(); });
         }
 
@@ -18311,9 +18378,12 @@ a.kind:hover{color:var(--fg)}
 .dot.system{background:var(--system)}
 .role{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-faint)}
 .body{min-width:0}
-.p{margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.p{margin:0 0 12px;white-space:pre-wrap;overflow-wrap:break-word}
 .p:last-child{margin-bottom:0}
-.prose{white-space:pre-wrap;overflow-wrap:anywhere}
+/* break-word, not anywhere: `anywhere` shrinks the min-content width to one
+   character, which collapses table columns into a vertical strip of letters
+   (the same reason the app's strip fixes .prose the same way). */
+.prose{white-space:pre-wrap;overflow-wrap:break-word}
 .muted{color:var(--fg-faint)}
 h2.md-h,h3.md-h,h4.md-h,h5.md-h,h6.md-h{margin:22px 0 10px;font-weight:600;line-height:1.4;letter-spacing:-.01em}
 h2.md-h{font-size:17px}
@@ -18327,10 +18397,11 @@ h5.md-h,h6.md-h{font-size:13px;color:var(--fg-dim);text-transform:uppercase;lett
 .md-list li{margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
 .md-list li::marker{color:var(--fg-faint)}
 code.ic{font-size:.88em;background:var(--code-bg);border-radius:4px;padding:1px 4px;overflow-wrap:anywhere}
-.tabwrap{margin:0 0 16px;overflow-x:auto}
-.md-tab{width:100%;border-collapse:collapse;font-size:13.5px}
+.tabwrap{margin:0 0 16px;max-width:100%;overflow-x:auto}
+.md-tab{width:100%;border-collapse:collapse;font-size:13.5px;table-layout:auto}
 .md-tab th,.md-tab td{padding:7px 14px 7px 0;text-align:left;vertical-align:top;
-white-space:pre-wrap;border-bottom:1px solid var(--line-soft)}
+white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;border-bottom:1px solid var(--line-soft)}
+.md-tab th{min-width:3.5em}
 .md-tab thead th{border-bottom:1px solid var(--line);color:var(--fg-dim);font-size:11.5px;
 font-weight:600;letter-spacing:.05em;text-transform:uppercase}
 .md-tab tbody tr:last-child td{border-bottom:0}
