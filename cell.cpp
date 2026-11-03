@@ -8416,6 +8416,7 @@ namespace cell
         inline constexpr auto kQueryPeriod = 45s;      // browse refresh
         inline constexpr auto kPairSweepPeriod = 2s;   // pairing window expiry check
         inline constexpr int kPairTtlSeconds = 300;    // default pairing window
+        inline constexpr int kPairWaitSeconds = 300;   // a half-finished code exchange
         inline constexpr int kPairMaxFails = 3;        // wrong codes before the window closes
 
         // ---- small utilities ----------------------------------------------------
@@ -9314,6 +9315,16 @@ namespace cell
             return sha256("cell-flowlink-pair|" + lo + "|" + hi).substr(0, crypto_pwhash_SALTBYTES);
         }
 
+        // Mutual pairing: A types B's code, B types A's code, and only then is
+        // there a link key. Phase 1 (the handshake) proves A knows B's code; the
+        // offer that carries the link key is sealed with this key instead, which
+        // needs BOTH codes, so neither side can finish alone.
+        //   K = HKDF-Extract(salt = PSK(A's code), ikm = PSK(B's code))
+        inline std::string pair_mutual_key(std::string_view psk_a, std::string_view psk_b)
+        {
+            return hkdf_extract(psk_a, psk_b);
+        }
+
         inline bool const_eq(std::string_view a, std::string_view b)
         {
             return a.size() == b.size() && (a.empty() || sodium_memcmp(a.data(), b.data(), a.size()) == 0);
@@ -9682,6 +9693,13 @@ namespace cell
                     doc["discovery"] = kDefaultMdnsPort;
                     doc["announce"] = true;
                     doc["accept"] = false;
+                    // the one `accept` switch split in three (and the local side
+                    // got its own two): a fresh file starts closed on every gate
+                    doc["accept_workspace"] = false;
+                    doc["accept_workflow"] = false;
+                    doc["accept_watch"] = false;
+                    doc["access_workspace"] = false;
+                    doc["access_workflow"] = false;
                     doc["workspace"] = "";
                 }
                 if (!doc.contains("links") || !doc["links"].is_array())
@@ -9727,12 +9745,24 @@ namespace cell
                 int disc = (int)jint(doc, "discovery", kDefaultMdnsPort);
                 if (disc == 47821 || disc <= 0)
                     disc = kDefaultMdnsPort;
+                // `accept` used to be one switch for "a paired peer may work
+                // here"; it now splits into workspace and workflow, and watching
+                // live turns is a third, separate grant. A file that only has the
+                // old key keeps its meaning on the two it used to cover.
+                const bool legacy_accept = jbool(doc, "accept", false);
+                auto inherit = [&](const char *key)
+                { return jbool(doc, key, legacy_accept); };
                 return {{"enabled", jbool(doc, "enabled")},
                         {"name", jstr(doc, "name")},
                         {"port", (int)jint(doc, "port", kDefaultPort)},
                         {"discovery", disc},
                         {"announce", jbool(doc, "announce", true)},
-                        {"accept", jbool(doc, "accept", false)},
+                        {"accept", legacy_accept},
+                        {"accept_workspace", inherit("accept_workspace")},
+                        {"accept_workflow", inherit("accept_workflow")},
+                        {"accept_watch", jbool(doc, "accept_watch", false)},
+                        {"access_workspace", jbool(doc, "access_workspace", false)},
+                        {"access_workflow", jbool(doc, "access_workflow", false)},
                         {"workspace", jstr(doc, "workspace")},
                         {"extra_targets", extras}};
             }
@@ -9740,9 +9770,21 @@ namespace cell
             {
                 return update_links([&](json &doc)
                                     {
+                    // a legacy file: pin the split once, so the two new gates
+                    // stop inheriting a stale `accept` after the first write
+                    if (doc.contains("accept") && !doc.contains("accept_workspace") &&
+                        !doc.contains("accept_workflow"))
+                    {
+                        const bool a = doc["accept"].is_boolean() && doc["accept"].get<bool>();
+                        doc["accept_workspace"] = a;
+                        doc["accept_workflow"] = a;
+                    }
                     for (auto it = patch.begin(); it != patch.end(); ++it)
                     {
-                        if (it.key() == "enabled" || it.key() == "announce" || it.key() == "accept")
+                        if (it.key() == "enabled" || it.key() == "announce" || it.key() == "accept" ||
+                            it.key() == "accept_workspace" || it.key() == "accept_workflow" ||
+                            it.key() == "accept_watch" || it.key() == "access_workspace" ||
+                            it.key() == "access_workflow")
                         {
                             if (it->is_boolean()) doc[it.key()] = it->get<bool>();
                             continue;
@@ -10224,7 +10266,16 @@ namespace cell
                 std::string psk; // pairing code PSK or link key
                 bool pair_mode = false;
                 std::string pairing_code; // client side: the code we typed
+                std::string own_code;     // client side: our own code, shown to the peer
                 std::string link_key;     // pair mode, initiator side: key we hand over
+                // mutual pairing (both sides type the other's code). Phase 1 only
+                // proves knowledge of the responder's code, so the connection is
+                // NOT a session: it carries two extra frames and then closes.
+                bool pair_mutual = false;
+                bool pair_pending = false;   // phase 1 done, waiting for the approval
+                std::string pair_psk_own;    // PSK of the responder's code (both sides)
+                std::string pair_psk_their;  // PSK of the initiator's code (initiator only)
+                json pair_offer;             // responder: the initiator's sealed link key
                 std::string hs_tx, hs_rx; // handshake keys
                 std::string app_tx, app_rx;
 
@@ -10261,6 +10312,9 @@ namespace cell
                 void on_hello(const json &j);
                 void on_hello_ack(const json &j);
                 void on_confirm(const json &j);
+                void on_pair_offer(const json &j);
+                void on_pair_done(const json &j);
+                void send_pair_offer();
                 void handshake_done();
                 void fail(const std::string &why);
 
@@ -10268,6 +10322,7 @@ namespace cell
                 void send_encrypted(const json &payload);
                 void do_write();
                 void close(const std::string &why);
+                void close_after_flush(const std::string &why);
 
                 bool request(const std::string &method, const json &params, int timeout_ms, json &out, std::string &err);
                 bool wait_ready(int timeout_ms, std::string &err);
@@ -10341,6 +10396,19 @@ namespace cell
             // so a dispatch copies a pointer instead of a std::function.
             std::flat_map<std::string, std::shared_ptr<const std::function<json(const json &, std::string &)>>> handlers;
 
+            // Mutual pairing keeps the phase-1 connections alive while the user
+            // reads the peer's code out loud: they are not sessions (no RPC, no
+            // workspace list), just a channel to finish the exchange on.
+            struct pair_wait
+            {
+                std::string client_id, name, addr;
+                std::uint16_t port = 0;
+                long long since = 0;
+                long long expires = 0;
+                bool incoming = true; // false: we asked them, waiting for approval
+                std::weak_ptr<conn> link;
+                json offer;           // incoming: the sealed link key
+            };
             struct pairing_state
             {
                 bool open = false;
@@ -10348,8 +10416,9 @@ namespace cell
                 std::string display; // grouped, for the UI
                 long long expires = 0;
                 int fails = 0;
-                std::string state = "idle"; // idle | waiting | paired | failed
+                std::string state = "idle"; // idle | waiting | request | paired
                 std::string peer;           // client_id once paired
+                std::map<std::string, pair_wait> waits; // client_id -> pending exchange
             } pairing;
             // what this cell publishes to its peers (a remote workspace picker):
             // pushed on every change, so the peer never has to poll
@@ -10412,6 +10481,10 @@ namespace cell
             void send_workspaces(const std::shared_ptr<conn> &c);
             void publish_workspaces(const json &list);
             bool notify(const std::string &peer, const std::string &method, const json &params);
+            // mutual pairing: the pending exchange of both codes
+            void note_pair_wait(const std::shared_ptr<conn> &c);
+            void drop_pair_wait(const std::string &peer);
+            json pair_approve(const std::string &code, const std::string &only, std::string &err);
 
             // ---- handlers -----------------------------------------------------
             json dispatch(const std::string &method, const json &params, std::string &err);
@@ -10450,6 +10523,13 @@ namespace cell
                 peer_addr = remote.address().to_string();
             pair_mode = (mode == "pair");
             pairing_code = code;
+            pair_mutual = pair_mode;
+            if (pair_mode)
+            {
+                std::lock_guard<std::mutex> lk(svc->mx);
+                if (svc->pairing.open && (long long)std::time(nullptr) < svc->pairing.expires)
+                    own_code = svc->pairing.code;
+            }
             x25519_pair k = x25519_new();
             my_eph_pub = k.pub;
             my_eph_sec = k.sec;
@@ -10464,6 +10544,7 @@ namespace cell
                        {"tz", tz_name()},
                        {"lang", lang_name()},
                        {"mode", pair_mode ? "pair" : "resume"},
+                       {"pm", pair_mutual ? "mutual" : ""},
                        {"ts", (long long)std::time(nullptr)}};
             hello_sent = true;
             send_raw(hello.dump());
@@ -10591,6 +10672,9 @@ namespace cell
             boost::system::error_code ec;
             sock.shutdown(tcp::socket::shutdown_both, ec);
             sock.close(ec);
+            // a pending pairing channel leaves no request behind
+            if (pair_pending)
+                svc->drop_pair_wait(peer_id);
             finish_wait(-1, why);
             kill_pending(why);
             auto svc_ = svc;
@@ -10610,6 +10694,34 @@ namespace cell
                     fail_reason = why;
             }
             wcv.notify_all();
+        }
+
+        // Send the last frame, then close once the write queue has drained: a
+        // plain close() shuts the socket immediately and the peer would never
+        // see the frame (the pairing "done" proof rides that last frame).
+        inline void impl::conn::close_after_flush(const std::string &why)
+        {
+            auto self = shared_from_this();
+            auto tim = std::make_shared<asio::steady_timer>(svc->io);
+            auto ticks = std::make_shared<int>(0);
+            auto step = std::make_shared<std::function<void()>>();
+            *step = [self, tim, ticks, step, why]()
+            {
+                if (self->closed.load() || ++*ticks > 150)
+                {
+                    self->close(why);
+                    return;
+                }
+                if (!self->wq.empty())
+                {
+                    tim->expires_after(std::chrono::milliseconds(20));
+                    tim->async_wait(asio::bind_executor(self->strand, [step](const boost::system::error_code &ec)
+                                                       { if (!ec) (*step)(); }));
+                    return;
+                }
+                self->close(why);
+            };
+            (*step)();
         }
 
         inline void impl::conn::kill_pending(const std::string &why)
@@ -10693,6 +10805,7 @@ namespace cell
             if (mode == "pair")
             {
                 pair_mode = true;
+                pair_mutual = jstr(j, "pm") == "mutual";
                 std::string code;
                 {
                     std::lock_guard<std::mutex> lk(svc->mx);
@@ -10703,6 +10816,7 @@ namespace cell
                 psk = argon2id(code, pair_salt(svc->client_id, their_id));
                 if (psk.empty())
                     return fail("key derivation failed");
+                pair_psk_own = psk; // response side: this is the PSK of OUR code
             }
             else
             {
@@ -10778,6 +10892,15 @@ namespace cell
                 psk_local = argon2id(pairing_code, pair_salt(svc->client_id, their_id));
                 if (psk_local.empty())
                     return fail("key derivation failed");
+                pair_psk_own = psk_local; // initiator side: PSK of THEIR code
+                if (pair_mutual)
+                {
+                    if (own_code.empty())
+                        return fail("the peer needs your code too: open a pairing window first");
+                    pair_psk_their = argon2id(own_code, pair_salt(svc->client_id, their_id));
+                    if (pair_psk_their.empty())
+                        return fail("key derivation failed");
+                }
             }
             else
             {
@@ -10804,7 +10927,7 @@ namespace cell
             app_rx = hkdf_expand(prk, "fl app s2c", 32);
 
             json confirm{{"t", "confirm"}, {"th", hex_encode(th)}};
-            if (pair_mode)
+            if (pair_mode && !pair_mutual)
             {
                 link_key = random_bytes(kKeyBytes);
                 confirm["link"] = b64_encode(link_key);
@@ -10823,6 +10946,30 @@ namespace cell
                                           svc->bound_port, peer_port));
             if (jstr(j, "th") != expect)
                 return fail("handshake confirmation mismatch");
+
+            if (pair_mode && pair_mutual)
+            {
+                // Phase 1 proves knowledge of the responder's code only, so the
+                // connection is kept as a *pairing channel* instead of a session:
+                // it carries the key offer and the approval proof, nothing else.
+                ready = true;
+                pair_pending = true;
+                if (inbound)
+                {
+                    // let the initiator finish its handshake; the offer follows on
+                    // this channel and the request appears once it is here
+                    json confirm{{"t", "confirm"}, {"th", expect}};
+                    json sealed{{"t", "enc"}, {"b", aead_seal(hs_tx, "fl-hs", confirm.dump())}};
+                    send_raw(sealed.dump());
+                }
+                else
+                {
+                    finish_wait(1, {});
+                    send_pair_offer();
+                    svc->note_pair_wait(shared_from_this());
+                }
+                return;
+            }
 
             if (inbound && pair_mode)
             {
@@ -10900,6 +11047,80 @@ namespace cell
             handshake_done();
         }
 
+        // Initiator side: hand over the long-term key sealed with the key that
+        // needs BOTH codes. A peer that only knows one code cannot open it, so
+        // the offer is useless until the responder types the initiator's code.
+        inline void impl::conn::send_pair_offer()
+        {
+            if (!pair_mode || !pair_mutual || pair_psk_own.empty() || pair_psk_their.empty())
+                return;
+            link_key = random_bytes(kKeyBytes);
+            const std::string k = pair_mutual_key(pair_psk_their, pair_psk_own);
+            send_encrypted(json{{"t", "pair_offer"}, {"offer", aead_seal(k, "fl-pair", link_key)}});
+        }
+
+        // Responder side: keep the sealed offer; the request becomes actionable
+        // only now (there is no key to open before it arrives).
+        inline void impl::conn::on_pair_offer(const json &j)
+        {
+            if (!pair_pending || !inbound)
+                return;
+            json offer = j.contains("offer") ? j["offer"] : json{};
+            if (!offer.is_object() || offer.empty())
+                return fail("the peer sent no key offer");
+            pair_offer = std::move(offer);
+            svc->note_pair_wait(shared_from_this());
+            svc->log("info", std::format("pairing request from {} ({}) awaits your code",
+                                        peer_name, peer_id.substr(0, 8)));
+            svc->emit({{"type", "pair_request"}, {"client_id", peer_id}, {"name", peer_name}});
+        }
+
+        // Initiator side: the responder proved it knows our code (the proof key
+        // needs both codes), so the link key is confirmed and stored.
+        inline void impl::conn::on_pair_done(const json &j)
+        {
+            if (!pair_pending || inbound)
+                return;
+            const std::string k = pair_mutual_key(pair_psk_their, pair_psk_own);
+            std::string proof;
+            if (k.empty() || !b64_decode(jstr(j, "proof"), proof) ||
+                !const_eq(proof, hmac_sha256(k, "fl pair done")))
+                return fail("the peer did not prove your pairing code");
+            if (link_key.size() != kKeyBytes)
+                return fail("no link key was offered");
+            if (!svc->st.save_key(peer_id, link_key))
+                return fail("could not store the link key");
+            peer_meta m;
+            m.id = peer_id;
+            m.name = peer_name.empty() ? peer_id.substr(0, 8) : peer_name;
+            boost::system::error_code rec;
+            const tcp::endpoint remote = sock.remote_endpoint(rec);
+            if (!rec)
+            {
+                m.addr = remote.address().to_string();
+                m.port = peer_port ? peer_port : remote.port();
+            }
+            m.paired_at = (long long)std::time(nullptr);
+            m.last_seen = m.paired_at;
+            m.via = "mutual";
+            m.paired = true;
+            m.os = peer_os;
+            m.tz = peer_tz;
+            m.lang = peer_lang;
+            (void)svc->st.save_meta(m);
+            svc->drop_pair_wait(peer_id);
+            {
+                std::lock_guard<std::mutex> lk(svc->mx);
+                svc->pairing.state = "paired";
+                svc->pairing.peer = peer_id;
+                svc->pairing.open = false;
+                svc->pairing.code.clear();
+            }
+            svc->log("info", std::format("paired with {} ({}) — both codes exchanged", m.name, peer_id));
+            svc->emit({{"type", "paired"}, {"client_id", peer_id}, {"name", m.name}});
+            close_after_flush("pairing complete");
+        }
+
         inline void impl::conn::handshake_done()
         {
             if (ready)
@@ -10962,6 +11183,16 @@ namespace cell
                 if (!p.is_object())
                     return close("malformed payload");
                 const std::string pt = jstr(p, "t");
+                // a pairing channel carries the exchange of both codes and
+                // nothing else — no RPC, no events, no workspace list
+                if (pair_pending)
+                {
+                    if (pt == "pair_offer")
+                        return on_pair_offer(p);
+                    if (pt == "pair_done")
+                        return on_pair_done(p);
+                    return close("unexpected frame on the pairing channel");
+                }
                 if (pt == "hello")
                 {
                     peer_name = clean_name(jstr(p, "name", peer_name));
@@ -12109,6 +12340,159 @@ namespace cell
             return true;
         }
 
+        // ---- mutual pairing: the pending exchange of both codes -------------
+        // Called from the connection's strand once a pairing channel is up. The
+        // record is what the page lists: "this cell asked to pair and proved it
+        // knows your code — type its code to finish".
+        inline void impl::note_pair_wait(const std::shared_ptr<conn> &c)
+        {
+            if (!c || c->peer_id.empty())
+                return;
+            pair_wait w;
+            w.client_id = c->peer_id;
+            w.name = clean_name(c->peer_name);
+            w.addr = c->peer_addr;
+            w.port = c->peer_port;
+            w.since = (long long)std::time(nullptr);
+            w.incoming = c->inbound;
+            w.expires = w.since + kPairWaitSeconds;
+            w.link = c;
+            w.offer = c->pair_offer;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (pairing.expires > 0 && w.expires > pairing.expires)
+                    w.expires = pairing.expires; // never outlive the window
+                pairing.waits[w.client_id] = w;
+                if (pairing.state != "paired" && pairing.state != "request")
+                    pairing.state = w.incoming ? "request" : "waiting";
+                if (w.incoming)
+                    pairing.peer = w.client_id;
+            }
+            announce(1); // the pairing flag/state is part of our TXT record
+        }
+
+        inline void impl::drop_pair_wait(const std::string &peer)
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            pairing.waits.erase(peer);
+            if (pairing.waits.empty() && pairing.state != "paired")
+            {
+                pairing.state = pairing.open ? "waiting" : "idle";
+                pairing.peer.clear();
+            }
+        }
+
+        // The responder's half: the user typed the initiator's code, so the offer
+        // can finally be opened. Both codes have now been exchanged — this is the
+        // moment a link key comes into existence on this side.
+        inline json impl::pair_approve(const std::string &code, const std::string &only, std::string &err)
+        {
+            const std::string norm = pairing_normalize(code);
+            std::string raw;
+            if (!pairing_code_decode(norm, raw))
+            {
+                err = "the pairing code is malformed (512-bit, base62)";
+                return json{};
+            }
+            std::shared_ptr<conn> c;
+            std::string peer;
+            std::string psk_own;
+            json offer;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                for (const auto &[id, w] : pairing.waits)
+                {
+                    if (!w.incoming)
+                        continue;
+                    if (!only.empty() && id != only)
+                        continue;
+                    auto sp = w.link.lock();
+                    if (!sp || !sp->pair_pending)
+                        continue;
+                    c = sp;
+                    peer = id;
+                    psk_own = sp->pair_psk_own;
+                    offer = sp->pair_offer;
+                    break;
+                }
+            }
+            if (!c)
+            {
+                err = "no pairing request is waiting for your code";
+                return json{};
+            }
+            if (psk_own.empty() || offer.is_null() || !offer.is_object())
+            {
+                err = "that request has no key offer yet — try again in a moment";
+                return json{};
+            }
+            const std::string psk_theirs = argon2id(norm, pair_salt(this->client_id, peer));
+            if (psk_theirs.empty())
+            {
+                err = "key derivation failed";
+                return json{};
+            }
+            const std::string k = pair_mutual_key(psk_theirs, psk_own);
+            std::string link;
+            if (!aead_open(k, "fl-pair", offer, link) || link.size() != kKeyBytes)
+            {
+                // keep the request on a typo (Argon2id bounds the guesses), but a
+                // few wrong codes close the window like they always did
+                std::lock_guard<std::mutex> lk(mx);
+                ++pairing.fails;
+                if (pairing.fails >= kPairMaxFails)
+                {
+                    pairing.waits.erase(peer);
+                    pairing.open = false;
+                    pairing.code.clear();
+                    pairing.display.clear();
+                    pairing.state = "idle";
+                    err = "too many wrong codes — open a new pairing window";
+                    asio::post(c->strand, [c]
+                               { c->close("too many wrong pairing codes"); });
+                    return json{};
+                }
+                err = "that code does not match the request";
+                return json{};
+            }
+            if (!st.save_key(peer, link))
+            {
+                err = "could not store the link key";
+                return json{};
+            }
+            peer_meta m;
+            m.id = peer;
+            m.name = c->peer_name.empty() ? peer.substr(0, 8) : clean_name(c->peer_name);
+            m.addr = c->peer_addr;
+            m.port = c->peer_port;
+            m.paired_at = (long long)std::time(nullptr);
+            m.last_seen = m.paired_at;
+            m.via = "mutual";
+            m.paired = true;
+            m.os = c->peer_os;
+            m.tz = c->peer_tz;
+            m.lang = c->peer_lang;
+            (void)st.save_meta(m);
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                pairing.waits.erase(peer);
+                pairing.state = "paired";
+                pairing.peer = peer;
+                pairing.open = false;
+                pairing.code.clear();
+                pairing.display.clear();
+            }
+            const std::string proof = b64_encode(hmac_sha256(k, "fl pair done"));
+            asio::post(c->strand, [c, proof]
+                       {
+                c->send_encrypted(json{{"t", "pair_done"}, {"proof", proof}});
+                c->close_after_flush("pairing complete"); });
+            announce(1);
+            log("info", std::format("paired with {} ({}) — both codes exchanged", m.name, peer));
+            emit({{"type", "paired"}, {"client_id", peer}, {"name", m.name}});
+            return json{{"ok", true}, {"client_id", peer}, {"name", m.name}, {"paired", true}};
+        }
+
         inline std::shared_ptr<impl::conn> impl::session_for(const std::string &peer, int timeout_ms, std::string &err)
         {
             {
@@ -12284,17 +12668,40 @@ namespace cell
             pair_timer.async_wait([self](const boost::system::error_code &ec)
                                   {
                 if (ec || !self->alive.load()) return;
+                std::vector<std::shared_ptr<impl::conn>> dead;
                 {
                     std::lock_guard<std::mutex> lk(self->mx);
                     if (self->pairing.open && (long long)std::time(nullptr) >= self->pairing.expires)
                     {
                         self->pairing.open = false;
                         self->pairing.code.clear();
-                        if (self->pairing.state == "waiting")
+                        self->pairing.display.clear();
+                        if (self->pairing.state == "waiting" || self->pairing.state == "request")
                             self->pairing.state = "expired";
                         self->emit({{"type", "pairing_expired"}});
                     }
+                    // a half-finished code exchange dies with its own deadline
+                    // (or with the window, whichever came first)
+                    const long long now = (long long)std::time(nullptr);
+                    const bool window = self->pairing.open && now < self->pairing.expires;
+                    for (auto it = self->pairing.waits.begin(); it != self->pairing.waits.end();)
+                    {
+                        if (it->second.expires > now && window)
+                        {
+                            ++it;
+                            continue;
+                        }
+                        if (auto sp = it->second.link.lock())
+                            dead.push_back(sp);
+                        it = self->pairing.waits.erase(it);
+                    }
+                    if (self->pairing.waits.empty() && self->pairing.state == "request")
+                        self->pairing.state = self->pairing.open ? "waiting" : "idle";
                 }
+                for (auto &c : dead)
+                    asio::post(c->strand, [c] { c->close("pairing request expired"); });
+                if (!dead.empty())
+                    self->emit({{"type", "pair_request_expired"}});
                 self->pair_expire_loop(); });
         }
 
@@ -12517,12 +12924,25 @@ namespace cell
             json pair;
             {
                 std::lock_guard<std::mutex> lk(mx);
+                json incoming = json::array(), outgoing = json::array();
+                for (const auto &[id, w] : pairing.waits)
+                {
+                    json row{{"client_id", id},
+                             {"name", w.name.empty() ? id.substr(0, 8) : w.name},
+                             {"addr", w.addr},
+                             {"port", w.port},
+                             {"since", w.since},
+                             {"expires", w.expires}};
+                    (w.incoming ? incoming : outgoing).push_back(std::move(row));
+                }
                 pair = {{"open", pairing.open},
                         {"state", pairing.state},
                         {"code", pairing.display},
                         {"expires", pairing.expires},
                         {"peer", pairing.peer},
-                        {"fails", pairing.fails}};
+                        {"fails", pairing.fails},
+                        {"requests", std::move(incoming)},
+                        {"outgoing", std::move(outgoing)}};
             }
             auto [unread, total] = st.transmission_counts();
             const bool on = alive.load();
@@ -12613,6 +13033,16 @@ namespace cell
                 ps.state = "waiting";
                 {
                     std::lock_guard<std::mutex> lk(p_->mx);
+                    // a new code must not drop requests that already proved
+                    // themselves: the user may be reading the peer's code out loud
+                    ps.waits = p_->pairing.waits;
+                    for (const auto &[id, w] : ps.waits)
+                        if (w.incoming)
+                        {
+                            ps.state = "request";
+                            ps.peer = id;
+                            break;
+                        }
                     p_->pairing = ps;
                 }
                 // the TXT record carries the flag; announce the change so a peer
@@ -12624,23 +13054,43 @@ namespace cell
             json pair_cancel()
             {
                 bool was = false;
+                std::vector<std::shared_ptr<impl::conn>> links;
                 {
                     std::lock_guard<std::mutex> lk(p_->mx);
-                    was = p_->pairing.open;
+                    was = p_->pairing.open || !p_->pairing.waits.empty();
+                    for (auto &[id, w] : p_->pairing.waits)
+                        if (auto sp = w.link.lock())
+                            links.push_back(sp);
                     p_->pairing = impl::pairing_state{};
                 }
+                for (auto &c : links)
+                    asio::post(c->strand, [c]
+                               { c->close("pairing cancelled"); });
                 p_->announce(1);
                 return json{{"ok", true}, {"was_open", was}};
             }
 
-            // `code` is what the user typed (grouping spaces are ignored); `addr`
-            // is "ip" or "ip:port", empty = find the peer through discovery
+            // `code` is what the user typed — the OTHER cell's code. Pairing is
+            // mutual: this call proves we know their code, and it only finishes
+            // when they type ours (see pair_approve). `addr` is "ip" or
+            // "ip:port", empty = find the peer through discovery.
             json pair_join(const std::string &code, const std::string &addr, std::string &err)
             {
                 if (!running())
                 {
                     err = "flowlink is not running";
                     return json{};
+                }
+                // the peer has to type OUR code, so a window must be open here
+                // even when the user never pressed "show my code"
+                if (!p_->is_pairing_open())
+                {
+                    json begun = pair_begin(kPairTtlSeconds);
+                    if (!begun.value("ok", false))
+                    {
+                        err = begun.value("error", std::string("could not open a pairing window"));
+                        return json{};
+                    }
                 }
                 const std::string norm = pairing_normalize(code);
                 std::string raw;
@@ -12774,19 +13224,41 @@ namespace cell
                         c->close("pairing failed");
                         continue;
                     }
-                    return json{{"ok", true},
-                                {"client_id", c->peer_id},
-                                {"name", c->peer_name},
-                                {"addr", ep.address().to_string()},
-                                {"port", ep.port()}};
+                    json r{{"ok", true},
+                           {"client_id", c->peer_id},
+                           {"name", c->peer_name},
+                           {"addr", ep.address().to_string()},
+                           {"port", ep.port()},
+                           {"pending", c->pair_mutual}};
+                    if (c->pair_mutual)
+                    {
+                        // the handshake only proved we know THEIR code; the link
+                        // exists once they type ours
+                        std::lock_guard<std::mutex> lk(p_->mx);
+                        r["code"] = p_->pairing.display;
+                        r["expires"] = p_->pairing.expires;
+                    }
+                    return r;
                 }
                 err = last.empty() ? "pairing failed" : last;
                 return json{};
             }
 
+            // The other half of a mutual pairing: the user typed the requester's
+            // code. Only now does a link key exist on this side — and the peer
+            // stores its copy on the proof this sends back.
+            json pair_approve(const std::string &code, const std::string &client_id, std::string &err)
+            {
+                if (!running())
+                {
+                    err = "flowlink is not running";
+                    return json{};
+                }
+                return p_->pair_approve(code, client_id, err);
+            }
+
             // ---- peers ---------------------------------------------------------
             json peers() { return p_->peers_json(); }
-
             // "forget": remove the link record, its credential and everything it
             // sent us. "disconnect" only removes the trust credential.
             bool forget(const std::string &id, std::string &err)
@@ -13488,6 +13960,15 @@ namespace cell
                     r["ok"] = true;
                     return r;
                 }
+                if (name == "approve")
+                {
+                    std::string err;
+                    nlohmann::json r = svc->pair_approve(args.value("code", ""), args.value("client_id", ""), err);
+                    if (!err.empty())
+                        return {{"ok", false}, {"error", err}};
+                    r["ok"] = true;
+                    return r;
+                }
                 if (name == "cancel")
                     return svc->pair_cancel();
                 if (name == "probe")
@@ -13680,10 +14161,18 @@ namespace cell
             if (sub == "join")
             {
                 if (toks.size() < 3)
-                    return fail("usage: /link join CODE [ADDR]");
+                    return fail("usage: /link join CODE [ADDR]  (CODE = the other cell's code)");
                 args["code"] = toks[2];
                 if (toks.size() > 3)
                     args["addr"] = toks[3];
+            }
+            else if (sub == "approve")
+            {
+                if (toks.size() < 3)
+                    return fail("usage: /link approve CODE [CELL]  (CODE = the cell that asked to pair)");
+                args["code"] = toks[2];
+                if (toks.size() > 3)
+                    args["client_id"] = resolve_cell(toks[3]).empty() ? toks[3] : resolve_cell(toks[3]);
             }
             else if (sub == "share")
             {
@@ -13725,9 +14214,9 @@ namespace cell
                      sub != "probe")
             {
                 line("usage: /link [status|on|off|peers|scan|discovery on|off|");
-                line("             pair [TTL]|join CODE [ADDR]|cancel|attach CELL|detach|");
-                line("             share CELL [SID]|send CELL TEXT|transfers|read ID|");
-                line("             forget CELL|disconnect CELL|probe [ADDR]]");
+                line("             pair [TTL]|join CODE [ADDR]|approve CODE [CELL]|cancel|");
+                line("             attach CELL|detach|share CELL [SID]|send CELL TEXT|");
+                line("             transfers|read ID|forget CELL|disconnect CELL|probe [ADDR]]");
                 return out;
             }
 
@@ -13761,6 +14250,12 @@ namespace cell
                 {
                     line(std::format("  pairing: paired with {}", pair.value("peer", "")));
                 }
+                for (const auto &q : pair.value("requests", nlohmann::json::array()))
+                    line(std::format("  request  {} ({}) — run /link approve with ITS code",
+                                     q.value("name", ""), q.value("client_id", "")));
+                for (const auto &q : pair.value("outgoing", nlohmann::json::array()))
+                    line(std::format("  waiting  {} ({}) to approve your code",
+                                     q.value("name", ""), q.value("client_id", "")));
                 const nlohmann::json peers = r.contains("peers") ? r["peers"] : nlohmann::json::array();
                 int online = 0, present = 0;
                 for (const auto &p : peers)
@@ -13840,14 +14335,31 @@ namespace cell
             if (sub == "pair")
             {
                 const int ttl = args.value("ttl", 0) > 0 ? args.value("ttl", 0) : 300;
-                line(std::format("pairing code (single use, {} minutes):", ttl / 60));
+                line(std::format("your pairing code (single use, {} minutes):", ttl / 60));
                 line("  " + r.value("code", std::string{}));
-                line("the other cell runs: /link join <that code> — nothing else is needed");
+                line("the other cell types it with: /link join <that code>");
+                line("it then shows ITS code here as a request — finish with /link approve <its code>");
                 return out;
             }
             if (sub == "join")
             {
-                line(std::format("paired with {} ({})", r.value("name", ""), r.value("client_id", "")));
+                if (r.value("pending", false))
+                {
+                    line(std::format("pairing request sent to {} ({})", r.value("name", ""), r.value("client_id", "")));
+                    line(std::format("give them your code, then they approve: {}",
+                                     r.value("code", std::string{})));
+                    line("the link exists once both codes have been exchanged — /link status shows the request");
+                }
+                else
+                {
+                    line(std::format("paired with {} ({})", r.value("name", ""), r.value("client_id", "")));
+                }
+                return out;
+            }
+            if (sub == "approve")
+            {
+                line(std::format("paired with {} ({}) — both codes exchanged",
+                                 r.value("name", ""), r.value("client_id", "")));
                 return out;
             }
             if (sub == "cancel")
@@ -30228,7 +30740,7 @@ int repl::run()
         o.port = (std::uint16_t)std::clamp(fl.value("port", 47822), 0, 65535);
         o.discovery = (std::uint16_t)std::clamp(fl.value("discovery", 5353), 0, 65535);
         o.announce = fl.value("announce", true);
-        o.accept_remote = fl.value("accept", false);
+        o.accept_remote = fl.value("accept_workspace", false) || fl.value("accept_workflow", false);
         o.on_event = [&attach_rid](const nlohmann::json &ev)
         {
             const std::string type = ev.value("type", "");
