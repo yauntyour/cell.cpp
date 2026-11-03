@@ -122,7 +122,7 @@ static const nlohmann::json *jfield(const nlohmann::json &j, const char *key)
     {
         const auto u = f->get<unsigned long long>();
         return u <= (unsigned long long)std::numeric_limits<long long>::max() ? std::optional{(long long)u}
-                                                                             : std::nullopt;
+                                                                              : std::nullopt;
     }
     if (f->is_number_integer())
         return f->get<long long>();
@@ -300,7 +300,7 @@ static std::string dump_safe(const nlohmann::json &j, int indent = -1)
         ++i;
         return lead;
     }
-    const size_t n = lead >= 0xF0 && lead <= 0xF4 ? 3
+    const size_t n = lead >= 0xF0 && lead <= 0xF4   ? 3
                      : lead >= 0xE0 && lead <= 0xEF ? 2
                      : lead >= 0xC2 && lead <= 0xDF ? 1
                                                     : 0;
@@ -27600,7 +27600,7 @@ static int run_selftest()
             R.expect(html.contains("<ol class=\"md-list\"><li>read</li><li>write</li></ol>"), "HTML export renders ordered lists");
             R.expect(html.contains("<ul class=\"md-list\"><li>alpha</li>"), "HTML export renders bullet lists");
             R.expect(html.contains("<ul class=\"md-list\"><li>parent<ul class=\"md-list\"><li>child one</li>"
-                               "<li>child two</li></ul></li><li>sibling</li>"),
+                                   "<li>child two</li></ul></li><li>sibling</li>"),
                      "HTML export nests indented list items inside their parent item");
             R.expect(html.contains("<ol class=\"md-list\" start=\"3\"><li>third</li><li>fourth</li></ol>"),
                      "HTML export keeps one list across blank lines and honours its start number");
