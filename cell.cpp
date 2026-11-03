@@ -12063,7 +12063,9 @@ namespace cell
                 std::lock_guard<std::mutex> lk(mx);
                 list = my_workspaces;
             }
-            if (!c || !c->ready || !list.is_array() || list.empty())
+            // an empty list is a real answer ("nothing open here"): skipping it
+            // would leave the peer showing the entries it cached earlier
+            if (!c || !c->ready || !list.is_array())
                 return;
             json payload{{"t", "evt"}, {"m", "ws.state"}, {"p", {{"workspaces", list}}}};
             asio::post(c->strand, [c, payload]
