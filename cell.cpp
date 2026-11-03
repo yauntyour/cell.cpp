@@ -87,7 +87,6 @@
 // core below it, and keeping the protocol, its on-disk store and the /link
 // bridge together is what makes the feature readable in a single-file core.
 
-
 // Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
 // Never throws and never returns a wrapped-around value: strtoull reports ERANGE
 // for "-1" (-> ULLONG_MAX) and for anything above ULLONG_MAX, and an out-of-range
@@ -7381,8 +7380,8 @@ namespace cell
 
         struct task
         {
-            std::string id;      // "t1", "t2", ... unique for the process lifetime
-            std::string tid;     // mounted thread id (hex, informational)
+            std::string id;  // "t1", "t2", ... unique for the process lifetime
+            std::string tid; // mounted thread id (hex, informational)
             std::string cmd;
             std::string wd;
             std::string session; // session that spawned it ("" = unknown)
@@ -7509,7 +7508,7 @@ namespace cell
             try
             {
                 std::thread worker([t, run_dir]
-                        {
+                                   {
                 {
                     std::lock_guard lk(t->mx);
                     t->tid = std::format("{:x}", (unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -8656,7 +8655,7 @@ namespace cell
 
         inline constexpr std::string_view kProto = "CELLFLNK";
         inline constexpr int kVersion = 2;
-        inline constexpr std::uint16_t kDefaultPort = 47822;   // TCP transport
+        inline constexpr std::uint16_t kDefaultPort = 47822;    // TCP transport
         inline constexpr std::uint16_t kDefaultMdnsPort = 5353; // DNS-SD
         inline constexpr std::string_view kServiceType = "_cell._tcp.local";
         inline constexpr std::string_view kGroup4 = "224.0.0.251";
@@ -8665,14 +8664,14 @@ namespace cell
         inline constexpr std::size_t kMaxDatagram = 4096;
         inline constexpr std::size_t kPairingBytes = 64; // 512-bit code
         inline constexpr std::size_t kKeyBytes = 32;
-        inline constexpr std::uint32_t kMdnsTtl = 120;   // seconds
-        inline constexpr auto kHeartbeat = 10s;          // ping when idle this long
-        inline constexpr auto kHeartbeatTimeout = 31s;   // no frame for this long = dead
-        inline constexpr auto kSweepPeriod = 2s;         // expiry/heartbeat sweep
-        inline constexpr auto kQueryPeriod = 45s;        // browse refresh
-        inline constexpr auto kPairSweepPeriod = 2s;     // pairing window expiry check
-        inline constexpr int kPairTtlSeconds = 300;      // default pairing window
-        inline constexpr int kPairMaxFails = 3;          // wrong codes before the window closes
+        inline constexpr std::uint32_t kMdnsTtl = 120; // seconds
+        inline constexpr auto kHeartbeat = 10s;        // ping when idle this long
+        inline constexpr auto kHeartbeatTimeout = 31s; // no frame for this long = dead
+        inline constexpr auto kSweepPeriod = 2s;       // expiry/heartbeat sweep
+        inline constexpr auto kQueryPeriod = 45s;      // browse refresh
+        inline constexpr auto kPairSweepPeriod = 2s;   // pairing window expiry check
+        inline constexpr int kPairTtlSeconds = 300;    // default pairing window
+        inline constexpr int kPairMaxFails = 3;        // wrong codes before the window closes
 
         // ---- JSON readers that never throw -------------------------------------
         // Everything arriving over the network goes through these: nlohmann's
@@ -8940,22 +8939,22 @@ namespace cell
         // their own machine: the OS name, the IANA time zone and the UI language.
         inline std::string os_name()
         {
-    #ifdef _WIN32
+#ifdef _WIN32
             return "Windows";
-    #elif defined(__APPLE__)
+#elif defined(__APPLE__)
             return "macOS";
-    #elif defined(__linux__)
+#elif defined(__linux__)
             return "Linux";
-    #else
+#else
             return "unknown";
-    #endif
+#endif
         }
 
         inline std::string tz_name()
         {
             if (const char *v = std::getenv("TZ"); v && *v)
                 return clean_name(v, 48);
-    #ifndef _WIN32
+#ifndef _WIN32
             std::error_code ec;
             const auto p = std::filesystem::read_symlink("/etc/localtime", ec);
             if (!ec)
@@ -8965,7 +8964,7 @@ namespace cell
                 if (at != std::string::npos)
                     return s.substr(at + 9);
             }
-    #endif
+#endif
             return "local";
         }
 
@@ -8974,11 +8973,11 @@ namespace cell
             for (const char *var : {"LANG", "LC_ALL", "LC_MESSAGES", "CELL_LANG"})
                 if (const char *v = std::getenv(var); v && *v)
                     return clean_name(v, 32);
-    #ifdef _WIN32
+#ifdef _WIN32
             return "zh-CN";
-    #else
+#else
             return "C";
-    #endif
+#endif
         }
 
         // =========================================================================
@@ -9019,12 +9018,12 @@ namespace cell
                 std::uint16_t type = 0;
                 std::uint16_t cls = c_in;
                 std::uint32_t ttl = 0;
-                std::string target;            // PTR / SRV / CNAME
-                std::uint16_t priority = 0;    // SRV
-                std::uint16_t weight = 0;      // SRV
-                std::uint16_t port = 0;        // SRV
-                std::vector<std::string> txt;  // TXT chunks
-                std::string addr;              // A / AAAA, numeric text
+                std::string target;           // PTR / SRV / CNAME
+                std::uint16_t priority = 0;   // SRV
+                std::uint16_t weight = 0;     // SRV
+                std::uint16_t port = 0;       // SRV
+                std::vector<std::string> txt; // TXT chunks
+                std::string addr;             // A / AAAA, numeric text
             };
 
             struct message
@@ -9379,7 +9378,7 @@ namespace cell
         {
             std::string addr; // numeric text, v6 link-local includes no %scope
             bool v6 = false;
-            unsigned scope = 0;  // v6 interface index, 0 when global
+            unsigned scope = 0; // v6 interface index, 0 when global
             bool loopback = false;
         };
 
@@ -9457,7 +9456,7 @@ namespace cell
                 }
             }
             else if (const auto at = host.find_last_of(':'); at != std::string::npos &&
-                                                              host.find(':') == at)
+                                                             host.find(':') == at)
             {
                 // exactly one colon: "host:port". More than one is a bare IPv6
                 // literal, which has no port.
@@ -9647,14 +9646,14 @@ namespace cell
         // bits, so the read-only attribute is the closest equivalent.
         inline void set_owner_only(const std::filesystem::path &p)
         {
-    #ifdef _WIN32
+#ifdef _WIN32
             std::error_code ec;
             std::filesystem::permissions(p,
                                          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                                          std::filesystem::perm_options::replace, ec);
-    #else
+#else
             ::chmod(p.c_str(), S_IRUSR | S_IWUSR);
-    #endif
+#endif
         }
 
         // ---- sealed key files ---------------------------------------------------
@@ -9842,9 +9841,7 @@ namespace cell
 
             json to_json() const
             {
-                return {{"client_id", id}, {"name", name}, {"addr", addr}, {"port", port},
-                        {"paired_at", paired_at}, {"last_seen", last_seen}, {"via", via},
-                        {"paired", paired}, {"os", os}, {"tz", tz}, {"lang", lang}};
+                return {{"client_id", id}, {"name", name}, {"addr", addr}, {"port", port}, {"paired_at", paired_at}, {"last_seen", last_seen}, {"via", via}, {"paired", paired}, {"os", os}, {"tz", tz}, {"lang", lang}};
             }
             static peer_meta from_json(const json &j)
             {
@@ -9876,7 +9873,7 @@ namespace cell
             std::string subject;
             std::string note;
             std::string kind = "session"; // "session" | "archive" | "text"
-            std::string file;              // file name inside links/<from>/
+            std::string file;             // file name inside links/<from>/
             long long created = 0;
             long long bytes = 0;
             bool read = false;
@@ -9904,10 +9901,7 @@ namespace cell
 
         inline json transmission_to_json(const transmission &t)
         {
-            return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
-                    {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
-                    {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
-                    {"read", t.read}, {"session", t.session}};
+            return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name}, {"subject", t.subject}, {"note", t.note}, {"kind", t.kind}, {"file", t.file}, {"created", t.created}, {"bytes", t.bytes}, {"read", t.read}, {"session", t.session}};
         }
 
         // a FlowLink workspace: a directory on another cell that the user pinned
@@ -10163,10 +10157,11 @@ namespace cell
             std::vector<peer_meta> all_meta()
             {
                 const json doc = get_links();
-                auto out = doc["links"]
-                           | std::views::transform([](const json &e) { return peer_meta::from_json(e); })
-                           | std::views::filter([](const peer_meta &m) { return is_hex_id(m.id, 32); })
-                           | std::ranges::to<std::vector>();
+                auto out = doc["links"] | std::views::transform([](const json &e)
+                                                                { return peer_meta::from_json(e); }) |
+                           std::views::filter([](const peer_meta &m)
+                                              { return is_hex_id(m.id, 32); }) |
+                           std::ranges::to<std::vector>();
                 std::ranges::sort(out, {}, &peer_meta::name);
                 return out;
             }
@@ -10206,7 +10201,7 @@ namespace cell
                 std::filesystem::remove(key_file(id), ec);
                 // the credential is what revokes access; the flag only drives the UI
                 (void)update_links([&](json &doc)
-                             {
+                                   {
                     for (auto &e : doc["links"])
                         if (jstr(e, "client_id") == id)
                             e["paired"] = false;
@@ -10268,7 +10263,7 @@ namespace cell
                 // last_seen / paired on the sender's record: best effort, the file
                 // and the index below are the durable part
                 (void)update_links([&](json &doc)
-                             {
+                                   {
                     json arr = json::array();
                     for (const auto &e : doc["links"])
                     {
@@ -10307,9 +10302,9 @@ namespace cell
                 const json index = read_doc(transmission_file());
                 if (!index.contains("items") || !index["items"].is_array())
                     return {};
-                auto out = index["items"]
-                           | std::views::transform([](const json &e) { return transmission_from_json(e); })
-                           | std::ranges::to<std::vector>();
+                auto out = index["items"] | std::views::transform([](const json &e)
+                                                                  { return transmission_from_json(e); }) |
+                           std::ranges::to<std::vector>();
                 std::ranges::sort(out, {}, &transmission::created);
                 std::ranges::reverse(out);
                 return out;
@@ -10418,8 +10413,7 @@ namespace cell
                         if (name.empty())
                             name = w.cwd;
                     }
-                    out.push_back({{"cell", w.cell}, {"cwd", w.cwd}, {"name", name},
-                                   {"added_at", w.added_at}});
+                    out.push_back({{"cell", w.cell}, {"cwd", w.cwd}, {"name", name}, {"added_at", w.added_at}});
                 }
                 return out;
             }
@@ -10427,10 +10421,7 @@ namespace cell
             {
                 json out = json::array();
                 for (const auto &t : list_transmissions())
-                    out.push_back({{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
-                                   {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
-                                   {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
-                                   {"read", t.read}, {"session", t.session}});
+                    out.push_back({{"id", t.id}, {"from", t.from}, {"from_name", t.from_name}, {"subject", t.subject}, {"note", t.note}, {"kind", t.kind}, {"file", t.file}, {"created", t.created}, {"bytes", t.bytes}, {"read", t.read}, {"session", t.session}});
                 return out;
             }
 
@@ -10438,18 +10429,17 @@ namespace cell
             std::vector<link_workspace> link_workspaces()
             {
                 const json doc = get_links();
-                return doc["workspaces"]
-                       | std::views::transform([](const json &w)
-                                               {
+                return doc["workspaces"] | std::views::transform([](const json &w)
+                                                                 {
                             link_workspace lw;
                             lw.cell = jstr(w, "cell");
                             lw.cwd = jstr(w, "cwd");
                             lw.name = jstr(w, "name");
                             lw.added_at = jint(w, "added_at");
-                            return lw; })
-                       | std::views::filter([](const link_workspace &lw)
-                                            { return !lw.cell.empty() && !lw.cwd.empty(); })
-                       | std::ranges::to<std::vector>();
+                            return lw; }) |
+                       std::views::filter([](const link_workspace &lw)
+                                          { return !lw.cell.empty() && !lw.cwd.empty(); }) |
+                       std::ranges::to<std::vector>();
             }
             [[nodiscard]] bool add_link_workspace(const link_workspace &w)
             {
@@ -10549,7 +10539,7 @@ namespace cell
                 std::string peer_addr;       // remote address of this connection
                 std::string my_eph_pub, my_eph_sec;
                 std::string peer_eph_pub;
-                std::string psk;          // pairing code PSK or link key
+                std::string psk; // pairing code PSK or link key
                 bool pair_mode = false;
                 std::string pairing_code; // client side: the code we typed
                 std::string link_key;     // pair mode, initiator side: key we hand over
@@ -10631,9 +10621,9 @@ namespace cell
             std::string mdns_tx_key;
             std::vector<local_addr> locals;
             long long locals_at = 0;
-            asio::steady_timer mdns_timer{io};   // periodic re-announce
-            asio::steady_timer query_timer{io};  // periodic browse query
-            asio::steady_timer burst_timer{io};  // initial announce/query burst
+            asio::steady_timer mdns_timer{io};  // periodic re-announce
+            asio::steady_timer query_timer{io}; // periodic browse query
+            asio::steady_timer burst_timer{io}; // initial announce/query burst
             asio::steady_timer sweep_timer{io};
             asio::steady_timer pair_timer{io};
             int burst_left = 0;
@@ -11255,9 +11245,7 @@ namespace cell
             svc->register_session(shared_from_this());
             finish_wait(1, {});
             svc->emit({{"type", "online"}, {"client_id", peer_id}, {"name", peer_name}});
-            send_encrypted(json{{"t", "hello"}, {"name", svc->name}, {"client_id", svc->client_id},
-                                {"port", svc->bound_port},
-                                {"accept_remote", svc->opt.accept_remote}});
+            send_encrypted(json{{"t", "hello"}, {"name", svc->name}, {"client_id", svc->client_id}, {"port", svc->bound_port}, {"accept_remote", svc->opt.accept_remote}});
             svc->send_workspaces(shared_from_this());
         }
 
@@ -11361,9 +11349,8 @@ namespace cell
                     if (method == "ws.state" && evt_params.is_object() &&
                         evt_params.contains("workspaces") && evt_params["workspaces"].is_array())
                         (void)svc->st.save_peer_workspaces(peer_id, evt_params["workspaces"],
-                                                          (long long)std::time(nullptr));
-                    json ev{{"type", "peer_event"}, {"client_id", peer_id},
-                            {"method", method}, {"params", std::move(evt_params)}};
+                                                           (long long)std::time(nullptr));
+                    json ev{{"type", "peer_event"}, {"client_id", peer_id}, {"method", method}, {"params", std::move(evt_params)}};
                     svc->emit(ev);
                     return;
                 }
@@ -11474,10 +11461,10 @@ namespace cell
                     boost::system::error_code oec;
                     acc->set_option(asio::ip::v6_only(false), oec); // best effort
                 }
-    #ifndef _WIN32
+#ifndef _WIN32
                 boost::system::error_code rec;
                 acc->set_option(tcp::acceptor::reuse_address(true), rec);
-    #endif
+#endif
                 acc->bind(tcp::endpoint(v6 ? tcp::v6() : tcp::v4(), preferred), ec);
                 if (ec)
                 {
@@ -12161,7 +12148,7 @@ namespace cell
                 std::vector<std::string> addrs;
                 bool goodbye = false;
             };
-            std::map<std::string, found> founds;                       // instance (lowered) -> fields
+            std::map<std::string, found> founds;                        // instance (lowered) -> fields
             std::map<std::string, std::vector<std::string>> host_addrs; // host (lowered) -> addresses
             for (const auto &r : m.an)
             {
@@ -12292,8 +12279,7 @@ namespace cell
         {
             json addrs = json::array();
             for (const auto &a : locals)
-                addrs.push_back({{"addr", a.addr}, {"family", a.v6 ? "v6" : "v4"},
-                                 {"scope", a.scope}, {"loopback", a.loopback}});
+                addrs.push_back({{"addr", a.addr}, {"family", a.v6 ? "v6" : "v4"}, {"scope", a.scope}, {"loopback", a.loopback}});
             const bool on = discovery_on.load();
             const char *state = !on ? "off" : (mdns_error.empty() ? "active" : "degraded");
             return {{"on", on},
@@ -12327,10 +12313,7 @@ namespace cell
                 json addrs = json::array();
                 for (const auto &a : p.addrs)
                     addrs.push_back(a);
-                out.push_back({{"client_id", id}, {"name", p.name}, {"addr", p.addrs.empty() ? "" : p.addrs.front()},
-                               {"addrs", addrs}, {"port", p.port}, {"os", p.os}, {"tz", p.tz},
-                               {"lang", p.lang}, {"accept", p.accept}, {"pairing", p.pairing_open},
-                               {"last_seen", p.seen}, {"expires", p.expires}});
+                out.push_back({{"client_id", id}, {"name", p.name}, {"addr", p.addrs.empty() ? "" : p.addrs.front()}, {"addrs", addrs}, {"port", p.port}, {"os", p.os}, {"tz", p.tz}, {"lang", p.lang}, {"accept", p.accept}, {"pairing", p.pairing_open}, {"last_seen", p.seen}, {"expires", p.expires}});
             }
             return out;
         }
@@ -12538,7 +12521,7 @@ namespace cell
                     const tcp::endpoint ep(address, port);
                     log("info", std::format("connecting to {} at {}:{}", peer.substr(0, 8), addr, port));
                     c->sock.async_connect(ep, asio::bind_executor(c->strand, [c](const boost::system::error_code &e)
-                                                                 {
+                                                                  {
                         if (e) { c->fail("connect failed: " + e.message()); return; }
                         c->start_outbound("resume", ""); }));
                     std::string why;
@@ -12654,8 +12637,7 @@ namespace cell
             if (method == "cli.exec")
                 return remote_console(params, err);
             if (method == "ping")
-                return json{{"ok", true}, {"ts", (long long)std::time(nullptr)}, {"name", name},
-                            {"client_id", client_id}};
+                return json{{"ok", true}, {"ts", (long long)std::time(nullptr)}, {"name", name}, {"client_id", client_id}};
             if (opt.on_call)
                 return opt.on_call(method, params, err);
             err = "unknown method: " + method;
@@ -12952,8 +12934,7 @@ namespace cell
                 // the TXT record carries the flag; announce the change so a peer
                 // browsing right now sees the window without waiting for a TTL
                 p_->announce(2);
-                return json{{"ok", true}, {"code", ps.display}, {"raw", ps.code},
-                            {"expires", ps.expires}, {"client_id", p_->client_id}, {"name", p_->name}};
+                return json{{"ok", true}, {"code", ps.display}, {"raw", ps.code}, {"expires", ps.expires}, {"client_id", p_->client_id}, {"name", p_->name}};
             }
 
             json pair_cancel()
@@ -13002,7 +12983,7 @@ namespace cell
                         port = (std::uint16_t)std::atoi(tail.c_str() + 1);
                 }
                 else if (const auto colon = host.rfind(':'); colon != std::string::npos &&
-                                                            host.find(':') == colon)
+                                                             host.find(':') == colon)
                 {
                     port = (std::uint16_t)std::atoi(host.c_str() + colon + 1);
                     host = host.substr(0, colon);
@@ -13193,10 +13174,7 @@ namespace cell
                     json msgs;
                     p_->st.read_transmission_messages(t, msgs);
                     (void)p_->st.mark_transmission(id, true); // read flag only
-                    return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
-                            {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
-                            {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
-                            {"read", true}, {"session", t.session}, {"messages", msgs}};
+                    return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name}, {"subject", t.subject}, {"note", t.note}, {"kind", t.kind}, {"file", t.file}, {"created", t.created}, {"bytes", t.bytes}, {"read", true}, {"session", t.session}, {"messages", msgs}};
                 }
                 return json{};
             }
@@ -13462,10 +13440,7 @@ namespace cell
                     continue;
                 nlohmann::json msgs;
                 st.read_transmission_messages(t, msgs);
-                return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name},
-                        {"subject", t.subject}, {"note", t.note}, {"kind", t.kind},
-                        {"file", t.file}, {"created", t.created}, {"bytes", t.bytes},
-                        {"read", t.read}, {"session", t.session}, {"messages", msgs}};
+                return {{"id", t.id}, {"from", t.from}, {"from_name", t.from_name}, {"subject", t.subject}, {"note", t.note}, {"kind", t.kind}, {"file", t.file}, {"created", t.created}, {"bytes", t.bytes}, {"read", t.read}, {"session", t.session}, {"messages", msgs}};
             }
             return nlohmann::json{};
         }
@@ -13527,8 +13502,7 @@ namespace cell
                         {"discovery_port", kDefaultMdnsPort},
                         {"discovery_bound", 0},
                         {"discovery_state", "off"},
-                        {"mdns", nlohmann::json{{"on", false}, {"state", "off"},
-                                                {"addresses", nlohmann::json::array()}}},
+                        {"mdns", nlohmann::json{{"on", false}, {"state", "off"}, {"addresses", nlohmann::json::array()}}},
                         {"addresses", nlohmann::json::array()},
                         {"announce", false},
                         {"hints", nlohmann::json::array()},
@@ -13808,7 +13782,7 @@ namespace cell
                 if (name == "publish")
                 {
                     svc->publish_workspaces(args.contains("workspaces") ? args["workspaces"]
-                                                                       : nlohmann::json::array());
+                                                                        : nlohmann::json::array());
                     return {{"ok", true}};
                 }
                 if (name == "ws.remote")
@@ -14135,7 +14109,7 @@ namespace cell
                             addr = a.get<std::string>(); // prefer a v6 address when there is one
                             break;
                         }
-                    const std::string state = p.value("online", false) ? "online"
+                    const std::string state = p.value("online", false)    ? "online"
                                               : p.value("present", false) ? "present"
                                                                           : "offline";
                     line(std::format("  {} [{}]{}{}  {}{}  {}", p.value("name", ""), state,
@@ -14277,7 +14251,6 @@ namespace cell
             return toks;
         }
     } // namespace flowlink
-
 
     // =========================================================================
     //  tools — the tool abstraction: execution policy (Deny / Ask / Allow), the
