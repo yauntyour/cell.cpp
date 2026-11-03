@@ -6690,11 +6690,61 @@ namespace cell
             inline bool verbose_enabled = false;
             using clock = std::chrono::steady_clock;
 
+            // A thread-local console sink: while a capture_scope is alive on this
+            // thread, everything print()/println() would write is handed to the
+            // scope instead. The remote console (/link attach) uses it to stream
+            // another cell's output over FlowLink — the alternative would be to
+            // thread an output parameter through every slash command.
+            using output_sink_t = std::function<void(std::string_view)>;
+            inline thread_local output_sink_t *capture_sink = nullptr;
+
+            inline void write_stdout(std::string_view s, bool flush_partial)
+            {
+                if (capture_sink)
+                {
+                    if (!s.empty())
+                        (*capture_sink)(s);
+                    return;
+                }
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                if (flush_partial)
+                    std::fflush(stdout);
+            }
+            inline void write_stderr(std::string_view s)
+            {
+                if (capture_sink)
+                {
+                    if (!s.empty())
+                        (*capture_sink)(s);
+                    return;
+                }
+                std::fwrite(s.data(), 1, s.size(), stderr);
+                std::fflush(stderr);
+            }
+
             void init_console()
             {
                 color_enabled = plat::init_console(color_force);
             }
         } // namespace detail
+
+        // RAII: redirect this thread's console output into `fn`. Nested scopes
+        // restore the previous sink. Not thread-safe by design — it is a
+        // per-thread view, and the FlowLink handler that installs it is the only
+        // thread writing that peer's output.
+        struct capture_scope
+        {
+            detail::output_sink_t sink;
+            detail::output_sink_t *prev = nullptr;
+            explicit capture_scope(detail::output_sink_t fn)
+                : sink(std::move(fn)), prev(detail::capture_sink)
+            {
+                detail::capture_sink = &sink;
+            }
+            ~capture_scope() { detail::capture_sink = prev; }
+            capture_scope(const capture_scope &) = delete;
+            capture_scope &operator=(const capture_scope &) = delete;
+        };
 
         enum class color : int
         {
@@ -6709,20 +6759,18 @@ namespace cell
         void print(std::format_string<Args...> fmt, Args &&...args)
         {
             std::string s = std::format(fmt, std::forward<Args>(args)...);
-            std::fwrite(s.data(), 1, s.size(), stdout);
             // flush only while a partial line is on screen (prompt, spinner, streamed
             // tokens): a completed line can stay in the CRT buffer, which makes long
             // tool echoes far cheaper. spawn_cmd flushes before running a child so
             // the child's output can never overtake ours.
-            if (!s.empty() && s.back() != '\n')
-                std::fflush(stdout);
+            detail::write_stdout(s, !s.empty() && s.back() != '\n');
         }
         template <std::formattable<char>... Args>
         void println(std::format_string<Args...> fmt, Args &&...args)
         {
             std::string s = std::format(fmt, std::forward<Args>(args)...);
             s += '\n';
-            std::fwrite(s.data(), 1, s.size(), stdout);
+            detail::write_stdout(s, false);
         }
         // milliseconds between two steady-clock time points
         inline long long diff_ms(detail::clock::time_point from, detail::clock::time_point to)
@@ -6741,8 +6789,7 @@ namespace cell
             if (detail::color_enabled)
                 s = std::format("\x1b[{}m{}\x1b[0m", (int)c, s);
             s += '\n';
-            std::fwrite(s.data(), 1, s.size(), stderr);
-            std::fflush(stderr);
+            detail::write_stderr(s);
         }
         // colored println to stdout (chat/think stream plain or dim text there;
         // tool-result echoes use this to stand out)
@@ -6753,7 +6800,7 @@ namespace cell
             if (detail::color_enabled)
                 s = std::format("\x1b[{}m{}\x1b[0m", (int)c, s);
             s += '\n';
-            std::fwrite(s.data(), 1, s.size(), stdout);
+            detail::write_stdout(s, false);
             // complete line: stays buffered like any other println output
         }
         template <std::formattable<char>... Args>
@@ -7825,7 +7872,7 @@ namespace cell
             // ---- FlowLink（局域网互联）--------------------------------------
             // FlowLink 的设置（开关、端口、信任的设备、工作区列表）不在
             // config.json 里：它们属于那个功能自己，存在 .cell/links/links.json
-            // （见 flowlink::store / cell::link::settings）。config.json 只留
+            // （见 flowlink::store / cell::flowlink::settings）。config.json 只留
             // 每个前端各自关心的东西。
 
             // An empty current_provider means "the first provider is active"; a
@@ -8061,7 +8108,7 @@ namespace cell
                         if (v.is_string())
                             s.active_sessions[k] = v.get<std::string>();
                 // 旧版把 FlowLink 设置写在 config.json 里：搬家由
-                // cell::link::migrate_legacy_settings() 一次完成，这里只读新位置。
+                // cell::flowlink::migrate_legacy_settings() 一次完成，这里只读新位置。
             }
             catch (const std::exception &e)
             {
@@ -8503,34 +8550,62 @@ namespace cell
     } // namespace encrypt
 
     // =========================================================================
-    //  FlowLink — the peer network (UDP discovery, pairing, end-to-end
-    //  encrypted messaging, remote cells and remote workspaces).
+    //  FlowLink — the peer network.
+    //
+    //  One namespace now owns the whole feature: DNS-SD discovery, pairing, the
+    //  end-to-end encrypted transport, remote workspaces, the remote console and
+    //  the /link command surface. `cell::link` (the old thin bridge) is gone;
+    //  its settings helpers and its command parser live here, next to the
+    //  protocol they describe, so the two can never drift apart.
     //
     //  Map of this region (in file order):
     //    1  protocol constants + JSON readers that never throw
     //    2  small utilities (ids, base62 pairing codes, time, platform info)
-    //    3  crypto (hash / HKDF / X25519 / Argon2id / AEAD)
-    //    4  sealed key files (Argon2id + AES-256-GCM, like the API-key vault)
-    //    5  records and the on-disk store (.cell/links/…)
-    //    6  conn — framing + handshake
-    //    7  impl — discovery, sessions, rpc dispatch
-    //    8  service — the public face (pimpl)
+    //    3  dns — the DNS wire format mDNS needs (pure functions)
+    //    4  local addresses, obtained through Boost.Asio only
+    //    5  crypto (hash / HKDF / X25519 / Argon2id / AEAD)
+    //    6  sealed key files (Argon2id + AES-256-GCM, like the API-key vault)
+    //    7  records and the on-disk store (.cell/links/…)
+    //    8  conn — framing, handshake, heartbeat
+    //    9  impl — mDNS responder/browser, sessions, rpc dispatch
+    //   10  service — the public face (pimpl)
+    //   11  host — the one mounted service + settings + /link command surface
     //
-    //  Nothing here is constructed until cell::link::enable() runs: no thread,
-    //  no socket, no allocation. `namespace link` right below is the bridge the
-    //  frontends use (/link, the desktop FlowLink page, the fl tool).
+    //  Nothing here is constructed until flowlink::enable() runs: no thread, no
+    //  socket, no allocation.
     // =========================================================================
 
-    //     cell A  <-- UDP discovery (broadcast + multicast) -->  cell B
-    //     cell A  <-- TCP, X25519 + Argon2id pairing code ---->  cell B
-    //             <-- XChaCha20-Poly1305 on every frame ---->
+    //     cell A  <-- mDNS (224.0.0.251 / ff02::fb, _cell._tcp.local) -->  cell B
+    //     cell A  <-- TCP, X25519 + Argon2id pairing code --------------->  cell B
+    //             <-- XChaCha20-Poly1305 on every frame ----------------->
+    //             <-- cli.exec / cli.out: the peer's console ----------->
     //
     //  Design notes
     //  ------------
-    //  * The service is OPT-IN and mounted on demand: nothing here is constructed
-    //    (no thread, no socket, no allocation) until cell::link::enable() runs.
-    //    `service` owns its own io_context, so it never shares a thread with the
-    //    agent loop, the UI or the HTTP server.
+    //  * Discovery is real DNS-SD over mDNS, not a private beacon: every cell
+    //    publishes `_cell._tcp.local` PTR, an SRV (its transport port), a TXT
+    //    block (client_id, name, OS, time zone, language, accept/pairing flags)
+    //    and A/AAAA records for its own addresses. `dns-sd -B _cell._tcp` sees
+    //    the same devices this page does. Goodbye packets (TTL 0) make a clean
+    //    shutdown disappear immediately instead of after the TTL.
+    //
+    //  * Both address families are first class: the TCP listener is a dual
+    //    stack v6 socket, AAAA records are advertised next to A records, and
+    //    connection attempts try every address the peer published. There is no
+    //    "IPv4 first" assumption left in the session code.
+    //
+    //  * No system socket headers. Interface addresses come from Boost.Asio's
+    //    resolver (it reports every NIC, including IPv6 link-local with its
+    //    scope id), multicast joins take those addresses directly, and the
+    //    transport is asio throughout. On Windows that means exactly one
+    //    system import library (`-lws2_32`, which asio itself requires) instead
+    //    of the old ws2_32 + mswsock + ole32 + iphlpapi pile.
+    //
+    //  * Liveness has two independent sources: mDNS presence (the record is
+    //    still inside its TTL) and a session heartbeat (ping every 10 s, three
+    //    missed answers close the session). "online" is the transport, "present"
+    //    is the network; a cell that stopped answering pings disappears even if
+    //    its last announcement is still cached.
     //
     //  * Identity: client_id = 16 random bytes from libsodium, 32 lowercase hex
     //    characters. It lives in `<exe dir>/.cell/links/identity.json` and is the
@@ -8543,6 +8618,7 @@ namespace cell
     //                                      the user's FlowLink workspace list
     //        links/transmission.json       index of every transfer received
     //        links/<client_id>/.key        the sealed long-term link key (trust)
+    //        links/<client_id>/workspaces.json  that peer's last published list
     //        links/<client_id>/<id>.jsonl  one file per received transfer
     //
     //    A link is trusted exactly while `.key` exists: "disconnect" removes it
@@ -8566,11 +8642,6 @@ namespace cell
     //    body is plaintext (HELLO / HELLO_ACK / CONFIRM); afterwards every frame is
     //    an AEAD blob (`{"t":"enc","n":...,"c":...}`) — "packet encryption only",
     //    no plaintext control channel to spoof.
-    //
-    //  * This was `flowlink.hpp` next to this file. It is part of the single
-    //    translation unit now: the core stays ONE file, so the protocol, the store
-    //    and the frontends that mount it can never drift apart at an include
-    //    boundary.
 
     namespace flowlink
     {
@@ -8584,26 +8655,24 @@ namespace cell
         using namespace std::string_view_literals;
 
         inline constexpr std::string_view kProto = "CELLFLNK";
-        inline constexpr int kVersion = 1;
-        inline constexpr std::uint16_t kDefaultPort = 47822;          // TCP transport
-        inline constexpr std::uint16_t kDefaultDiscoveryPort = 47821; // UDP discovery
-        // A host (especially Windows + WSL in mirrored mode, which share the port
-        // table) can only give the well-known port to one process. The next slots
-        // are probed on local addresses as well, so a second cell on the same
-        // machine is still found even when another app holds 47821.
-        inline constexpr int kRendezvousSlots = 4;
-        inline constexpr std::string_view kGroup = "239.255.42.71";   // multicast fallback
+        inline constexpr int kVersion = 2;
+        inline constexpr std::uint16_t kDefaultPort = 47822;   // TCP transport
+        inline constexpr std::uint16_t kDefaultMdnsPort = 5353; // DNS-SD
+        inline constexpr std::string_view kServiceType = "_cell._tcp.local";
+        inline constexpr std::string_view kGroup4 = "224.0.0.251";
+        inline constexpr std::string_view kGroup6 = "ff02::fb";
         inline constexpr std::size_t kMaxFrame = 16uz * 1024uz * 1024uz; // 16 MiB
-        inline constexpr std::size_t kMaxDatagram = 1024;
-        inline constexpr std::size_t kPairingBytes = 64;              // 512-bit code
+        inline constexpr std::size_t kMaxDatagram = 4096;
+        inline constexpr std::size_t kPairingBytes = 64; // 512-bit code
         inline constexpr std::size_t kKeyBytes = 32;
-        inline constexpr auto kAnnouncePeriod = 5s;   // discovery beacon period
-        inline constexpr auto kPeerTtl = 30s;         // discovered peer goes offline
-        inline constexpr auto kSessionIdle = 180s;    // idle TCP session is dropped
-        inline constexpr auto kSweepPeriod = 10s;     // session/discovery sweep
-        inline constexpr auto kPairSweepPeriod = 2s;  // pairing window expiry check
-        inline constexpr int kPairTtlSeconds = 300;   // default pairing window
-        inline constexpr int kPairMaxFails = 3;       // wrong codes before the window closes
+        inline constexpr std::uint32_t kMdnsTtl = 120;   // seconds
+        inline constexpr auto kHeartbeat = 10s;          // ping when idle this long
+        inline constexpr auto kHeartbeatTimeout = 31s;   // no frame for this long = dead
+        inline constexpr auto kSweepPeriod = 2s;         // expiry/heartbeat sweep
+        inline constexpr auto kQueryPeriod = 45s;        // browse refresh
+        inline constexpr auto kPairSweepPeriod = 2s;     // pairing window expiry check
+        inline constexpr int kPairTtlSeconds = 300;      // default pairing window
+        inline constexpr int kPairMaxFails = 3;          // wrong codes before the window closes
 
         // ---- JSON readers that never throw -------------------------------------
         // Everything arriving over the network goes through these: nlohmann's
@@ -8843,6 +8912,29 @@ namespace cell
             return out;
         }
 
+        // A DNS-SD instance label: printable, no dots (they would split the name),
+        // bounded. The client id suffix keeps two cells with the same display name
+        // apart — the label is what the browser keys on.
+        inline std::string instance_label(std::string_view name, std::string_view id8)
+        {
+            std::string out;
+            for (unsigned char c : name)
+            {
+                const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_';
+                out.push_back(ok ? (char)c : '-');
+                if (out.size() >= 32)
+                    break;
+            }
+            while (!out.empty() && out.back() == '-')
+                out.pop_back();
+            if (out.empty())
+                out = "cell";
+            out.push_back('-');
+            out.append(id8.substr(0, 8));
+            return out;
+        }
+
         // ---- what a peer shows about itself in the device list ------------------
         // Plain strings, no privacy surface beyond what the user already sees on
         // their own machine: the OS name, the IANA time zone and the UI language.
@@ -8864,8 +8956,6 @@ namespace cell
             if (const char *v = std::getenv("TZ"); v && *v)
                 return clean_name(v, 48);
     #ifndef _WIN32
-            // /etc/localtime is a symlink into zoneinfo on every mainstream distro;
-            // the tail after "zoneinfo/" is the IANA name the peer displays
             std::error_code ec;
             const auto p = std::filesystem::read_symlink("/etc/localtime", ec);
             if (!ec)
@@ -8891,206 +8981,486 @@ namespace cell
     #endif
         }
 
-        // ---- local IPv4 interfaces ----------------------------------------------
-        // Discovery needs the *directed broadcast* address of every subnet this
-        // host sits on, and a /24 guess is wrong the moment the mask is not /24 —
-        // which is exactly the case that matters: WSL2 hands its vEthernet a /20,
-        // Hyper-V switches a /20, and plenty of LANs run /16 or /18. With a /18,
-        // "100.2.22.255" is an ordinary host address, so the datagram is a unicast
-        // to nobody and discovery silently finds nothing.
+        // =========================================================================
+        //  dns — just enough of the DNS wire format for mDNS/DNS-SD.
         //
-        // Two more things only real enumeration can give us:
-        //  * adapters the hostname does not resolve to (vEthernet (WSL) is the
-        //    one that matters — the Windows side never announced into the WSL
-        //    subnet, so WSL and the host could never see each other);
-        //  * the default gateway. A gateway is a real host on the same segment,
-        //    and for WSL2 it *is* the Windows host: unicasting an announce there
-        //    is the one path that survives the NAT boundary.
-        struct iface_v4
+        //  Pure functions over byte strings: no socket, no allocation beyond the
+        //  message itself, no exceptions. The selftest covers encode/decode
+        //  round-trips and the compression pointers a real responder emits
+        //  (avahi compresses SRV targets and PTR chains aggressively — a decoder
+        //  that refuses pointers simply sees nothing on a network with a Mac).
+        // =========================================================================
+        namespace dns
         {
-            std::string name;   // adapter name, for logs and the UI
-            std::string addr;   // dotted quad
-            std::string bcast;  // addr | ~mask
-            std::string gw;     // first gateway, "" when there is none
-            unsigned prefix = 0;
-        };
+            inline constexpr std::uint16_t t_a = 1;
+            inline constexpr std::uint16_t t_ptr = 12;
+            inline constexpr std::uint16_t t_txt = 16;
+            inline constexpr std::uint16_t t_aaaa = 28;
+            inline constexpr std::uint16_t t_srv = 33;
+            inline constexpr std::uint16_t t_any = 255;
+            inline constexpr std::uint16_t c_in = 1;
 
-        inline std::string v4_text(std::uint32_t host_order)
-        {
-            return std::format("{}.{}.{}.{}", (host_order >> 24) & 0xffu, (host_order >> 16) & 0xffu,
-                               (host_order >> 8) & 0xffu, host_order & 0xffu);
-        }
+            inline constexpr std::uint16_t f_response = 0x8000;
+            inline constexpr std::uint16_t f_authoritative = 0x0400;
 
-        // One address a beacon or probe is sent to. `kind` drives both the send
-        // path (multicast goes out through the per-interface senders) and the
-        // management page's diagnostics, so "why does discovery see nothing" has
-        // an answer that names the mechanism instead of a bare IP list.
-        struct disc_target
-        {
-            std::string addr;
-            std::uint16_t port = 0;
-            std::string kind;  // broadcast | multicast | local | gateway | peer | extra
-            std::string label; // short human text for the UI
-        };
-
-        // loopback and link-local (169.254/16) subnets carry no peers
-        inline bool v4_ignored(std::uint32_t host_order)
-        {
-            const unsigned a = (host_order >> 24) & 0xffu;
-            return a == 0 || a == 127 || ((host_order >> 16) & 0xffffu) == 0xa9feu;
-        }
-
-        inline std::vector<iface_v4> local_ifaces_v4()
-        {
-            std::vector<iface_v4> out;
-    #ifdef _WIN32
-            ULONG size = 16u * 1024u;
-            std::vector<unsigned char> buf;
-            IP_ADAPTER_ADDRESSES *addrs = nullptr;
-            for (int attempt = 0; attempt < 3; ++attempt)
+            struct question
             {
-                buf.resize(size);
-                addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buf.data());
-                const ULONG rc = GetAdaptersAddresses(
-                    AF_INET,
-                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
-                        GAA_FLAG_INCLUDE_GATEWAYS,
-                    nullptr, addrs, &size);
-                if (rc == NO_ERROR)
+                std::string name;
+                std::uint16_t type = 0;
+                std::uint16_t cls = c_in;
+            };
+
+            // One resource record. Only the fields this protocol reads are decoded;
+            // `cls` keeps the cache-flush bit (0x8000) that DNS-SD sets on unique
+            // records, and `ttl == 0` is a goodbye.
+            struct rr
+            {
+                std::string name;
+                std::uint16_t type = 0;
+                std::uint16_t cls = c_in;
+                std::uint32_t ttl = 0;
+                std::string target;            // PTR / SRV / CNAME
+                std::uint16_t priority = 0;    // SRV
+                std::uint16_t weight = 0;      // SRV
+                std::uint16_t port = 0;        // SRV
+                std::vector<std::string> txt;  // TXT chunks
+                std::string addr;              // A / AAAA, numeric text
+            };
+
+            struct message
+            {
+                std::uint16_t id = 0;
+                std::uint16_t flags = 0;
+                std::vector<question> qs;
+                std::vector<rr> an; // answers + authorities + additionals, in order
+                bool is_response() const { return (flags & f_response) != 0; }
+            };
+
+            inline void put_u16(std::string &out, std::uint16_t v)
+            {
+                out.push_back((char)((v >> 8) & 0xff));
+                out.push_back((char)(v & 0xff));
+            }
+            inline void put_u32(std::string &out, std::uint32_t v)
+            {
+                put_u16(out, (std::uint16_t)(v >> 16));
+                put_u16(out, (std::uint16_t)(v & 0xffff));
+            }
+            inline std::uint16_t get_u16(std::string_view b, std::size_t at)
+            {
+                return (std::uint16_t)(((unsigned char)b[at] << 8) | (unsigned char)b[at + 1]);
+            }
+            inline std::uint32_t get_u32(std::string_view b, std::size_t at)
+            {
+                return ((std::uint32_t)(unsigned char)b[at] << 24) |
+                       ((std::uint32_t)(unsigned char)b[at + 1] << 16) |
+                       ((std::uint32_t)(unsigned char)b[at + 2] << 8) |
+                       (std::uint32_t)(unsigned char)b[at + 3];
+            }
+
+            // "a.b.local" -> 1'a'1'b'5'local'0; the root is a single zero byte.
+            inline bool put_name(std::string &out, std::string_view name)
+            {
+                while (!name.empty() && name.back() == '.')
+                    name.remove_suffix(1);
+                std::string enc;
+                if (!name.empty())
+                {
+                    std::size_t at = 0;
+                    while (at <= name.size())
+                    {
+                        const std::size_t dot = name.find('.', at);
+                        const std::size_t end = dot == std::string_view::npos ? name.size() : dot;
+                        const std::size_t len = end - at;
+                        if (len == 0 || len > 63)
+                            return false; // empty label / label too long
+                        enc.push_back((char)len);
+                        enc.append(name.substr(at, len));
+                        if (dot == std::string_view::npos)
+                            break;
+                        at = dot + 1;
+                    }
+                    // the 255-byte limit is per NAME, not per packet: checking the
+                    // caller's buffer rejected every record after the first few
+                    if (enc.size() > 255)
+                        return false;
+                }
+                enc.push_back('\0');
+                out += enc;
+                return true;
+            }
+
+            // Decode a possibly compressed name. `at` advances past the name (or
+            // past the first pointer). Pointers must point backwards and the jump
+            // chain is bounded, so a hostile packet cannot spin here.
+            inline bool read_name(std::string_view b, std::size_t &at, std::string &out)
+            {
+                out.clear();
+                std::size_t pos = at;
+                bool jumped = false;
+                int hops = 0;
+                for (;;)
+                {
+                    if (pos >= b.size())
+                        return false;
+                    const unsigned len = (unsigned char)b[pos];
+                    if (len == 0)
+                    {
+                        ++pos;
+                        break;
+                    }
+                    if ((len & 0xc0) == 0xc0)
+                    {
+                        if (pos + 1 >= b.size())
+                            return false;
+                        const std::size_t target = ((len & 0x3fu) << 8) | (unsigned char)b[pos + 1];
+                        if (!jumped)
+                            at = pos + 2;
+                        jumped = true;
+                        if (target >= pos || ++hops > 32)
+                            return false; // forward/looping pointer
+                        pos = target;
+                        continue;
+                    }
+                    if ((len & 0xc0) != 0 || len > 63 || pos + 1 + len > b.size())
+                        return false;
+                    if (!out.empty())
+                        out.push_back('.');
+                    out.append(b.substr(pos + 1, len));
+                    pos += 1 + len;
+                }
+                if (!jumped)
+                    at = pos;
+                return !out.empty();
+            }
+
+            inline std::string lower_ascii_copy(std::string s)
+            {
+                for (char &c : s)
+                    if (c >= 'A' && c <= 'Z')
+                        c = (char)(c - 'A' + 'a');
+                return s;
+            }
+
+            // case-insensitive name equality, ignoring the trailing dot
+            inline bool name_is(std::string_view a, std::string_view b)
+            {
+                while (!a.empty() && a.back() == '.')
+                    a.remove_suffix(1);
+                while (!b.empty() && b.back() == '.')
+                    b.remove_suffix(1);
+                if (a.size() != b.size())
+                    return false;
+                for (std::size_t i = 0; i < a.size(); i++)
+                {
+                    char x = a[i], y = b[i];
+                    if (x >= 'A' && x <= 'Z')
+                        x = (char)(x - 'A' + 'a');
+                    if (y >= 'A' && y <= 'Z')
+                        y = (char)(y - 'A' + 'a');
+                    if (x != y)
+                        return false;
+                }
+                return true;
+            }
+
+            // does `name` end with `suffix` (label-aligned, case-insensitive)?
+            inline bool name_ends_with(std::string_view name, std::string_view suffix)
+            {
+                while (!name.empty() && name.back() == '.')
+                    name.remove_suffix(1);
+                while (!suffix.empty() && suffix.back() == '.')
+                    suffix.remove_suffix(1);
+                if (suffix.size() > name.size())
+                    return false;
+                const std::string_view tail = name.substr(name.size() - suffix.size());
+                if (!name_is(tail, suffix))
+                    return false;
+                return name.size() == suffix.size() || name[name.size() - suffix.size() - 1] == '.';
+            }
+
+            inline bool put_rr(std::string &out, const rr &r)
+            {
+                if (!put_name(out, r.name))
+                    return false;
+                put_u16(out, r.type);
+                put_u16(out, r.cls);
+                put_u32(out, r.ttl);
+                std::string rd;
+                switch (r.type)
+                {
+                case t_ptr:
+                    if (!put_name(rd, r.target))
+                        return false;
                     break;
-                addrs = nullptr;
-                if (rc != ERROR_BUFFER_OVERFLOW)
-                    return out;
-            }
-            for (auto *a = addrs; a; a = a->Next)
-            {
-                if (a->OperStatus != IfOperStatusUp)
-                    continue;
-                std::string gw;
-                if (a->FirstGatewayAddress)
-                {
-                    const auto *sa = reinterpret_cast<const sockaddr_in *>(a->FirstGatewayAddress->Address.lpSockaddr);
-                    if (sa && sa->sin_family == AF_INET)
+                case t_srv:
+                    put_u16(rd, r.priority);
+                    put_u16(rd, r.weight);
+                    put_u16(rd, r.port);
+                    if (!put_name(rd, r.target))
+                        return false;
+                    break;
+                case t_txt:
+                    for (const auto &s : r.txt)
                     {
-                        const std::uint32_t g = ntohl(sa->sin_addr.s_addr);
-                        if (g != 0 && !v4_ignored(g))
-                            gw = v4_text(g);
+                        if (s.size() > 255)
+                            return false;
+                        rd.push_back((char)s.size());
+                        rd.append(s);
                     }
-                }
-                for (auto *u = a->FirstUnicastAddress; u; u = u->Next)
+                    if (rd.empty())
+                        rd.push_back('\0');
+                    break;
+                case t_a:
+                case t_aaaa:
                 {
-                    const auto *sa = reinterpret_cast<const sockaddr_in *>(u->Address.lpSockaddr);
-                    if (!sa || sa->sin_family != AF_INET)
-                        continue;
-                    const std::uint32_t ip = ntohl(sa->sin_addr.s_addr);
-                    if (v4_ignored(ip))
-                        continue;
-                    const unsigned prefix = std::min<unsigned>(u->OnLinkPrefixLength, 32u);
-                    const std::uint32_t mask = prefix == 0 ? 0u : 0xffffffffu << (32u - prefix);
-                    iface_v4 i;
-                    i.name = a->FriendlyName ? clean_name(plat::wide_to_utf8(std::wstring_view(a->FriendlyName)), 48)
-                                             : std::string{};
-                    i.addr = v4_text(ip);
-                    i.bcast = v4_text(ip | ~mask);
-                    i.gw = gw;
-                    i.prefix = prefix;
-                    out.push_back(std::move(i));
+                    boost::system::error_code ec;
+                    const auto a = asio::ip::make_address(r.addr, ec);
+                    if (ec || (r.type == t_a) != a.is_v4())
+                        return false;
+                    if (a.is_v4())
+                    {
+                        const auto bytes = a.to_v4().to_bytes();
+                        rd.append((const char *)bytes.data(), bytes.size());
+                    }
+                    else
+                    {
+                        const auto bytes = a.to_v6().to_bytes();
+                        rd.append((const char *)bytes.data(), bytes.size());
+                    }
+                    break;
                 }
+                default:
+                    return false;
+                }
+                if (rd.size() > 65535)
+                    return false;
+                put_u16(out, (std::uint16_t)rd.size());
+                out += rd;
+                return true;
             }
-    #else
-            ifaddrs *list = nullptr;
-            if (getifaddrs(&list) != 0)
+
+            inline bool parse(std::string_view b, message &out)
+            {
+                out = message{};
+                if (b.size() < 12)
+                    return false;
+                out.id = get_u16(b, 0);
+                out.flags = get_u16(b, 2);
+                const std::size_t qd = get_u16(b, 4);
+                const std::size_t total = (std::size_t)get_u16(b, 6) + get_u16(b, 8) + get_u16(b, 10);
+                std::size_t at = 12;
+                out.qs.reserve(std::min<std::size_t>(qd, 32));
+                for (std::size_t i = 0; i < qd; i++)
+                {
+                    question q;
+                    if (!read_name(b, at, q.name) || at + 4 > b.size())
+                        return false;
+                    q.type = get_u16(b, at);
+                    q.cls = get_u16(b, at + 2);
+                    at += 4;
+                    out.qs.push_back(std::move(q));
+                }
+                out.an.reserve(std::min<std::size_t>(total, 64));
+                for (std::size_t i = 0; i < total; i++)
+                {
+                    rr r;
+                    if (!read_name(b, at, r.name) || at + 10 > b.size())
+                        return false;
+                    r.type = get_u16(b, at);
+                    r.cls = get_u16(b, at + 2);
+                    r.ttl = get_u32(b, at + 4);
+                    const std::size_t rdlen = get_u16(b, at + 8);
+                    at += 10;
+                    if (at + rdlen > b.size())
+                        return false;
+                    const std::string_view rd = b.substr(at, rdlen);
+                    std::size_t pos = at; // decoder cursor for names inside rdata
+                    switch (r.type)
+                    {
+                    case t_ptr:
+                        if (!read_name(b, pos, r.target) || pos > at + rdlen)
+                            return false;
+                        break;
+                    case t_srv:
+                        if (rdlen < 7)
+                            return false;
+                        r.priority = get_u16(b, at);
+                        r.weight = get_u16(b, at + 2);
+                        r.port = get_u16(b, at + 4);
+                        pos = at + 6;
+                        if (!read_name(b, pos, r.target))
+                            return false;
+                        break;
+                    case t_txt:
+                    {
+                        std::size_t p = 0;
+                        while (p < rd.size())
+                        {
+                            const std::size_t len = (unsigned char)rd[p];
+                            ++p;
+                            if (p + len > rd.size())
+                                return false;
+                            r.txt.emplace_back(rd.substr(p, len));
+                            p += len;
+                        }
+                        break;
+                    }
+                    case t_a:
+                        if (rdlen != 4)
+                            return false;
+                        {
+                            asio::ip::address_v4::bytes_type bytes{};
+                            std::memcpy(bytes.data(), rd.data(), 4);
+                            r.addr = asio::ip::address_v4(bytes).to_string();
+                        }
+                        break;
+                    case t_aaaa:
+                        if (rdlen != 16)
+                            return false;
+                        {
+                            asio::ip::address_v6::bytes_type bytes{};
+                            std::memcpy(bytes.data(), rd.data(), 16);
+                            r.addr = asio::ip::address_v6(bytes).to_string();
+                        }
+                        break;
+                    default:
+                        break; // unknown rdata: keep the record, ignore the body
+                    }
+                    at += rdlen;
+                    out.an.push_back(std::move(r));
+                }
+                return true;
+            }
+
+            inline std::string query(std::uint16_t id, std::string_view name, std::uint16_t type)
+            {
+                std::string out;
+                put_u16(out, id);
+                put_u16(out, 0); // standard query
+                put_u16(out, 1); // qdcount
+                put_u16(out, 0);
+                put_u16(out, 0);
+                put_u16(out, 0);
+                if (!put_name(out, name))
+                    return {};
+                put_u16(out, type);
+                put_u16(out, c_in);
                 return out;
-            for (auto *ifa = list; ifa; ifa = ifa->ifa_next)
+            }
+
+            inline std::string response(std::uint16_t id, const std::vector<rr> &answers)
             {
-                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-                    continue;
-                if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
-                    continue;
-                const auto *sa = reinterpret_cast<const sockaddr_in *>(ifa->ifa_addr);
-                const std::uint32_t ip = ntohl(sa->sin_addr.s_addr);
-                if (v4_ignored(ip))
-                    continue;
-                std::uint32_t mask = 0xffffffffu;
-                unsigned prefix = 32;
-                if (ifa->ifa_netmask)
+                std::string out;
+                put_u16(out, id);
+                put_u16(out, (std::uint16_t)(f_response | f_authoritative));
+                put_u16(out, 0); // qdcount
+                put_u16(out, (std::uint16_t)answers.size());
+                put_u16(out, 0);
+                put_u16(out, 0);
+                for (const auto &r : answers)
+                    if (!put_rr(out, r))
+                        return {};
+                return out;
+            }
+        } // namespace dns
+
+        // =========================================================================
+        //  local addresses — through Boost.Asio only.
+        //
+        //  `ip::host_name()` + a passive UDP resolve returns every address the
+        //  host owns: all IPv4 NICs (LAN, VPN, the WSL/Hyper-V vEthernet) and the
+        //  IPv6 addresses, link-local ones carrying their scope id. That is the
+        //  same information GetAdaptersAddresses gave the old code, without
+        //  iphlpapi, winsock headers or extra import libraries — and it is the
+        //  shape std::net will expose.
+        // =========================================================================
+        struct local_addr
+        {
+            std::string addr; // numeric text, v6 link-local includes no %scope
+            bool v6 = false;
+            unsigned scope = 0;  // v6 interface index, 0 when global
+            bool loopback = false;
+        };
+
+        inline std::vector<local_addr> local_addresses()
+        {
+            std::vector<local_addr> out;
+            boost::system::error_code ec;
+            const std::string host = asio::ip::host_name(ec);
+            if (ec || host.empty())
+                return out;
+            udp::resolver res(asio::system_executor{});
+            boost::system::error_code rec;
+            const auto eps = res.resolve(host, "", udp::resolver::passive, rec);
+            if (rec)
+                return out;
+            auto add = [&out](const asio::ip::address &a)
+            {
+                local_addr la;
+                la.v6 = a.is_v6();
+                la.loopback = a.is_loopback();
+                if (la.v6)
                 {
-                    mask = ntohl(reinterpret_cast<const sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr);
-                    prefix = 0;
-                    for (std::uint32_t m = mask; m & 0x80000000u; m <<= 1)
-                        ++prefix;
+                    la.scope = a.to_v6().scope_id();
+                    la.addr = a.to_v6().to_string(); // "fe80::1%12" when scoped
                 }
-                iface_v4 i;
-                i.name = ifa->ifa_name ? clean_name(ifa->ifa_name, 48) : std::string{};
-                i.addr = v4_text(ip);
-                i.bcast = v4_text(ip | ~mask);
-                i.prefix = prefix;
-                out.push_back(std::move(i));
-            }
-            freeifaddrs(list);
-            // Default gateway per interface. On Linux this is /proc/net/route;
-            // under WSL2 it is the Windows host, which makes it the only address
-            // an announce can use to cross the NAT boundary.
-    #ifdef __linux__
-            if (std::ifstream rt("/proc/net/route"); rt)
-            {
-                std::string line;
-                std::getline(rt, line); // header
-                while (std::getline(rt, line))
-                {
-                    std::istringstream ss(line);
-                    std::string dev, dest, gw, flags;
-                    if (!(ss >> dev >> dest >> gw >> flags))
-                        continue;
-                    if (dest != "00000000")
-                        continue;
-                    std::uint32_t g = 0;
-                    try
-                    {
-                        g = (std::uint32_t)std::stoul(gw, nullptr, 16);
-                    }
-                    catch (...)
-                    {
-                        continue;
-                    }
-                    // /proc/net/route prints the address in host byte order of a
-                    // little-endian kernel, i.e. the dotted quad read backwards
-                    const std::uint32_t host = ((g & 0xffu) << 24) | ((g & 0xff00u) << 8) |
-                                               ((g >> 8) & 0xff00u) | ((g >> 24) & 0xffu);
-                    if (host == 0 || v4_ignored(host))
-                        continue;
-                    for (auto &i : out)
-                        if (i.name == clean_name(dev, 48) && i.gw.empty())
-                            i.gw = v4_text(host);
-                }
-            }
-    #endif
-    #endif
-            // The same address can show up on several adapters (Hyper-V, the
-            // mirrored WSL stack, a bonded interface). One entry per address is
-            // enough; keep the copy that knows a gateway.
-            std::map<std::string, iface_v4> by_addr;
-            for (auto &i : out)
-            {
-                auto it = by_addr.find(i.addr);
-                if (it == by_addr.end() || (it->second.gw.empty() && !i.gw.empty()))
-                    by_addr[i.addr] = std::move(i);
-            }
-            out.clear();
-            out.reserve(by_addr.size());
-            for (auto &[_, i] : by_addr)
-                out.push_back(std::move(i));
+                else
+                    la.addr = a.to_v4().to_string();
+                if (a.is_unspecified() || a.is_multicast())
+                    return;
+                if (!la.v6 && la.addr.rfind("169.254.", 0) == 0)
+                    return; // link-local v4 carries no peers we can name
+                for (const auto &e : out)
+                    if (e.addr == la.addr)
+                        return;
+                out.push_back(std::move(la));
+            };
+            for (const auto &ep : eps)
+                add(ep.endpoint().address());
+            // loopback last: it is a legitimate target for a second cell on the
+            // same host, but it must never win over a real interface
+            std::stable_partition(out.begin(), out.end(), [](const local_addr &a)
+                                  { return !a.loopback; });
             return out;
         }
 
-        // "10.0.0.5" / "10.0.0.5:47821" — the manual probe target a user types when
-        // broadcast cannot reach the peer (WSL2 NAT, client-isolated Wi-Fi).
-        inline bool parse_endpoint_v4(const std::string &raw, std::uint16_t default_port, udp::endpoint &out)
+        // "10.0.0.5" / "[fe80::1%12]:47822" / "fe80::1" / "1.2.3.4:5353"
+        inline bool parse_endpoint(const std::string &raw, std::uint16_t default_port, udp::endpoint &out)
         {
             std::string host = text::trim(raw);
             std::uint16_t port = default_port;
-            if (const auto at = host.find_last_of(':'); at != std::string::npos && host.find(':') == at)
+            if (host.empty())
+                return false;
+            if (host.front() == '[')
             {
+                const auto close = host.find(']');
+                if (close == std::string::npos)
+                    return false;
+                const std::string tail = host.substr(close + 1);
+                host = host.substr(1, close - 1);
+                if (!tail.empty())
+                {
+                    if (tail.front() != ':')
+                        return false;
+                    try
+                    {
+                        const long v = std::stol(tail.substr(1));
+                        if (v <= 0 || v > 65535)
+                            return false;
+                        port = (std::uint16_t)v;
+                    }
+                    catch (...)
+                    {
+                        return false;
+                    }
+                }
+            }
+            else if (const auto at = host.find_last_of(':'); at != std::string::npos &&
+                                                              host.find(':') == at)
+            {
+                // exactly one colon: "host:port". More than one is a bare IPv6
+                // literal, which has no port.
                 const std::string tail = host.substr(at + 1);
                 host = host.substr(0, at);
                 if (!tail.empty())
@@ -9112,7 +9482,7 @@ namespace cell
             if (host.empty())
                 return false;
             boost::system::error_code ec;
-            const auto a = asio::ip::make_address_v4(host, ec);
+            const auto a = asio::ip::make_address(host, ec);
             if (ec)
                 return false;
             out = udp::endpoint(a, port);
@@ -9274,9 +9644,7 @@ namespace cell
         }
 
         // Owner-only permissions for a secret file, portably: Windows has no mode
-        // bits, so the read-only attribute is the closest equivalent (the ACL side
-        // is cell::plat::restrict_file_permissions' job for the vault); POSIX gets
-        // 0600 regardless of the umask.
+        // bits, so the read-only attribute is the closest equivalent.
         inline void set_owner_only(const std::filesystem::path &p)
         {
     #ifdef _WIN32
@@ -9326,7 +9694,6 @@ namespace cell
                 out << b64_encode(master);
                 const bool ok = out.good();
                 out.close();
-                // owner-only from the moment it exists
                 set_owner_only(master_file(root));
                 return ok;
             }
@@ -9365,10 +9732,8 @@ namespace cell
                     ct.resize((std::size_t)clen);
                     // The document below reads sealed["n"]/sealed["c"] for both
                     // AEAD modes. This branch used to store "nonce"/"ct" instead,
-                    // so on any CPU with AES-NI (crypto_aead_aes256gcm_is_available)
-                    // the key file was written with nonce/ct = null and could never
-                    // be read back — the resume handshake then threw a JSON
-                    // type_error inside the io worker (silently killing the thread).
+                    // so on any CPU with AES-NI the key file was written with
+                    // nonce/ct = null and could never be read back.
                     sealed = json{{"n", b64_encode(nonce)}, {"c", b64_encode(ct)}};
                 }
                 else
@@ -9409,8 +9774,7 @@ namespace cell
                         return false;
                     // Never throw out of here: this runs inside the network
                     // handshake, and an exception used to escape into io.run() and
-                    // silently kill the worker thread. Old buggy AES-GCM key files
-                    // (nonce/ct written as null) must fail gracefully instead.
+                    // silently kill the worker thread.
                     auto sfield = [&doc](const char *k) -> std::string
                     {
                         const auto it = doc.find(k);
@@ -9462,17 +9826,6 @@ namespace cell
         };
 
         // ---- peer records and the on-disk store ---------------------------------
-        //  Everything FlowLink owns lives in `<exe dir>/.cell/links/`:
-        //
-        //      links/identity.json          this cell's client_id + display name
-        //      links/links.json             service settings, every paired link and
-        //                                   the user's FlowLink workspace list
-        //      links/transmission.json      index of every transfer received
-        //      links/<client_id>/.key       the sealed long-term link key (trust)
-        //      links/<client_id>/<id>.jsonl one file per received transfer
-        //
-        //  A link is trusted exactly while `.key` exists: disconnecting removes it
-        //  and keeps the received files, re-pairing writes a fresh one.
         struct peer_meta
         {
             std::string id;
@@ -9483,7 +9836,6 @@ namespace cell
             long long last_seen = 0;
             std::string via = "code"; // "code" = we showed the code, "entered" = we typed theirs
             bool paired = false;
-            // what the other cell told us about itself (discovery / handshake)
             std::string os;
             std::string tz;
             std::string lang;
@@ -9524,7 +9876,7 @@ namespace cell
             std::string subject;
             std::string note;
             std::string kind = "session"; // "session" | "archive" | "text"
-            std::string file;             // file name inside links/<from>/
+            std::string file;              // file name inside links/<from>/
             long long created = 0;
             long long bytes = 0;
             bool read = false;
@@ -9573,12 +9925,18 @@ namespace cell
             std::filesystem::path root; // the .cell directory
             mutable std::mutex mx;      // guards the JSON documents on disk
 
+            explicit store(std::filesystem::path r) : root(std::move(r)) {}
+
             std::filesystem::path links() const { return root / "links"; }
             std::filesystem::path link_dir(const std::string &id) const { return links() / id; }
             std::filesystem::path key_file(const std::string &id) const { return link_dir(id) / ".key"; }
             std::filesystem::path identity_file() const { return links() / "identity.json"; }
             std::filesystem::path links_file() const { return links() / "links.json"; }
             std::filesystem::path transmission_file() const { return links() / "transmission.json"; }
+            std::filesystem::path peer_ws_file(const std::string &id) const
+            {
+                return link_dir(id) / "workspaces.json";
+            }
 
             // ---- raw document helpers -----------------------------------------
             static json read_doc(const std::filesystem::path &file)
@@ -9646,11 +10004,11 @@ namespace cell
                 json doc = read_doc(links_file());
                 if (!doc.contains("version"))
                 {
-                    doc["version"] = 2;
+                    doc["version"] = 3;
                     doc["enabled"] = false;
                     doc["name"] = "";
                     doc["port"] = kDefaultPort;
-                    doc["discovery"] = kDefaultDiscoveryPort;
+                    doc["discovery"] = kDefaultMdnsPort;
                     doc["announce"] = true;
                     doc["accept"] = false;
                     doc["workspace"] = "";
@@ -9693,10 +10051,15 @@ namespace cell
                     for (const auto &e : doc["extra_targets"])
                         if (e.is_string() && !e.get_ref<const std::string &>().empty())
                             extras.push_back(e);
+                // pre-mDNS builds stored the private beacon port (47821). The
+                // setting is the DNS-SD port now; keep old files working.
+                int disc = (int)jint(doc, "discovery", kDefaultMdnsPort);
+                if (disc == 47821 || disc <= 0)
+                    disc = kDefaultMdnsPort;
                 return {{"enabled", jbool(doc, "enabled")},
                         {"name", jstr(doc, "name")},
                         {"port", (int)jint(doc, "port", kDefaultPort)},
-                        {"discovery", (int)jint(doc, "discovery", kDefaultDiscoveryPort)},
+                        {"discovery", disc},
                         {"announce", jbool(doc, "announce", true)},
                         {"accept", jbool(doc, "accept", false)},
                         {"workspace", jstr(doc, "workspace")},
@@ -9851,6 +10214,24 @@ namespace cell
                 return !ec;
             }
 
+            // ---- the peer's published workspace list ---------------------------
+            [[nodiscard]] bool save_peer_workspaces(const std::string &id, const json &list, long long at)
+            {
+                if (!is_hex_id(id, 32) || !list.is_array())
+                    return false;
+                return write_doc(peer_ws_file(id), json{{"updated", at}, {"workspaces", list}});
+            }
+            json load_peer_workspaces(const std::string &id, long long *updated = nullptr)
+            {
+                if (!is_hex_id(id, 32))
+                    return json::array();
+                const json doc = read_doc(peer_ws_file(id));
+                if (updated)
+                    *updated = jint(doc, "updated", 0);
+                return doc.contains("workspaces") && doc["workspaces"].is_array() ? doc["workspaces"]
+                                                                                  : json::array();
+            }
+
             // ---- transmissions -------------------------------------------------
             // one JSONL file per transfer under links/<sender>/; the index in
             // links/transmission.json is what the UI lists
@@ -9903,34 +10284,41 @@ namespace cell
                     }
                     doc["links"] = arr;
                     return true; });
+                (void)update_index([&](json &items)
+                                   {
+                    items.push_back(transmission_to_json(rec));
+                    return true; });
+                return rec.id;
+            }
+
+            [[nodiscard]] bool update_index(const std::function<bool(json &)> &fn)
+            {
                 std::lock_guard<std::mutex> lk(mx);
                 json index = read_doc(transmission_file());
                 if (!index.contains("items") || !index["items"].is_array())
                     index["items"] = json::array();
-                index["version"] = 1;
-                index["items"].insert(index["items"].begin(), transmission_to_json(rec));
-                write_doc(transmission_file(), index);
-                return rec.id;
+                if (!fn(index["items"]))
+                    return false;
+                return write_doc(transmission_file(), index);
             }
+
             std::vector<transmission> list_transmissions()
             {
-                json index;
-                {
-                    std::lock_guard<std::mutex> lk(mx);
-                    index = read_doc(transmission_file());
-                }
-                auto out = index.value("items", json::array())
+                const json index = read_doc(transmission_file());
+                if (!index.contains("items") || !index["items"].is_array())
+                    return {};
+                auto out = index["items"]
                            | std::views::transform([](const json &e) { return transmission_from_json(e); })
-                           | std::views::filter([](const transmission &t) { return !t.id.empty(); })
                            | std::ranges::to<std::vector>();
-                std::ranges::sort(out, std::greater{}, &transmission::created);
+                std::ranges::sort(out, {}, &transmission::created);
+                std::ranges::reverse(out);
                 return out;
             }
+
             bool read_transmission_messages(const transmission &t, json &out)
             {
                 out = json::array();
-                if (!is_hex_id(t.from, 32) || t.file.empty() ||
-                    t.file.find('/') != std::string::npos || t.file.find("..") != std::string::npos)
+                if (!is_hex_id(t.from, 32) || t.file.empty())
                     return false;
                 std::ifstream f(link_dir(t.from) / t.file, std::ios::binary);
                 if (!f)
@@ -9940,54 +10328,53 @@ namespace cell
                 {
                     if (line.empty())
                         continue;
-                    json j = json::parse(line, nullptr, false);
-                    if (!j.is_object())
-                        continue;
-                    out.push_back(j);
+                    auto j = json::parse(line, nullptr, false);
+                    if (j.is_object())
+                        out.push_back(std::move(j));
                 }
                 return true;
             }
+
             [[nodiscard]] bool mark_transmission(const std::string &id, bool read)
             {
-                std::lock_guard<std::mutex> lk(mx);
-                json index = read_doc(transmission_file());
-                bool found = false;
-                for (auto &e : index["items"])
-                    if (jstr(e, "id") == id)
-                    {
-                        e["read"] = read;
-                        found = true;
-                    }
-                if (!found)
-                    return false;
-                return write_doc(transmission_file(), index);
+                return update_index([&](json &items)
+                                    {
+                    for (auto &e : items)
+                        if (jstr(e, "id") == id)
+                        {
+                            e["read"] = read;
+                            return true;
+                        }
+                    return false; });
             }
-            [[nodiscard]] bool drop_transmission(const std::string &id)
+
+            bool drop_transmission(const std::string &id)
             {
-                transmission gone;
-                {
-                    std::lock_guard<std::mutex> lk(mx);
-                    json index = read_doc(transmission_file());
+                std::string from, file;
+                const bool dropped = update_index([&](json &items)
+                                                  {
                     json arr = json::array();
-                    for (const auto &e : index["items"])
+                    for (const auto &e : items)
                     {
                         if (jstr(e, "id") == id)
-                            gone = transmission_from_json(e);
-                        else
-                            arr.push_back(e);
+                        {
+                            from = jstr(e, "from");
+                            file = jstr(e, "file");
+                            continue;
+                        }
+                        arr.push_back(e);
                     }
-                    if (gone.id.empty())
-                        return false;
-                    index["items"] = arr;
-                    write_doc(transmission_file(), index);
-                }
-                if (is_hex_id(gone.from, 32) && !gone.file.empty())
+                    const bool changed = arr.size() != items.size();
+                    items = arr;
+                    return changed; });
+                if (dropped && is_hex_id(from, 32) && !file.empty())
                 {
                     std::error_code ec;
-                    std::filesystem::remove(link_dir(gone.from) / gone.file, ec);
+                    std::filesystem::remove(link_dir(from) / file, ec);
                 }
-                return true;
+                return dropped;
             }
+
             void drop_transmissions_from(const std::string &cell)
             {
                 std::lock_guard<std::mutex> lk(mx);
@@ -10095,9 +10482,11 @@ namespace cell
         // =========================================================================
         //  service — the whole FlowLink stack behind one object. Constructing it
         //  allocates nothing but the impl; start() binds sockets and spawns the
-        //  worker threads; stop() joins them. A disabled FlowLink is a null
-        //  unique_ptr in app_core: no memory, no threads, no sockets.
+        //  worker threads; stop() joins them.
         // =========================================================================
+        // a chunk of console output, routed to whichever peer asked for it
+        using output_fn = std::function<void(std::string_view)>;
+
         struct impl : std::enable_shared_from_this<impl>
         {
             struct options
@@ -10105,17 +10494,19 @@ namespace cell
                 std::filesystem::path root;
                 std::string name;
                 std::uint16_t port = kDefaultPort;
-                std::uint16_t discovery_port = kDefaultDiscoveryPort;
-                bool announce = true;
+                std::uint16_t mdns_port = kDefaultMdnsPort;
+                bool announce = true; // start with discovery on
                 bool accept_remote = false;
                 // user-configured extra discovery targets ("ip[:port]"): the way
-                // through a NAT/VPN/firewall that also blocks our probe targets
+                // through a NAT/VPN/firewall that also blocks multicast
                 std::vector<std::string> extra_targets;
                 std::function<void(const json &)> on_event;
                 std::function<void(const std::string &, const std::string &)> on_log;
-                // methods this module does not implement itself (fs.*, tw.*): the
-                // shell answers them, because only it knows the workspaces
+                // methods this module does not implement itself (fs.*, tw.*, ws.*):
+                // the shell answers them, because only it knows the workspaces
                 std::function<json(const std::string &, const json &, std::string &)> on_call;
+                // the remote console: run one console line, streaming its output
+                std::function<bool(const std::string &, const output_fn &, std::string &)> on_cli;
             };
 
             // ---- connection ---------------------------------------------------
@@ -10155,9 +10546,10 @@ namespace cell
                 std::string peer_id, peer_name;
                 std::string peer_os, peer_tz, peer_lang;
                 std::uint16_t peer_port = 0; // the port the peer LISTENS on (its source port is ephemeral)
+                std::string peer_addr;       // remote address of this connection
                 std::string my_eph_pub, my_eph_sec;
                 std::string peer_eph_pub;
-                std::string psk;        // pairing code PSK or link key
+                std::string psk;          // pairing code PSK or link key
                 bool pair_mode = false;
                 std::string pairing_code; // client side: the code we typed
                 std::string link_key;     // pair mode, initiator side: key we hand over
@@ -10166,7 +10558,6 @@ namespace cell
 
                 // frame IO
                 std::array<unsigned char, 4> hdr{};
-                std::string body;
                 std::deque<std::string> wq;
                 bool writing = false;
                 std::atomic<bool> closed{false};
@@ -10182,7 +10573,10 @@ namespace cell
                 std::condition_variable wcv;
                 int state = 0; // 0 connecting/handshaking, 1 ready, -1 failed
                 std::string fail_reason;
-                long long last_rx = 0;
+                // liveness: every frame refreshes last_rx; the sweep pings an idle
+                // session and closes one that has been silent for too long
+                std::atomic<long long> last_rx{0};
+                std::atomic<long long> last_ping{0};
 
                 explicit conn(std::shared_ptr<impl> s, tcp::socket sock_)
                     : svc(std::move(s)), sock(std::move(sock_)), strand(asio::make_strand(svc->io)) {}
@@ -10195,7 +10589,6 @@ namespace cell
                 void on_hello(const json &j);
                 void on_hello_ack(const json &j);
                 void on_confirm(const json &j);
-                void on_enc(const json &j);
                 void handshake_done();
                 void fail(const std::string &why);
 
@@ -10214,81 +10607,62 @@ namespace cell
             store st;
             std::string client_id;
             std::string name;
+            std::string instance;  // DNS-SD instance label
+            std::string host_name; // cell-<id8>.local
 
             asio::io_context io;
             std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work;
             std::vector<std::jthread> threads;
             std::unique_ptr<tcp::acceptor> acceptor;
-            // Discovery sockets, deliberately split:
-            //
-            //  * beacon_sock is bound to an OS-assigned (random) port. Every
-            //    announce/probe is SENT from it and every unicast reply arrives
-            //    here, so the source port of our datagrams is our receive port.
-            //    This socket can never collide with anything: two cells on one
-            //    machine (or Windows + WSL under mirrored networking, which shares
-            //    the port space) each get their own.
-            //  * rendezvous_sock is the optional well-known listener (default UDP
-            //    47821). Only one process on a host/port-space can hold it; that
-            //    is fine, because peers reach us by replying to our beacon. If it
-            //    cannot be bound the service keeps running in "probe-only" mode
-            //    instead of switching discovery off.
-            std::unique_ptr<udp::socket> beacon_sock;
-            std::unique_ptr<udp::socket> rendezvous_sock;
-            // one outbound socket per interface so multicast leaves the right NIC
-            // (IP_MULTICAST_IF is per socket, not per datagram)
-            std::vector<std::unique_ptr<udp::socket>> mcast_senders;
-            std::string mcast_sender_key;
-            asio::steady_timer announce_timer{io};
+
+            // ---- discovery (mDNS) ----------------------------------------------
+            // One socket per family, both bound to the DNS-SD port. Every
+            // announcement is also sent through a per-interface sender so a
+            // multi-homed host reaches every subnet it sits on; joins use the
+            // addresses asio reports, never a system interface table.
+            // The discovery sockets are touched from io handlers (send) and from
+            // the caller's thread (stop / discovery switch): one lock keeps a
+            // send from walking a vector that close_discovery just cleared.
+            mutable std::mutex mdns_mx;
+            std::unique_ptr<udp::socket> mdns4;
+            std::unique_ptr<udp::socket> mdns6;
+            std::vector<std::unique_ptr<udp::socket>> mdns_tx4;
+            std::vector<std::unique_ptr<udp::socket>> mdns_tx6;
+            std::string mdns_tx_key;
+            std::vector<local_addr> locals;
+            long long locals_at = 0;
+            asio::steady_timer mdns_timer{io};   // periodic re-announce
+            asio::steady_timer query_timer{io};  // periodic browse query
+            asio::steady_timer burst_timer{io};  // initial announce/query burst
             asio::steady_timer sweep_timer{io};
             asio::steady_timer pair_timer{io};
-            udp::endpoint group_endpoint;
-            // every address a beacon goes to, with the mechanism it exercises;
-            // rebuilt before every announce (see build_announce_targets)
-            std::vector<disc_target> announce_targets;
-            // what the last build saw, for the management page's "本机地址"
-            std::vector<iface_v4> local_ifaces;
-            long long ifaces_at = 0; // last local_ifaces_v4() pass
-            std::uint16_t rx_port = 0;         // beacon_sock's port (random)
-            std::uint16_t rendezvous_port = 0; // actual bound discovery port, 0 = none
-            std::string rendezvous_error;      // why the well-known port is not ours
-            // datagrams that made it through the firewall, for the same page
-            unsigned long long rx_announce = 0;
-            unsigned long long rx_probe = 0;
-            std::atomic<unsigned long long> tx_sent{0};
-            std::atomic<unsigned long long> tx_errors{0};
-            std::string rx_last_from;
+            int burst_left = 0;
+            int burst_kind = 0; // 1 = announce, 2 = query
+            std::uint32_t seq = 0;
+            std::uint16_t mdns_bound4 = 0;
+            std::uint16_t mdns_bound6 = 0;
+            std::string mdns_error;
+            std::atomic<bool> discovery_on{false};
+            std::atomic<unsigned long long> rx_query{0}, rx_response{0}, tx_query{0}, tx_response{0};
+            std::atomic<unsigned long long> answered{0}; // responses sent from on_query
+            std::string last_mdns_from;
             long long started_at = 0;
             std::atomic<bool> alive{false};
             std::uint16_t bound_port = 0;
 
-            mutable std::mutex mx; // guards peers / sessions / pairing / handlers
-            struct peer_state
+            mutable std::mutex mx; // guards presence / sessions / pairing / handlers
+            struct presence
             {
-                std::string id, name;
-                std::string addr;      // most recent source address
-                std::uint16_t port = 0; // TCP transport port the peer listens on
-                std::uint16_t rx_port = 0;   // the peer's beacon/receive UDP port
-                std::uint16_t disc_port = 0; // peer's bound rendezvous port, 0 = none
-                long long last_seen = 0;
-                // last time we answered this peer with a unicast announce: a
-                // multi-homed peer arrives with a different source address on each
-                // interface, so without a cooldown two peers would bounce replies
-                // off each other forever
-                long long last_reflect = 0;
-                // timestamps of the last beacon/probe applied, so the copies that
-                // arrive on every interface are not processed (or counted) again
-                long long last_ann_ts = 0;
-                long long last_probe_ts = 0;
-                long long last_seq = 0;
-                bool pairing_open = false;
-                // every source endpoint this peer has been seen at, newest first:
-                // a multi-homed peer (LAN + VPN, mirrored WSL) may only be
-                // reachable through one of them for TCP
-                std::vector<std::pair<std::string, std::uint16_t>> endpoints;
-                // what the announce carried: shown in "Scan Links" before pairing
+                std::string id, name, host, instance;
+                std::vector<std::string> addrs;
+                std::uint16_t port = 0;
                 std::string os, tz, lang;
+                bool accept = false;
+                bool pairing_open = false;
+                long long seen = 0;
+                long long expires = 0;
             };
-            std::map<std::string, peer_state> discovered;
+            std::map<std::string, presence> present; // client_id -> last mDNS records
             std::map<std::string, std::shared_ptr<conn>> sessions;
             // A flat (contiguous) map is the right shape here: a handful of methods,
             // looked up on every inbound RPC frame, never erased. Values are shared
@@ -10298,13 +10672,16 @@ namespace cell
             struct pairing_state
             {
                 bool open = false;
-                std::string code;     // normalized (no separators)
-                std::string display;  // grouped, for the UI
+                std::string code;    // normalized (no separators)
+                std::string display; // grouped, for the UI
                 long long expires = 0;
                 int fails = 0;
                 std::string state = "idle"; // idle | waiting | paired | failed
                 std::string peer;           // client_id once paired
             } pairing;
+            // what this cell publishes to its peers (a remote workspace picker):
+            // pushed on every change, so the peer never has to poll
+            json my_workspaces = json::array();
 
             explicit impl(options o) : opt(std::move(o)), st{opt.root} {}
             ~impl() { stop(); }
@@ -10329,18 +10706,28 @@ namespace cell
             }
 
             // ---- discovery ----------------------------------------------------
-            void build_announce_targets();
-            void rebuild_mcast_senders(const std::vector<iface_v4> &ifaces);
-            void refresh_ifaces();
-            std::vector<disc_target> targets_snapshot();
-            void announce_loop();
-            void announce_once(bool probe_reply, const udp::endpoint *to);
-            void probe_now(const udp::endpoint *to = nullptr);
-            json beacon_json(const char *type);
-            void beacon_send_all(const json &p);                        // io thread only
-            void beacon_send_one(const json &p, const udp::endpoint &to); // io thread only
-            void start_receive(udp::socket &sock);
-            void on_datagram(const std::string &text, const udp::endpoint &from);
+            void refresh_locals(bool force = false);
+            void rebuild_tx();
+            void open_discovery(std::string &err);
+            void close_discovery();
+            bool set_discovery(bool on, std::string &err);
+            void mdns_read(udp::socket &sock, bool v6);
+            void on_mdns(const std::string &text, const udp::endpoint &from);
+            bool on_query(const dns::message &m, const udp::endpoint &from);
+            bool on_response(const dns::message &m, const udp::endpoint &from);
+            std::vector<dns::rr> my_records(std::uint32_t ttl);
+            void announce(int times);
+            void discovery_query(int times);
+            void send_multicast(const std::string &text);
+            void send_browse(const std::string &text);
+            void send_unicast(const std::string &text, const udp::endpoint &to);
+            void burst_loop();
+            void mdns_loop();
+            void query_loop();
+            void sweep_loop();
+            void pair_expire_loop();
+            json discovery_json();
+            json presence_json();
 
             // ---- inbound connections -----------------------------------------
             void accept_loop();
@@ -10350,12 +10737,14 @@ namespace cell
             std::shared_ptr<conn> session_for(const std::string &peer, int timeout_ms, std::string &err);
             void register_session(const std::shared_ptr<conn> &c);
             void drop_session(const std::string &peer, const std::shared_ptr<conn> &c);
-            void sweep_loop();
-            void pair_expire_loop();
+            void send_workspaces(const std::shared_ptr<conn> &c);
+            void publish_workspaces(const json &list);
+            bool notify(const std::string &peer, const std::string &method, const json &params);
 
             // ---- handlers -----------------------------------------------------
             json dispatch(const std::string &method, const json &params, std::string &err);
             json deliver_transmission(const json &params, std::string &err);
+            json remote_console(const json &params, std::string &err);
 
             // ---- views --------------------------------------------------------
             json status();
@@ -10370,7 +10759,11 @@ namespace cell
         {
             auto self = shared_from_this();
             sock.set_option(tcp::no_delay(true));
-            last_rx = (long long)std::time(nullptr);
+            last_rx.store((long long)std::time(nullptr));
+            boost::system::error_code ec;
+            const auto remote = sock.remote_endpoint(ec);
+            if (!ec)
+                peer_addr = remote.address().to_string();
             read_header();
         }
 
@@ -10378,7 +10771,11 @@ namespace cell
         {
             auto self = shared_from_this();
             sock.set_option(tcp::no_delay(true));
-            last_rx = (long long)std::time(nullptr);
+            last_rx.store((long long)std::time(nullptr));
+            boost::system::error_code rec;
+            const auto remote = sock.remote_endpoint(rec);
+            if (!rec)
+                peer_addr = remote.address().to_string();
             pair_mode = (mode == "pair");
             pairing_code = code;
             x25519_pair k = x25519_new();
@@ -10422,7 +10819,7 @@ namespace cell
                                                  {
                     if (ec)
                     {
-                        self->svc->log("warn", std::format("read_header failed on {}: {}",
+                        self->svc->log("info", std::format("read_header failed on {}: {}",
                                                           self->peer_id.empty() ? std::string("(handshake)")
                                                                                 : self->peer_id.substr(0, 8),
                                                           ec.message()));
@@ -10443,14 +10840,14 @@ namespace cell
                                                  {
                     if (ec)
                     {
-                        self->svc->log("warn", std::format("read_body failed on {}: {}",
+                        self->svc->log("info", std::format("read_body failed on {}: {}",
                                                           self->peer_id.empty() ? std::string("(handshake)")
                                                                                 : self->peer_id.substr(0, 8),
                                                           ec.message()));
                         self->close("read failed");
                         return;
                     }
-                    self->last_rx = (long long)std::time(nullptr);
+                    self->last_rx.store((long long)std::time(nullptr));
                     // Defence in depth: a malformed/forged frame must close this
                     // one connection, never escape into io.run() and kill the
                     // worker thread (that also silently dropped unrelated peers).
@@ -10593,7 +10990,7 @@ namespace cell
                                                   const std::string &mode,
                                                   std::uint16_t a_port, std::uint16_t b_port)
         {
-            return sha256("fl1|" + a_id + "|" + b_id + "|" + a_eph + "|" + b_eph + "|" + mode +
+            return sha256("fl2|" + a_id + "|" + b_id + "|" + a_eph + "|" + b_eph + "|" + mode +
                           "|" + std::to_string(a_port) + "|" + std::to_string(b_port));
         }
 
@@ -10679,8 +11076,7 @@ namespace cell
             // Do NOT send our CONFIRM yet. The responder sends it only after the
             // initiator's CONFIRM has been verified (see on_confirm): that makes
             // the initiator's "handshake done" mean "the responder has validated me
-            // and, when pairing, persisted the link key" — otherwise a pairing
-            // check on the responder's disk raced the initiator's success return.
+            // and, when pairing, persisted the link key".
             hello_sent = true;
             (void)link;
         }
@@ -10773,8 +11169,6 @@ namespace cell
                 if (!rec)
                 {
                     m.addr = remote.address().to_string();
-                    // the LISTENING port, not the ephemeral source port of this
-                    // connection: the peer must be reachable in the other direction
                     m.port = peer_port ? peer_port : remote.port();
                 }
                 m.paired_at = (long long)std::time(nullptr);
@@ -10808,8 +11202,6 @@ namespace cell
                 if (!rec)
                 {
                     m.addr = remote.address().to_string();
-                    // the LISTENING port, not the ephemeral source port of this
-                    // connection: the peer must be reachable in the other direction
                     m.port = peer_port ? peer_port : remote.port();
                 }
                 m.paired_at = (long long)std::time(nullptr);
@@ -10819,8 +11211,7 @@ namespace cell
                 m.os = peer_os;
                 m.tz = peer_tz;
                 m.lang = peer_lang;
-                (void)svc->st.save_meta(m); // the link key is already stored;
-                                            // the record is a convenience
+                (void)svc->st.save_meta(m);
                 svc->log("info", std::format("paired with {} ({})", m.name, peer_id));
                 svc->emit({{"type", "paired"}, {"client_id", peer_id}, {"name", m.name}});
             }
@@ -10842,14 +11233,13 @@ namespace cell
             if (ready)
                 return;
             ready = true;
+            last_rx.store((long long)std::time(nullptr));
             // refresh the peer's last-known address so a reconnect needs no discovery
             if (auto m = svc->st.load_meta(peer_id))
             {
-                boost::system::error_code ec;
-                const tcp::endpoint remote = sock.remote_endpoint(ec);
-                if (!ec)
-                    m->addr = remote.address().to_string();
-                m->port = peer_port ? peer_port : remote.port();
+                if (!peer_addr.empty())
+                    m->addr = peer_addr;
+                m->port = peer_port ? peer_port : m->port;
                 m->last_seen = (long long)std::time(nullptr);
                 m->paired = true;
                 if (!peer_os.empty())
@@ -10868,6 +11258,7 @@ namespace cell
             send_encrypted(json{{"t", "hello"}, {"name", svc->name}, {"client_id", svc->client_id},
                                 {"port", svc->bound_port},
                                 {"accept_remote", svc->opt.accept_remote}});
+            svc->send_workspaces(shared_from_this());
         }
 
         inline void impl::conn::on_frame(const std::string &text)
@@ -10926,8 +11317,9 @@ namespace cell
                     if (params.is_object())
                         params["_from"] = peer_id;
                     auto self = shared_from_this();
-                    // handlers may block for minutes (a remote teamwork run): run
-                    // them off the io thread, answer back on the strand
+                    // handlers may block for minutes (a remote teamwork run or a
+                    // console line): run them off the io thread, answer back on
+                    // the strand
                     std::thread([self, id, method, params]
                                 {
                         std::string err;
@@ -10961,8 +11353,17 @@ namespace cell
                 }
                 if (pt == "evt")
                 {
+                    const std::string method = jstr(p, "m");
+                    json evt_params = p.contains("p") ? p["p"] : json{};
+                    // A peer pushes its open-workspace list on every change; keep
+                    // it on disk so the picker renders instantly (and while the
+                    // peer is offline) instead of waiting for a round trip.
+                    if (method == "ws.state" && evt_params.is_object() &&
+                        evt_params.contains("workspaces") && evt_params["workspaces"].is_array())
+                        (void)svc->st.save_peer_workspaces(peer_id, evt_params["workspaces"],
+                                                          (long long)std::time(nullptr));
                     json ev{{"type", "peer_event"}, {"client_id", peer_id},
-                            {"method", jstr(p, "m")}, {"params", p.contains("p") ? p["p"] : json{}}};
+                            {"method", method}, {"params", std::move(evt_params)}};
                     svc->emit(ev);
                     return;
                 }
@@ -11012,6 +11413,21 @@ namespace cell
         // -------------------------------------------------------------------------
         //  impl — lifecycle
         // -------------------------------------------------------------------------
+        // v4-mapped v6 addresses ("::ffff:192.168.1.5") are what a dual-stack
+        // listener reports for an IPv4 client; showing and reconnecting with the
+        // plain form is what a human and a stored record expect.
+        inline std::string addr_text(const asio::ip::address &a)
+        {
+            if (a.is_v6() && a.to_v6().is_v4_mapped())
+            {
+                const auto bytes = a.to_v6().to_bytes(); // 16 bytes, v4 in the tail
+                asio::ip::address_v4::bytes_type tail{};
+                std::memcpy(tail.data(), bytes.data() + 12, 4);
+                return asio::ip::address_v4(tail).to_string();
+            }
+            return a.to_string();
+        }
+
         inline bool impl::start(std::string &err)
         {
             if (alive.load())
@@ -11032,61 +11448,69 @@ namespace cell
                 err = "identity file is corrupt (client_id)";
                 return false;
             }
+            instance = instance_label(name, client_id);
+            host_name = "cell-" + client_id.substr(0, 8) + ".local";
             std::error_code fec;
             std::filesystem::create_directories(st.links(), fec);
             boost::system::error_code ec;
 
-            // ---- inbound TCP ------------------------------------------------
-            // Preferred port first; when it is taken (a second cell on the same
-            // machine, Windows + WSL under mirrored networking sharing the port
-            // table, another app) fall back to an OS-assigned port and advertise
-            // THAT port in the beacon. Peers learn the real port from discovery,
-            // so a random transport port is not a problem — failing to start is.
-            auto bind_transport = [&](std::uint16_t preferred) -> bool
+            // ---- inbound TCP ---------------------------------------------------
+            // Dual stack: one v6 listener accepts both families (Windows and
+            // every mainstream POSIX default to v6_only=false). A host without
+            // IPv6 falls back to a v4 listener, and a busy preferred port falls
+            // back to an OS-assigned one — peers learn the real port from the SRV
+            // record, so a random transport port is not a problem.
+            auto open_listener = [&](std::uint16_t preferred, bool v6) -> bool
             {
-                acceptor = std::make_unique<tcp::acceptor>(io);
-                acceptor->open(tcp::v4(), ec);
+                auto acc = std::make_unique<tcp::acceptor>(io);
+                acc->open(v6 ? tcp::v6() : tcp::v4(), ec);
                 if (ec)
                 {
-                    err = "could not open the transport socket: " + ec.message();
+                    err = std::format("could not open the transport socket: {}", ec.message());
                     return false;
                 }
+                if (v6)
+                {
+                    boost::system::error_code oec;
+                    acc->set_option(asio::ip::v6_only(false), oec); // best effort
+                }
     #ifndef _WIN32
-                // SO_REUSEADDR on a Windows TCP listener lets another process bind
-                // the same port and take the connections over — exactly the wrong
-                // property for a service that carries keys. POSIX needs it only to
-                // survive TIME_WAIT after a restart.
-                acceptor->set_option(tcp::acceptor::reuse_address(true), ec);
+                boost::system::error_code rec;
+                acc->set_option(tcp::acceptor::reuse_address(true), rec);
     #endif
-                acceptor->bind(tcp::endpoint(tcp::v4(), preferred), ec);
+                acc->bind(tcp::endpoint(v6 ? tcp::v6() : tcp::v4(), preferred), ec);
                 if (ec)
                 {
                     err = std::format("could not bind TCP port {}: {}", preferred, ec.message());
-                    acceptor.reset();
                     return false;
                 }
-                acceptor->listen(asio::socket_base::max_listen_connections, ec);
+                acc->listen(asio::socket_base::max_listen_connections, ec);
                 if (ec)
                 {
                     err = "could not listen: " + ec.message();
-                    acceptor.reset();
                     return false;
                 }
-                bound_port = acceptor->local_endpoint(ec).port();
+                bound_port = acc->local_endpoint(ec).port();
+                acceptor = std::move(acc);
                 return true;
             };
             try
             {
-                if (!bind_transport(opt.port))
+                bool ok = open_listener(opt.port, true);
+                if (!ok)
                 {
-                    if (opt.port == 0)
-                        return false;
+                    ec.clear();
+                    ok = open_listener(opt.port, false);
+                }
+                if (!ok && opt.port != 0)
+                {
                     log("warn", std::format("TCP port {} is busy ({}); falling back to an OS-assigned port",
                                             opt.port, err));
                     ec.clear();
-                    if (!bind_transport(0))
-                        return false;
+                    ok = open_listener(0, true) || open_listener(0, false);
                 }
+                if (!ok)
+                    return false;
             }
             catch (const std::exception &e)
             {
@@ -11094,135 +11518,10 @@ namespace cell
                 return false;
             }
 
-            // ---- UDP discovery ----------------------------------------------
-            // Discovery is never fatal any more. beacon_sock (a random OS-assigned
-            // port) is the real channel — every announce/probe is sent from it and
-            // every unicast reply arrives there. The well-known port is just an
-            // optional extra listener: if another process on this host (or the host
-            // itself under mirrored WSL networking) already holds it, we keep
-            // probing instead of switching discovery off.
             started_at = (long long)std::time(nullptr);
-            rx_port = 0;
-            rendezvous_port = 0;
-            rendezvous_error.clear();
-            if (opt.announce)
-            {
-                try
-                {
-                    beacon_sock = std::make_unique<udp::socket>(io);
-                    beacon_sock->open(udp::v4(), ec);
-                    if (ec)
-                    {
-                        log("warn", "discovery disabled: could not open the beacon socket: " + ec.message());
-                        beacon_sock.reset();
-                    }
-                    else
-                    {
-                        beacon_sock->set_option(asio::socket_base::reuse_address(true), ec);
-                        beacon_sock->set_option(asio::socket_base::broadcast(true), ec);
-                        beacon_sock->set_option(asio::socket_base::send_buffer_size(64 * 1024), ec);
-                        beacon_sock->bind(udp::endpoint(udp::v4(), 0), ec);
-                        if (ec)
-                        {
-                            log("warn", "discovery disabled: could not bind the beacon socket: " + ec.message());
-                            beacon_sock.reset();
-                        }
-                        else
-                        {
-                            rx_port = beacon_sock->local_endpoint(ec).port();
-                        }
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    beacon_sock.reset();
-                    log("warn", std::string("discovery disabled: ") + e.what());
-                }
-                // Bind the first free well-known slot. The extra slots are only
-                // for the same-host case (mirrored WSL / a stale cell / another
-                // app holding 47821); peers probe them on local addresses.
-                if (beacon_sock && opt.discovery_port != 0)
-                {
-                    std::string last_reason;
-                    for (int slot = 0; slot < kRendezvousSlots && !rendezvous_sock; ++slot)
-                    {
-                        const int wanted = std::min<int>(65535, (int)opt.discovery_port + slot);
-                        if (wanted <= 0)
-                            break;
-                        try
-                        {
-                            auto s = std::make_unique<udp::socket>(io);
-                            boost::system::error_code oec;
-                            s->open(udp::v4(), oec);
-                            if (oec)
-                            {
-                                last_reason = oec.message();
-                                break;
-                            }
-                            s->set_option(asio::socket_base::reuse_address(true), oec);
-                            s->set_option(asio::socket_base::broadcast(true), oec);
-                            s->set_option(asio::socket_base::receive_buffer_size(256 * 1024), oec);
-                            s->bind(udp::endpoint(udp::v4(), (std::uint16_t)wanted), oec);
-                            if (oec)
-                            {
-                                last_reason = oec.message();
-                                s->close(oec);
-                                continue;
-                            }
-                            rendezvous_sock = std::move(s);
-                            rendezvous_port = (std::uint16_t)wanted;
-                            group_endpoint = udp::endpoint(asio::ip::make_address_v4(kGroup), rendezvous_port);
-                            boost::system::error_code jec;
-                            rendezvous_sock->set_option(
-                                asio::ip::multicast::join_group(asio::ip::make_address_v4(kGroup)), jec);
-                            rendezvous_sock->set_option(asio::ip::multicast::enable_loopback(true), jec);
-                        }
-                        catch (const std::exception &e)
-                        {
-                            last_reason = e.what();
-                            break;
-                        }
-                    }
-                    if (!rendezvous_sock)
-                    {
-                        rendezvous_error = last_reason.empty() ? "no free slot" : last_reason;
-                        log("warn", std::format(
-                                        "discovery port {}..{} are busy ({}); active probing on UDP {} continues",
-                                        opt.discovery_port,
-                                        std::min<int>(65535, (int)opt.discovery_port + kRendezvousSlots - 1),
-                                        rendezvous_error, rx_port));
-                    }
-                    else if (rendezvous_port != opt.discovery_port)
-                    {
-                        log("info", std::format("discovery port {} was busy; listening on the next free slot {}",
-                                                opt.discovery_port, rendezvous_port));
-                    }
-                }
-                if (beacon_sock)
-                {
-                    // interfaces, targets, multicast membership + per-interface
-                    // multicast senders
-                    build_announce_targets();
-                }
-            }
-
             alive.store(true);
             work.emplace(asio::make_work_guard(io));
             accept_loop();
-            if (beacon_sock)
-            {
-                start_receive(*beacon_sock);
-                if (rendezvous_sock)
-                    start_receive(*rendezvous_sock);
-                announce_loop();
-                // First beacon immediately instead of one period later: a freshly
-                // opened Scan Links page should not need 5 s to show the peer.
-                auto self = shared_from_this();
-                asio::post(io, [self]
-                           {
-                    if (!self->alive.load()) return;
-                    self->beacon_send_all(self->beacon_json("announce")); });
-            }
             sweep_loop();
             pair_expire_loop();
             const unsigned n = std::max(1u, std::min(4u, std::thread::hardware_concurrency() / 2));
@@ -11242,8 +11541,19 @@ namespace cell
                     {
                         log("error", "io worker stopped by an unknown exception");
                     } });
-            log("info", std::format("flowlink started: id={} transport={} rx_udp={} discovery_udp={} name={}",
-                                    client_id, bound_port, rx_port, rendezvous_port, name));
+
+            // Discovery is never fatal: a machine with no multicast route still
+            // pairs by typed address and still serves its transport.
+            if (opt.announce)
+            {
+                std::string derr;
+                if (!set_discovery(true, derr))
+                    log("warn", "discovery is off: " + derr);
+            }
+            log("info", std::format("flowlink started: id={} transport={} (v6={}) mdns={} instance={} name={}",
+                                    client_id, bound_port, acceptor && acceptor->local_endpoint(ec).protocol() == tcp::v6(),
+                                    discovery_on.load() ? std::to_string(opt.mdns_port) : std::string("off"),
+                                    instance, name));
             return true;
         }
 
@@ -11251,36 +11561,30 @@ namespace cell
         {
             if (!alive.exchange(false))
                 return;
+            // a clean goodbye: peers drop us now instead of after the TTL
+            if (discovery_on.load())
+            {
+                const auto pkt = dns::response(0, my_records(0));
+                if (!pkt.empty())
+                    send_multicast(pkt);
+            }
+            close_discovery();
             boost::system::error_code ec;
             if (acceptor)
             {
                 acceptor->close(ec);
                 acceptor.reset();
             }
-            if (beacon_sock)
-            {
-                beacon_sock->close(ec);
-                beacon_sock.reset();
-            }
-            if (rendezvous_sock)
-            {
-                rendezvous_sock->close(ec);
-                rendezvous_sock.reset();
-            }
-            for (auto &s : mcast_senders)
-                s->close(ec);
-            mcast_senders.clear();
-            mcast_sender_key.clear();
-            rx_port = 0;
-            rendezvous_port = 0;
-            announce_timer.cancel();
+            mdns_timer.cancel();
+            query_timer.cancel();
+            burst_timer.cancel();
             sweep_timer.cancel();
             pair_timer.cancel();
             std::map<std::string, std::shared_ptr<conn>> drop;
             {
                 std::lock_guard<std::mutex> lk(mx);
                 drop.swap(sessions);
-                discovered.clear();
+                present.clear();
                 pairing = pairing_state{};
             }
             for (auto &[id, c] : drop)
@@ -11296,460 +11600,743 @@ namespace cell
             }
             threads.clear();
             io.restart();
-            log("info", "flowlink stopped");
+            log("info", std::format("flowlink stopped (mdns rx_q={} rx_r={} tx_q={} tx_r={} answered={} present={})",
+                                    rx_query.load(), rx_response.load(), tx_query.load(), tx_response.load(),
+                                    answered.load(), (long long)present.size()));
         }
 
         // -------------------------------------------------------------------------
-        //  impl — discovery
-        //
-        //  Two sockets, one protocol:
-        //
-        //   * beacon_sock — bound to an OS-assigned random port. Every announce and
-        //     probe is SENT from it and every unicast reply arrives there, so its
-        //     port is the address peers reply to. Two cells on one machine can
-        //     always have their own; nothing here can fail because a port is busy.
-        //   * rendezvous_sock — the optional well-known listener (default UDP
-        //     47821). Broadcasts/multicast/probes that peers send to the fixed
-        //     port land here. Only one process per port space can hold it, which
-        //     is fine: the other cell answers unicasts from its beacon port.
-        //
-        //  Announcements are ALSO unicast to peers we already know. That is what
-        //  makes Windows <-> WSL work under mirrored networking, where the WSL ->
-        //  Windows direction drops broadcast but unicast (including 127.0.0.1 and
-        //  the host's own interface address) is delivered.
+        //  impl — mDNS discovery
         // -------------------------------------------------------------------------
-        inline std::vector<disc_target> impl::targets_snapshot()
+        inline void impl::refresh_locals(bool force)
         {
-            std::lock_guard<std::mutex> lk(mx);
-            return announce_targets;
-        }
-
-        inline void impl::refresh_ifaces()
-        {
-            std::vector<iface_v4> ifaces = local_ifaces_v4();
-            std::lock_guard<std::mutex> lk(mx);
-            local_ifaces = std::move(ifaces);
-            ifaces_at = (long long)std::time(nullptr);
-        }
-
-        // Multicast needs one outbound socket per interface: IP_MULTICAST_IF is a
-        // per-socket option, so a single socket only ever leaves through the
-        // default route (that is why the old join_group() had no effect on sends).
-        inline void impl::rebuild_mcast_senders(const std::vector<iface_v4> &ifaces)
-        {
-            std::string key;
-            for (const auto &i : ifaces)
+            const long long now = (long long)std::time(nullptr);
+            if (!force && now - locals_at < 30)
+                return;
+            auto next = local_addresses();
+            bool changed = next.size() != locals.size();
+            if (!changed)
+                for (std::size_t i = 0; i < next.size(); i++)
+                    if (next[i].addr != locals[i].addr)
+                    {
+                        changed = true;
+                        break;
+                    }
+            locals = std::move(next);
+            locals_at = now;
+            if (changed && discovery_on.load())
             {
-                key += i.addr;
+                rebuild_tx();
+                // a new NIC must be announced, and the old records for the
+                // addresses that vanished will age out on their own TTL
+                announce(1);
+            }
+        }
+
+        // One outbound socket per interface: IP_MULTICAST_IF is a per-socket
+        // option, so a single socket only ever leaves through the default route.
+        // Interfaces are the addresses asio reported — no system table.
+        inline void impl::rebuild_tx()
+        {
+            std::lock_guard<std::mutex> lk(mdns_mx);
+            std::string key;
+            for (const auto &a : locals)
+            {
+                key += a.addr;
                 key.push_back(';');
             }
-            if (key == mcast_sender_key)
+            if (key == mdns_tx_key)
                 return;
+            mdns_tx_key = std::move(key);
             boost::system::error_code ec;
-            for (auto &s : mcast_senders)
+            for (auto &s : mdns_tx4)
                 s->close(ec);
-            mcast_senders.clear();
-            mcast_sender_key = std::move(key);
-            for (const auto &i : ifaces)
+            mdns_tx4.clear();
+            for (auto &s : mdns_tx6)
+                s->close(ec);
+            mdns_tx6.clear();
+            for (const auto &a : locals)
             {
+                if (a.loopback)
+                    continue;
                 boost::system::error_code sec;
-                auto s = std::make_unique<udp::socket>(io);
-                s->open(udp::v4(), sec);
-                if (sec)
-                    continue;
-                s->set_option(asio::socket_base::reuse_address(true), sec);
-                s->set_option(asio::socket_base::broadcast(true), sec);
-                const auto local = asio::ip::make_address_v4(i.addr, sec);
-                if (sec)
-                {
-                    s->close(sec);
-                    continue;
-                }
-                s->bind(udp::endpoint(local, 0), sec);
-                if (sec)
-                {
-                    s->close(sec);
-                    continue;
-                }
-                s->set_option(asio::ip::multicast::outbound_interface(local), sec);
-                s->set_option(asio::ip::multicast::hops(2), sec);
-                mcast_senders.push_back(std::move(s));
-            }
-        }
-
-        inline void impl::build_announce_targets()
-        {
-            // A configured discovery port of 0 means "do not bind the well-known
-            // port"; peers still need somewhere to send to, so probing keeps using
-            // the protocol default.
-            const std::uint16_t port = opt.discovery_port != 0 ? opt.discovery_port : kDefaultDiscoveryPort;
-            std::vector<disc_target> targets;
-            auto add = [&targets](const std::string &text, std::uint16_t p, std::string kind,
-                                  std::string label)
-            {
-                if (text.empty() || p == 0)
-                    return;
                 boost::system::error_code aec;
-                const auto a = asio::ip::make_address_v4(text, aec);
-                if (aec || a.is_unspecified())
-                    return;
-                for (const auto &t : targets)
-                    if (t.addr == text && t.port == p)
-                        return; // one mechanism per destination is enough
-                targets.push_back({text, p, std::move(kind), std::move(label)});
-            };
-
-            // Local addresses (and the gateway) are probed on every rendezvous slot:
-            // a second cell on this host may have had to take a later slot.
-            auto add_slots = [&](const std::string &addr, const std::string &kind, const std::string &label)
-            {
-                add(addr, port, kind, label);
-                for (int slot = 1; slot < kRendezvousSlots; ++slot)
-                {
-                    const int p = std::min<int>(65535, (int)port + slot);
-                    if (p != port)
-                        add(addr, (std::uint16_t)p, kind, label + "（备用端口）");
-                }
-            };
-            const std::vector<iface_v4> ifaces = local_ifaces_v4();
-            for (const auto &i : ifaces)
-            {
-                // The host's own address: in mirrored WSL this is the shared
-                // Windows interface, and unicasting to it reaches the other stack.
-                add_slots(i.addr, "local", "本机地址");
-                if (i.prefix <= 30) // /31 and /32 have no directed broadcast
-                {
-                    add_slots(i.bcast, "broadcast", "子网广播");
-                }
-                if (!i.gw.empty())
-                    add_slots(i.gw, "gateway", "网关");
-            }
-            add_slots("127.0.0.1", "local", "回环");
-            if (!ifaces.empty())
-                add_slots("255.255.255.255", "broadcast", "全局广播");
-            if (group_endpoint.port() != 0)
-                add(std::string(kGroup), group_endpoint.port(), "multicast", "组播");
-
-            // Known peers, unicast. This is the keepalive path for mirrored WSL /
-            // client-isolated Wi-Fi / anything that drops broadcast.
-            {
-                std::lock_guard<std::mutex> lk(mx);
-                for (const auto &[id, p] : discovered)
-                {
-                    if (p.addr.empty())
-                        continue;
-                    if (p.rx_port != 0)
-                        add(p.addr, p.rx_port, "peer", "已发现设备");
-                    if (p.disc_port != 0)
-                        add(p.addr, p.disc_port, "peer", "已发现设备");
-                }
-            }
-            // Paired peers from disk: the only bootstrap after both sides restarted
-            // (their random beacon ports are gone).
-            for (const auto &m : st.all_meta())
-                if (!m.addr.empty() && is_hex_id(m.id, 32))
-                    add(m.addr, port, "peer", "已配对设备");
-            // User-configured targets: cross-subnet, VPN, a peer behind NAT.
-            for (const auto &raw : opt.extra_targets)
-            {
-                udp::endpoint ep;
-                if (parse_endpoint_v4(raw, port, ep))
-                    add(ep.address().to_string(), ep.port(), "extra", "自定义地址");
-            }
-
-            // Bound the work per beacon: a host with many adapters or a burst of
-            // discovered peers must not turn one beacon into hundreds of datagrams.
-            if (targets.size() > 192)
-                targets.resize(192);
-            {
-                std::lock_guard<std::mutex> lk(mx);
-                local_ifaces = ifaces;
-                ifaces_at = (long long)std::time(nullptr);
-                announce_targets = std::move(targets);
-            }
-
-            // Join the group on every interface as well: an AP that filters
-            // broadcast between clients may still pass multicast. Joining the same
-            // (group, interface) twice fails harmlessly.
-            if (rendezvous_sock)
-            {
-                for (const auto &i : ifaces)
-                {
-                    boost::system::error_code jec;
-                    const auto local = asio::ip::make_address_v4(i.addr, jec);
-                    if (jec)
-                        continue;
-                    rendezvous_sock->set_option(
-                        asio::ip::multicast::join_group(asio::ip::make_address_v4(kGroup), local), jec);
-                }
-            }
-            rebuild_mcast_senders(ifaces);
-        }
-
-        inline json impl::beacon_json(const char *type)
-        {
-            static std::atomic<unsigned long long> seq{0};
-            const unsigned long long n = ++seq;
-            return json{{"m", kProto},
-                        {"v", kVersion},
-                        {"t", type},
-                        {"id", client_id},
-                        {"name", name},
-                        {"port", bound_port},        // TCP transport port (may be random)
-                        {"rp", rx_port},             // reply here when 47821 is not ours
-                        {"dp", rendezvous_port},     // our binding of the well-known port, 0 = none
-                        {"seq", (long long)n},
-                        {"pair", is_pairing_open()},
-                        {"accept", opt.accept_remote},
-                        {"os", os_name()},
-                        {"tz", tz_name()},
-                        {"lang", lang_name()},
-                        {"ts", (long long)std::time(nullptr)}};
-        }
-
-        inline void impl::beacon_send_all(const json &p)
-        {
-            if (!alive.load() || !beacon_sock)
-                return;
-            const std::string text = p.dump();
-            const std::vector<disc_target> targets = targets_snapshot();
-            boost::system::error_code ec;
-            bool had_error = false;
-            for (const auto &t : targets)
-            {
-                if (t.kind == "multicast")
-                    continue; // sent below through the per-interface sockets
-                boost::system::error_code aec;
-                const auto a = asio::ip::make_address_v4(t.addr, aec);
+                const auto addr = asio::ip::make_address(a.addr, aec);
                 if (aec)
                     continue;
-                beacon_sock->send_to(asio::buffer(text), udp::endpoint(a, t.port), 0, ec);
-                had_error = had_error || (bool)ec;
-            }
-            if (group_endpoint.port() != 0)
-            {
-                for (auto &s : mcast_senders)
+                auto s = std::make_unique<udp::socket>(io);
+                s->open(a.v6 ? udp::v6() : udp::v4(), sec);
+                if (sec)
+                    continue;
+                if (!a.v6)
+                    s->set_option(asio::ip::multicast::outbound_interface(addr.to_v4()), sec);
+                s->set_option(asio::ip::multicast::hops(1), sec);
+                s->bind(udp::endpoint(addr, 0), sec);
+                if (sec)
                 {
-                    s->send_to(asio::buffer(text), group_endpoint, 0, ec);
-                    had_error = had_error || (bool)ec;
+                    s->close(sec);
+                    continue;
+                }
+                (a.v6 ? mdns_tx6 : mdns_tx4).push_back(std::move(s));
+            }
+            // Join the group on every interface we have. Re-joining is harmless;
+            // failing one interface must not kill discovery on the others.
+            for (const auto &a : locals)
+            {
+                if (a.loopback)
+                    continue;
+                boost::system::error_code jec;
+                const auto addr = asio::ip::make_address(a.addr, jec);
+                if (jec)
+                    continue;
+                if (!a.v6 && mdns4)
+                    mdns4->set_option(asio::ip::multicast::join_group(
+                                          asio::ip::make_address_v4(kGroup4), addr.to_v4()),
+                                      jec);
+                else if (a.v6 && mdns6 && a.scope != 0)
+                    mdns6->set_option(asio::ip::multicast::join_group(
+                                          asio::ip::make_address_v6(kGroup6), a.scope),
+                                      jec);
+            }
+        }
+
+        inline bool impl::set_discovery(bool on, std::string &err)
+        {
+            if (on == discovery_on.load())
+                return true;
+            if (!on)
+            {
+                if (discovery_on.load())
+                {
+                    const auto pkt = dns::response(0, my_records(0)); // goodbye
+                    if (!pkt.empty())
+                        send_multicast(pkt);
+                }
+                close_discovery();
+                emit({{"type", "discovery"}, {"on", false}});
+                return true;
+            }
+            open_discovery(err);
+            if (!discovery_on.load())
+                return false;
+            emit({{"type", "discovery"}, {"on", true}});
+            return true;
+        }
+
+        inline void impl::open_discovery(std::string &err)
+        {
+            err.clear();
+            mdns_error.clear();
+            mdns_bound4 = mdns_bound6 = 0;
+            refresh_locals(true);
+            boost::system::error_code ec;
+            mdns4 = std::make_unique<udp::socket>(io);
+            mdns4->open(udp::v4(), ec);
+            if (!ec)
+            {
+                mdns4->set_option(udp::socket::reuse_address(true), ec);
+                mdns4->set_option(udp::socket::broadcast(true), ec);
+                mdns4->bind(udp::endpoint(asio::ip::address_v4::any(), opt.mdns_port), ec);
+                if (ec)
+                {
+                    // another responder holds the port without reuse: keep the
+                    // service alive on an ephemeral port (unicast replies still
+                    // arrive there, and our own announcements still go out)
+                    mdns_error = ec.message();
+                    ec.clear();
+                    mdns4->bind(udp::endpoint(asio::ip::address_v4::any(), 0), ec);
+                }
+                if (!ec)
+                {
+                    mdns_bound4 = mdns4->local_endpoint(ec).port();
+                    boost::system::error_code oec;
+                    mdns4->set_option(asio::ip::multicast::enable_loopback(true), oec);
                 }
             }
-            if (had_error)
-                ++tx_errors;
-            else
-                ++tx_sent;
-        }
-
-        inline void impl::beacon_send_one(const json &p, const udp::endpoint &to)
-        {
-            if (!alive.load() || !beacon_sock)
-                return;
-            boost::system::error_code ec;
-            beacon_sock->send_to(asio::buffer(p.dump()), to, 0, ec);
             if (ec)
-                ++tx_errors;
-            else
-                ++tx_sent;
+            {
+                mdns4.reset();
+                err = "could not open the DNS-SD socket: " + ec.message();
+                return;
+            }
+            mdns6 = std::make_unique<udp::socket>(io);
+            ec.clear();
+            mdns6->open(udp::v6(), ec);
+            if (!ec)
+            {
+                mdns6->set_option(udp::socket::reuse_address(true), ec);
+                mdns6->bind(udp::endpoint(asio::ip::address_v6::any(), opt.mdns_port), ec);
+                if (ec)
+                {
+                    if (mdns_error.empty())
+                        mdns_error = ec.message();
+                    ec.clear();
+                    mdns6->bind(udp::endpoint(asio::ip::address_v6::any(), 0), ec);
+                }
+                if (!ec)
+                {
+                    mdns_bound6 = mdns6->local_endpoint(ec).port();
+                    boost::system::error_code oec;
+                    mdns6->set_option(asio::ip::multicast::enable_loopback(true), oec);
+                }
+            }
+            if (ec)
+                mdns6.reset(); // IPv4 discovery is enough to run; v6 TCP still works
+
+            rebuild_tx();
+            discovery_on.store(true);
+            if (mdns4)
+                mdns_read(*mdns4, false);
+            if (mdns6)
+                mdns_read(*mdns6, true);
+            announce(3);
+            discovery_query(3);
+            mdns_loop();
+            query_loop();
+            log("info", std::format("mDNS: instance={} host={} port={} bound4={} bound6={}{}",
+                                    instance, host_name, opt.mdns_port, mdns_bound4, mdns_bound6,
+                                    mdns_error.empty() ? "" : " (" + mdns_error + ")"));
         }
 
-        inline void impl::announce_once(bool probe_reply, const udp::endpoint *to)
+        inline void impl::close_discovery()
         {
-            if (!alive.load() || !beacon_sock)
+            std::lock_guard<std::mutex> lk(mdns_mx);
+            if (!discovery_on.exchange(false))
+            {
+                // still tear the sockets down: a half-open start must not leak
+            }
+            mdns_timer.cancel();
+            query_timer.cancel();
+            burst_timer.cancel();
+            burst_left = 0;
+            boost::system::error_code ec;
+            if (mdns4)
+            {
+                mdns4->close(ec);
+                mdns4.reset();
+            }
+            if (mdns6)
+            {
+                mdns6->close(ec);
+                mdns6.reset();
+            }
+            for (auto &s : mdns_tx4)
+                s->close(ec);
+            mdns_tx4.clear();
+            for (auto &s : mdns_tx6)
+                s->close(ec);
+            mdns_tx6.clear();
+            mdns_tx_key.clear();
+            mdns_bound4 = mdns_bound6 = 0;
+        }
+
+        inline std::vector<dns::rr> impl::my_records(std::uint32_t ttl)
+        {
+            std::vector<dns::rr> out;
+            const std::string inst = instance + "." + std::string(kServiceType);
+            dns::rr ptr;
+            ptr.name = std::string(kServiceType);
+            ptr.type = dns::t_ptr;
+            ptr.ttl = ttl;
+            ptr.target = inst;
+            out.push_back(std::move(ptr));
+
+            dns::rr srv;
+            srv.name = inst;
+            srv.type = dns::t_srv;
+            srv.cls = (std::uint16_t)(dns::c_in | 0x8000); // cache-flush: unique
+            srv.ttl = ttl;
+            srv.port = bound_port;
+            srv.target = host_name;
+            out.push_back(std::move(srv));
+
+            dns::rr txt;
+            txt.name = inst;
+            txt.type = dns::t_txt;
+            txt.cls = (std::uint16_t)(dns::c_in | 0x8000);
+            txt.ttl = ttl;
+            txt.txt = {std::format("id={}", client_id),
+                       std::format("name={}", name),
+                       std::format("ver={}", kVersion),
+                       std::format("os={}", os_name()),
+                       std::format("tz={}", tz_name()),
+                       std::format("lang={}", lang_name()),
+                       std::format("acc={}", opt.accept_remote ? 1 : 0),
+                       std::format("pair={}", is_pairing_open() ? 1 : 0),
+                       std::format("ws={}", my_workspaces.size())};
+            out.push_back(std::move(txt));
+
+            for (const auto &a : locals)
+            {
+                boost::system::error_code ec;
+                const auto addr = asio::ip::make_address(a.addr, ec);
+                if (ec)
+                    continue;
+                if (addr.is_loopback())
+                    continue; // a peer cannot use our loopback
+                dns::rr r;
+                r.name = host_name;
+                r.type = a.v6 ? dns::t_aaaa : dns::t_a;
+                r.cls = (std::uint16_t)(dns::c_in | 0x8000);
+                r.ttl = ttl;
+                r.addr = addr_text(addr);
+                out.push_back(std::move(r));
+            }
+            return out;
+        }
+
+        inline void impl::announce(int times)
+        {
+            if (!discovery_on.load() || times <= 0)
                 return;
             auto self = shared_from_this();
-            if (to)
+            asio::post(io, [self, times]
+                       {
+                if (!self->discovery_on.load()) return;
+                self->burst_kind = 1;
+                self->burst_left = times;
+                self->burst_loop(); });
+        }
+
+        inline void impl::discovery_query(int times)
+        {
+            if (!discovery_on.load() || times <= 0)
+                return;
+            auto self = shared_from_this();
+            asio::post(io, [self, times]
+                       {
+                if (!self->discovery_on.load()) return;
+                self->burst_kind = 2;
+                self->burst_left = times;
+                self->burst_loop(); });
+        }
+
+        inline void impl::burst_loop()
+        {
+            if (!alive.load() || !discovery_on.load() || burst_left <= 0)
+                return;
+            if (burst_kind == 1)
             {
-                const udp::endpoint ep = *to;
-                asio::post(io, [self, ep]
-                           { self->beacon_send_one(self->beacon_json("announce"), ep); });
+                auto pkt = dns::response(0, my_records(kMdnsTtl));
+                if (!pkt.empty())
+                {
+                    send_multicast(pkt);
+                    ++tx_response;
+                    for (const auto &raw : opt.extra_targets)
+                    {
+                        udp::endpoint ep;
+                        if (parse_endpoint(raw, opt.mdns_port, ep))
+                            send_unicast(pkt, ep);
+                    }
+                }
             }
             else
             {
-                asio::post(io, [self]
-                           { self->beacon_send_all(self->beacon_json("announce")); });
+                auto pkt = dns::query(0, kServiceType, dns::t_ptr);
+                if (!pkt.empty())
+                {
+                    send_browse(pkt);
+                    ++tx_query;
+                    for (const auto &raw : opt.extra_targets)
+                    {
+                        udp::endpoint ep;
+                        if (parse_endpoint(raw, opt.mdns_port, ep))
+                            send_unicast(pkt, ep);
+                    }
+                }
             }
-            (void)probe_reply;
+            if (--burst_left > 0)
+            {
+                auto self = shared_from_this();
+                burst_timer.expires_after(900ms);
+                burst_timer.async_wait([self](const boost::system::error_code &ec)
+                                       {
+                    if (ec || !self->discovery_on.load()) return;
+                    self->burst_loop(); });
+            }
         }
 
-        inline void impl::announce_loop()
+        inline void impl::mdns_loop()
         {
-            if (!alive.load() || !beacon_sock)
+            if (!alive.load() || !discovery_on.load())
                 return;
             auto self = shared_from_this();
-            const auto jitter = std::chrono::milliseconds{static_cast<int>(randombytes_uniform(1200))};
-            announce_timer.expires_after(kAnnouncePeriod + jitter);
-            announce_timer.async_wait([self](const boost::system::error_code &ec)
-                                      {
-                if (ec || !self->alive.load()) return;
-                // Re-enumerate before every beacon: adapters appear and vanish while
-                // we run (WSL starts after us, a VPN connects, a dock is plugged in),
-                // and a target list frozen at start() is exactly why a WSL host and
-                // its Windows host never found each other.
-                self->build_announce_targets();
-                self->beacon_send_all(self->beacon_json("announce"));
-                self->announce_loop(); });
+            // re-announce at half the TTL, so a cache never expires a live peer
+            mdns_timer.expires_after(std::chrono::seconds(kMdnsTtl / 2));
+            mdns_timer.async_wait([self](const boost::system::error_code &ec)
+                                  {
+                if (ec || !self->alive.load() || !self->discovery_on.load()) return;
+                self->refresh_locals();
+                auto pkt = dns::response(0, self->my_records(kMdnsTtl));
+                if (!pkt.empty()) { self->send_multicast(pkt); ++self->tx_response; }
+                self->mdns_loop(); });
         }
 
-        inline void impl::start_receive(udp::socket &sock)
+        inline void impl::query_loop()
         {
-            if (!alive.load())
+            if (!alive.load() || !discovery_on.load())
+                return;
+            auto self = shared_from_this();
+            query_timer.expires_after(kQueryPeriod);
+            query_timer.async_wait([self](const boost::system::error_code &ec)
+                                   {
+                if (ec || !self->alive.load() || !self->discovery_on.load()) return;
+                auto pkt = dns::query(0, kServiceType, dns::t_ptr);
+                if (!pkt.empty()) { self->send_browse(pkt); ++self->tx_query; }
+                self->query_loop(); });
+        }
+
+        inline void impl::send_multicast(const std::string &text)
+        {
+            if (text.empty())
+                return;
+            std::lock_guard<std::mutex> lk(mdns_mx);
+            boost::system::error_code ec;
+            bool sent = false;
+            const auto group4 = udp::endpoint(asio::ip::make_address_v4(kGroup4),
+                                              mdns_bound4 ? mdns_bound4 : opt.mdns_port);
+            for (auto &s : mdns_tx4)
+            {
+                s->send_to(asio::buffer(text), group4, 0, ec);
+                sent = sent || !ec;
+            }
+            for (const auto &a : locals)
+            {
+                if (a.loopback || !a.v6 || a.scope == 0)
+                    continue;
+                boost::system::error_code aec;
+                auto g = asio::ip::make_address_v6(kGroup6, aec);
+                if (aec)
+                    continue;
+                const asio::ip::address_v6 scoped(g.to_bytes(), a.scope);
+                for (auto &s : mdns_tx6)
+                {
+                    s->send_to(asio::buffer(text),
+                               udp::endpoint(scoped, mdns_bound6 ? mdns_bound6 : opt.mdns_port), 0, ec);
+                    sent = sent || !ec;
+                }
+            }
+            if (!sent && mdns4)
+                mdns4->send_to(asio::buffer(text), group4, 0, ec);
+        }
+
+        // A query must leave from the receiving socket: its source port is what a
+        // legacy (unicast-only) responder answers to, and a query from the
+        // DNS-SD port is answered with multicast, which lands in the same loop.
+        inline void impl::send_browse(const std::string &text)
+        {
+            if (text.empty())
+                return;
+            std::lock_guard<std::mutex> lk(mdns_mx);
+            boost::system::error_code ec;
+            if (mdns4)
+                mdns4->send_to(asio::buffer(text),
+                               udp::endpoint(asio::ip::make_address_v4(kGroup4), opt.mdns_port), 0, ec);
+            if (mdns6)
+            {
+                boost::system::error_code aec;
+                auto g = asio::ip::make_address_v6(kGroup6, aec);
+                if (!aec)
+                    for (const auto &a : locals)
+                    {
+                        if (a.loopback || !a.v6 || a.scope == 0)
+                            continue;
+                        const asio::ip::address_v6 scoped(g.to_bytes(), a.scope);
+                        mdns6->send_to(asio::buffer(text), udp::endpoint(scoped, opt.mdns_port), 0, ec);
+                    }
+            }
+        }
+
+        inline void impl::send_unicast(const std::string &text, const udp::endpoint &to)
+        {
+            if (text.empty())
+                return;
+            std::lock_guard<std::mutex> lk(mdns_mx);
+            boost::system::error_code ec;
+            if (to.address().is_v6())
+            {
+                if (mdns6)
+                    mdns6->send_to(asio::buffer(text), to, 0, ec);
+                else if (!mdns_tx6.empty())
+                    mdns_tx6.front()->send_to(asio::buffer(text), to, 0, ec);
+            }
+            else if (mdns4)
+                mdns4->send_to(asio::buffer(text), to, 0, ec);
+        }
+
+        inline void impl::mdns_read(udp::socket &sock, bool v6)
+        {
+            if (!alive.load() || !discovery_on.load())
                 return;
             auto self = shared_from_this();
             udp::socket *sp = &sock;
             auto buf = std::make_shared<std::string>(kMaxDatagram, '\0');
             auto from = std::make_shared<udp::endpoint>();
             sock.async_receive_from(asio::buffer(*buf), *from,
-                                    [self, sp, buf, from](const boost::system::error_code &ec, std::size_t n)
+                                    [self, sp, buf, from, v6](const boost::system::error_code &ec, std::size_t n)
                                     {
                 // Never touch the socket unless it is still one of ours: stop()
                 // closes and replaces them while handlers may still be queued.
-                const bool ours = sp == self->beacon_sock.get() || sp == self->rendezvous_sock.get();
-                if (!self->alive.load() || !ours)
+                const bool ours = sp == self->mdns4.get() || sp == self->mdns6.get();
+                if (!self->alive.load() || !self->discovery_on.load() || !ours)
                     return;
                 if (ec)
                 {
                     if (ec != asio::error::operation_aborted)
-                        self->start_receive(*sp);
+                        self->mdns_read(*sp, v6);
                     return;
                 }
                 buf->resize(n);
-                try { self->on_datagram(*buf, *from); }
+                try { self->on_mdns(*buf, *from); }
                 catch (const std::exception &e)
                 {
-                    self->log("warn", std::format("discovery datagram handler failed: {}", e.what()));
+                    self->log("warn", std::format("mDNS handler failed: {}", e.what()));
                 }
-                self->start_receive(*sp); });
+                self->mdns_read(*sp, v6); });
         }
 
-        inline void impl::on_datagram(const std::string &text, const udp::endpoint &from)
+        inline void impl::on_mdns(const std::string &text, const udp::endpoint &from)
         {
-            if (!alive.load())
+            dns::message m;
+            if (!dns::parse(text, m))
                 return;
-            json j = json::parse(text, nullptr, false);
-            if (!j.is_object() || jstr(j, "m") != kProto)
-                return;
-            if (jint(j, "v") != kVersion)
-                return;
-            const std::string t = jstr(j, "t");
-            if (t != "announce" && t != "probe")
-                return;
-            const std::string their_id = jstr(j, "id");
-            if (!is_hex_id(their_id, 32) || their_id == client_id)
-                return;
-            const std::uint16_t tcp_port =
-                (std::uint16_t)std::clamp(jint(j, "port"), 0LL, 65535LL);
-            if (tcp_port == 0)
-                return;
-            const std::string their_name = clean_name(jstr(j, "name"));
-            const std::uint16_t their_dp =
-                (std::uint16_t)std::clamp(jint(j, "dp"), 0LL, 65535LL);
-            const long long ts = jint(j, "ts", 0);
-            const bool pair_open = jbool(j, "pair", false);
-            const std::string from_addr = from.address().to_string();
-            // The source port is the peer's beacon_sock, i.e. where it listens for
-            // replies; an older peer that sent from its rendezvous socket reports
-            // the same thing through "rp". Fall back to the datagram source.
-            const std::uint16_t reply_port =
-                (std::uint16_t)std::clamp(jint(j, "rp", (long long)from.port()), 0LL, 65535LL);
-            if (reply_port == 0)
-                return;
-            const bool is_probe = (t == "probe");
-
-            bool fresh = false;
-            bool reflect = false;
+            last_mdns_from = addr_text(from.address());
+            // Count only packets that concern this service: a busy LAN emits
+            // hundreds of unrelated mDNS responses per second, and a counter
+            // that mixes them in cannot answer "is anybody out there".
+            if (m.is_response())
             {
-                std::lock_guard<std::mutex> lk(mx);
-                auto [it_new, inserted] = discovered.try_emplace(their_id);
-                // Beacons are unauthenticated: cap the table so a LAN flood of
-                // made-up client ids cannot grow memory without bound.
-                if (inserted && discovered.size() > 64)
-                {
-                    discovered.erase(it_new);
-                    return;
-                }
-                peer_state &p = it_new->second;
-                // One datagram can reach us through several targets (loopback, the
-                // host's own address, the rendezvous socket). Same beacon timestamp
-                // = same beacon: count it once.
-                if (is_probe)
-                {
-                    ++rx_probe;
-                    if (ts != 0 && ts > p.last_probe_ts)
-                        p.last_probe_ts = ts;
-                }
-                else
-                {
-                    if (ts != 0 && ts == p.last_ann_ts)
-                        return;
-                    ++rx_announce;
-                    if (ts != 0 && ts > p.last_ann_ts)
-                        p.last_ann_ts = ts;
-                }
-                rx_last_from = from_addr;
-                const long long now = (long long)std::time(nullptr);
-                fresh = p.last_seen == 0;
-                const bool moved = p.addr != from_addr || p.rx_port != reply_port;
-                p.id = their_id;
-                p.name = their_name;
-                p.addr = from_addr;
-                p.port = tcp_port;
-                p.rx_port = reply_port;
-                p.disc_port = their_dp;
-                p.last_seen = now;
-                p.pairing_open = pair_open;
-                p.os = clean_name(jstr(j, "os"), 24);
-                p.tz = clean_name(jstr(j, "tz"), 48);
-                p.lang = clean_name(jstr(j, "lang"), 24);
-                auto same = [&](const std::pair<std::string, std::uint16_t> &e)
-                { return e.first == from_addr && e.second == reply_port; };
-                p.endpoints.erase(std::remove_if(p.endpoints.begin(), p.endpoints.end(), same),
-                                  p.endpoints.end());
-                p.endpoints.insert(p.endpoints.begin(), {from_addr, reply_port});
-                if (p.endpoints.size() > 4)
-                    p.endpoints.resize(4);
-                // Answer a new/moved peer, and always answer a probe. The cooldown
-                // keeps two multi-homed cells from reflecting announces forever.
-                const long long cooldown = is_probe ? 1 : 5;
-                if ((fresh || moved || is_probe) && now - p.last_reflect >= cooldown)
-                {
-                    p.last_reflect = now;
-                    reflect = true;
-                }
+                if (on_response(m, from))
+                    ++rx_response;
             }
-            if (reflect)
-                beacon_send_one(beacon_json("announce"), from);
-            if (!fresh)
-                return; // known peer: refresh only, no event storm
-            emit({{"type", "discovered"},
-                  {"client_id", their_id},
-                  {"name", their_name},
-                  {"addr", from_addr},
-                  {"port", tcp_port},
-                  {"rx_port", reply_port},
-                  {"pairing", pair_open},
-                  {"os", clean_name(jstr(j, "os"), 24)},
-                  {"tz", clean_name(jstr(j, "tz"), 48)},
-                  {"lang", clean_name(jstr(j, "lang"), 24)}});
+            else if (on_query(m, from))
+                ++rx_query;
         }
 
-        inline void impl::probe_now(const udp::endpoint *to)
+        // Somebody asks for the service (a browse) or for one of our records.
+        // Answer from the DNS-SD port; a query that came from a legacy unicasic
+        // source port gets a unicast answer to that port.
+        inline bool impl::on_query(const dns::message &m, const udp::endpoint &from)
         {
-            if (!alive.load() || !beacon_sock)
-                return;
-            auto self = shared_from_this();
-            if (to)
+            const std::string inst = instance + "." + std::string(kServiceType);
+            bool want = false;
+            for (const auto &q : m.qs)
             {
-                const udp::endpoint ep = *to;
-                asio::post(io, [self, ep]
-                           { self->beacon_send_one(self->beacon_json("probe"), ep); });
-                return;
+                if (q.type == dns::t_any &&
+                    (dns::name_is(q.name, kServiceType) || dns::name_is(q.name, inst) ||
+                     dns::name_is(q.name, host_name)))
+                    want = true;
+                else if (q.type == dns::t_ptr && dns::name_is(q.name, kServiceType))
+                    want = true;
+                else if ((q.type == dns::t_srv || q.type == dns::t_txt) && dns::name_is(q.name, inst))
+                    want = true;
+                else if ((q.type == dns::t_a || q.type == dns::t_aaaa) && dns::name_is(q.name, host_name))
+                    want = true;
+                if (want)
+                    break;
             }
-            asio::post(io, [self]
-                       { self->beacon_send_all(self->beacon_json("probe")); });
+            if (!want)
+                return false;
+            auto pkt = dns::response(m.id, my_records(kMdnsTtl));
+            if (pkt.empty())
+                return true;
+            const bool legacy = from.port() != (mdns_bound4 ? mdns_bound4 : opt.mdns_port) &&
+                                from.port() != (mdns_bound6 ? mdns_bound6 : opt.mdns_port);
+            if (legacy)
+                send_unicast(pkt, from);
+            else
+                send_multicast(pkt);
+            ++answered;
+            return true;
+        }
+
+        inline bool impl::on_response(const dns::message &m, const udp::endpoint &from)
+        {
+            struct found
+            {
+                std::string id, name, host, os, tz, lang;
+                std::uint16_t port = 0;
+                bool accept = false, pairing_open = false;
+                std::uint32_t ttl = kMdnsTtl;
+                std::vector<std::string> addrs;
+                bool goodbye = false;
+            };
+            std::map<std::string, found> founds;                       // instance (lowered) -> fields
+            std::map<std::string, std::vector<std::string>> host_addrs; // host (lowered) -> addresses
+            for (const auto &r : m.an)
+            {
+                if (r.type == dns::t_a || r.type == dns::t_aaaa)
+                {
+                    if (r.ttl != 0)
+                        host_addrs[dns::lower_ascii_copy(r.name)].push_back(r.addr);
+                    continue;
+                }
+                if (!dns::name_ends_with(r.name, kServiceType))
+                    continue;
+                if (r.type == dns::t_ptr)
+                {
+                    auto &f = founds[dns::lower_ascii_copy(r.target)];
+                    if (r.ttl == 0)
+                        f.goodbye = true;
+                    continue;
+                }
+                auto &f = founds[dns::lower_ascii_copy(r.name)];
+                if (r.type == dns::t_srv)
+                {
+                    f.port = r.port;
+                    f.host = dns::lower_ascii_copy(r.target);
+                    f.ttl = r.ttl;
+                    if (r.ttl == 0)
+                        f.goodbye = true;
+                }
+                else if (r.type == dns::t_txt)
+                {
+                    f.ttl = r.ttl;
+                    if (r.ttl == 0)
+                        f.goodbye = true;
+                    for (const auto &kv : r.txt)
+                    {
+                        const auto eq = kv.find('=');
+                        if (eq == std::string::npos)
+                            continue;
+                        const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+                        if (k == "id")
+                            f.id = v;
+                        else if (k == "name")
+                            f.name = clean_name(v);
+                        else if (k == "os")
+                            f.os = clean_name(v, 24);
+                        else if (k == "tz")
+                            f.tz = clean_name(v, 48);
+                        else if (k == "lang")
+                            f.lang = clean_name(v, 24);
+                        else if (k == "acc")
+                            f.accept = (v == "1");
+                        else if (k == "pair")
+                            f.pairing_open = (v == "1");
+                    }
+                }
+            }
+            const std::string src = addr_text(from.address());
+            const long long now = (long long)std::time(nullptr);
+            for (auto &[inst, f] : founds)
+            {
+                if (!is_hex_id(f.id, 32) || f.id == client_id)
+                    continue; // not one of us, not a peer we can address
+                if (f.goodbye || f.ttl == 0)
+                {
+                    std::string gone_name;
+                    bool removed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        const auto it = present.find(f.id);
+                        if (it != present.end())
+                        {
+                            gone_name = it->second.name;
+                            present.erase(it);
+                            removed = true;
+                        }
+                    }
+                    if (removed)
+                        emit({{"type", "lost"}, {"client_id", f.id}, {"name", gone_name}});
+                    continue;
+                }
+                std::vector<std::string> addrs;
+                addrs.push_back(src); // reachable by definition: it just reached us
+                for (const auto &a : host_addrs[f.host])
+                    if (std::ranges::find(addrs, a) == addrs.end())
+                        addrs.push_back(a);
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    auto &p = present[f.id];
+                    fresh = p.seen == 0;
+                    p.id = f.id;
+                    if (!f.name.empty())
+                        p.name = f.name;
+                    p.instance = inst;
+                    p.host = f.host;
+                    for (const auto &a : addrs)
+                        if (std::ranges::find(p.addrs, a) == p.addrs.end())
+                            p.addrs.push_back(a);
+                    if (p.addrs.size() > 6)
+                        p.addrs.resize(6);
+                    if (f.port != 0)
+                        p.port = f.port;
+                    if (!f.os.empty())
+                        p.os = f.os;
+                    if (!f.tz.empty())
+                        p.tz = f.tz;
+                    if (!f.lang.empty())
+                        p.lang = f.lang;
+                    p.accept = f.accept;
+                    p.pairing_open = f.pairing_open;
+                    p.seen = now;
+                    p.expires = now + (long long)(f.ttl ? f.ttl : kMdnsTtl);
+                }
+                if (fresh)
+                    emit({{"type", "discovered"},
+                          {"client_id", f.id},
+                          {"name", f.name},
+                          {"addr", src},
+                          {"port", f.port},
+                          {"os", f.os},
+                          {"tz", f.tz},
+                          {"lang", f.lang},
+                          {"pairing", f.pairing_open}});
+            }
+            return !founds.empty();
+        }
+
+        inline json impl::discovery_json()
+        {
+            json addrs = json::array();
+            for (const auto &a : locals)
+                addrs.push_back({{"addr", a.addr}, {"family", a.v6 ? "v6" : "v4"},
+                                 {"scope", a.scope}, {"loopback", a.loopback}});
+            const bool on = discovery_on.load();
+            const char *state = !on ? "off" : (mdns_error.empty() ? "active" : "degraded");
+            return {{"on", on},
+                    {"state", state},
+                    {"port", opt.mdns_port},
+                    {"bound4", mdns_bound4},
+                    {"bound6", mdns_bound6},
+                    {"instance", instance},
+                    {"host", host_name},
+                    {"service", std::string(kServiceType)},
+                    {"addresses", addrs},
+                    {"rx_query", rx_query.load()},
+                    {"rx_response", rx_response.load()},
+                    {"tx_query", tx_query.load()},
+                    {"tx_response", tx_response.load()},
+                    {"peers", [this]
+                     {
+                         std::lock_guard<std::mutex> lk(mx);
+                         return (long long)present.size();
+                     }()},
+                    {"last_from", last_mdns_from},
+                    {"error", mdns_error}};
+        }
+
+        inline json impl::presence_json()
+        {
+            json out = json::array();
+            std::lock_guard<std::mutex> lk(mx);
+            for (const auto &[id, p] : present)
+            {
+                json addrs = json::array();
+                for (const auto &a : p.addrs)
+                    addrs.push_back(a);
+                out.push_back({{"client_id", id}, {"name", p.name}, {"addr", p.addrs.empty() ? "" : p.addrs.front()},
+                               {"addrs", addrs}, {"port", p.port}, {"os", p.os}, {"tz", p.tz},
+                               {"lang", p.lang}, {"accept", p.accept}, {"pairing", p.pairing_open},
+                               {"last_seen", p.seen}, {"expires", p.expires}});
+            }
+            return out;
         }
 
         // -------------------------------------------------------------------------
-        //  impl — inbound connections and sessions
+        //  impl — inbound connections, sessions, liveness
         // -------------------------------------------------------------------------
         inline std::shared_ptr<impl::conn> impl::make_conn(tcp::socket s)
         {
@@ -11767,11 +12354,6 @@ namespace cell
                 if (!self->alive.load()) return;
                 if (!ec)
                 {
-                    boost::system::error_code rec;
-                    const auto remote = s->remote_endpoint(rec);
-                    if (!rec)
-                        self->log("info", std::format("inbound connection from {}:{}",
-                                                      remote.address().to_string(), remote.port()));
                     auto c = self->make_conn(std::move(*s));
                     c->inbound = true;
                     c->start_inbound();
@@ -11809,6 +12391,57 @@ namespace cell
                 emit({{"type", "offline"}, {"client_id", peer}});
         }
 
+        inline void impl::send_workspaces(const std::shared_ptr<conn> &c)
+        {
+            json list;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                list = my_workspaces;
+            }
+            if (!c || !c->ready || !list.is_array() || list.empty())
+                return;
+            json payload{{"t", "evt"}, {"m", "ws.state"}, {"p", {{"workspaces", list}}}};
+            asio::post(c->strand, [c, payload]
+                       { c->send_encrypted(payload); });
+        }
+
+        // A frontend's workspace list changed: remember it for the next peer and
+        // push it to everyone connected right now. This is what makes the remote
+        // picker live instead of a manual refresh.
+        inline void impl::publish_workspaces(const json &list)
+        {
+            std::vector<std::shared_ptr<conn>> targets;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                my_workspaces = list.is_array() ? list : json::array();
+                for (auto &[id, c] : sessions)
+                    if (c->ready)
+                        targets.push_back(c);
+            }
+            for (auto &c : targets)
+                send_workspaces(c);
+            announce(1); // the `ws=` count in the TXT record changed
+        }
+
+        // fire-and-forget event to one peer (remote console chunks, workspace
+        // pushes, remote turn streaming): the peer sees it as a "peer_event"
+        inline bool impl::notify(const std::string &peer, const std::string &method, const json &params)
+        {
+            std::shared_ptr<conn> c;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                auto it = sessions.find(peer);
+                if (it != sessions.end())
+                    c = it->second;
+            }
+            if (!c || !c->ready)
+                return false;
+            json payload{{"t", "evt"}, {"m", method}, {"p", params}};
+            asio::post(c->strand, [c, payload]
+                       { c->send_encrypted(payload); });
+            return true;
+        }
+
         inline std::shared_ptr<impl::conn> impl::session_for(const std::string &peer, int timeout_ms, std::string &err)
         {
             {
@@ -11828,28 +12461,25 @@ namespace cell
                     return nullptr;
                 }
             }
-            // Where is it? Every source endpoint discovery has seen — a multi-homed
-            // peer (LAN + VPN, mirrored WSL) may only accept TCP on one of them —
-            // then the address remembered at pairing. The TCP port always comes
-            // from the beacon/handshake, because the transport port may be random.
+            // Where is it? Every address mDNS published for it — a multi-homed
+            // peer (LAN + VPN, WSL, a v6-only segment) may only accept TCP on one
+            // of them — then the address remembered at pairing.
             std::vector<std::pair<std::string, std::uint16_t>> unique;
-            auto collect = [&]()
+            auto collect = [&]() -> bool
             {
                 std::vector<std::pair<std::string, std::uint16_t>> out;
-                bool fresh_seen = false;
+                bool fresh = false;
+                std::uint16_t published_port = 0;
                 {
                     std::lock_guard<std::mutex> lk(mx);
-                    if (auto it = discovered.find(peer); it != discovered.end())
+                    if (auto it = present.find(peer); it != present.end())
                     {
-                        const auto &d = it->second;
-                        fresh_seen = d.port != 0 &&
-                                     (long long)std::time(nullptr) - d.last_seen <= 8;
-                        if (d.port != 0)
-                            for (const auto &e : d.endpoints)
-                                if (!e.first.empty())
-                                    out.emplace_back(e.first, d.port);
-                        if (out.empty() && !d.addr.empty() && d.port != 0)
-                            out.emplace_back(d.addr, d.port);
+                        const auto &p = it->second;
+                        fresh = (long long)std::time(nullptr) <= p.expires;
+                        published_port = p.port;
+                        for (const auto &a : p.addrs)
+                            if (!a.empty() && p.port != 0)
+                                out.emplace_back(a, p.port);
                     }
                 }
                 if (auto m = st.load_meta(peer))
@@ -11858,16 +12488,16 @@ namespace cell
                 for (const auto &c : out)
                     if (std::ranges::find(unique, c) == unique.end())
                         unique.push_back(c);
-                return fresh_seen;
+                (void)published_port;
+                return fresh;
             };
             const bool fresh = collect();
             if (unique.empty() || !fresh)
             {
-                // Restarting a cell changes its random transport port; the cached
-                // address can be one beacon stale. Send a probe and give the answer
-                // a moment before trusting the cache.
-                probe_now();
-                std::this_thread::sleep_for(std::chrono::milliseconds(350));
+                // a peer that restarted listens on a new port; ask again before
+                // trusting a stale record
+                discovery_query(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
                 (void)collect();
             }
             if (unique.empty())
@@ -11920,10 +12550,8 @@ namespace cell
                 }
                 if (round == 0)
                 {
-                    // One more probe: the first candidates may all be from before a
-                    // peer restart (connection refused / stale port).
-                    probe_now();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+                    discovery_query(1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(400));
                     (void)collect();
                 }
             }
@@ -11941,24 +12569,42 @@ namespace cell
                                    {
                 if (ec || !self->alive.load()) return;
                 const long long now = (long long)std::time(nullptr);
-                std::vector<std::shared_ptr<impl::conn>> idle;
+                std::vector<std::shared_ptr<impl::conn>> dead;
+                std::vector<json> events;
                 {
                     std::lock_guard<std::mutex> lk(self->mx);
-                    for (auto it = self->discovered.begin(); it != self->discovered.end();)
-                        if (now - it->second.last_seen > kPeerTtl.count())
-                            it = self->discovered.erase(it);
+                    for (auto it = self->present.begin(); it != self->present.end();)
+                    {
+                        if (it->second.expires <= now)
+                        {
+                            events.push_back({{"type", "lost"}, {"client_id", it->first},
+                                              {"name", it->second.name}});
+                            it = self->present.erase(it);
+                        }
                         else
                             ++it;
+                    }
                     for (auto &[id, c] : self->sessions)
-                        if (c->ready && now - c->last_rx > kSessionIdle.count())
-                            idle.push_back(c);
+                    {
+                        if (!c->ready)
+                            continue;
+                        const long long rx = c->last_rx.load();
+                        if (now - rx > (long long)kHeartbeatTimeout.count())
+                            dead.push_back(c);
+                        else if (now - rx >= (long long)kHeartbeat.count() &&
+                                 now - c->last_ping.load() >= (long long)kHeartbeat.count())
+                        {
+                            c->last_ping.store(now);
+                            asio::post(c->strand, [c]
+                                       { c->send_encrypted(json{{"t", "ping"}}); });
+                        }
+                    }
                 }
-                // Keep "本机地址" live even while discovery is off or its sockets
-                // could not be opened: a VPN/dock/WSL adapter may appear later.
-                if (now - self->ifaces_at >= 10)
-                    self->refresh_ifaces();
-                for (auto &c : idle)
-                    c->close("idle timeout");
+                for (auto &e : events)
+                    self->emit(e);
+                for (auto &c : dead)
+                    c->close("heartbeat timeout");
+                self->refresh_locals();
                 self->sweep_loop(); });
         }
 
@@ -12000,6 +12646,13 @@ namespace cell
                 return (*h)(params, err);
             if (method == "transfer.deliver" || method == "mail.deliver")
                 return deliver_transmission(params, err);
+            if (method == "ws.list")
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                return json{{"ok", true}, {"workspaces", my_workspaces}};
+            }
+            if (method == "cli.exec")
+                return remote_console(params, err);
             if (method == "ping")
                 return json{{"ok", true}, {"ts", (long long)std::time(nullptr)}, {"name", name},
                             {"client_id", client_id}};
@@ -12007,6 +12660,65 @@ namespace cell
                 return opt.on_call(method, params, err);
             err = "unknown method: " + method;
             return json{};
+        }
+
+        // A peer asked this cell to run a console line (its /link attach). The
+        // line is executed here, in this cell's own session and workspace; every
+        // chunk of output is streamed back over the same encrypted session.
+        inline json impl::remote_console(const json &params, std::string &err)
+        {
+            if (!opt.on_cli)
+            {
+                err = "this cell does not expose a remote console";
+                return json{};
+            }
+            if (!opt.accept_remote)
+            {
+                err = "this cell does not accept remote work (FlowLink settings)";
+                return json{};
+            }
+            const std::string line = jstr(params, "line");
+            const std::string rid = jstr(params, "rid");
+            const std::string from = jstr(params, "_from");
+            if (line.empty())
+            {
+                err = "empty console line";
+                return json{};
+            }
+            auto buf = std::make_shared<std::string>();
+            auto flush = [this, from, rid, buf]()
+            {
+                if (buf->empty())
+                    return;
+                if (!from.empty())
+                    notify(from, "cli.out", {{"rid", rid}, {"text", *buf}});
+                buf->clear();
+            };
+            output_fn sink = [buf, flush](std::string_view chunk)
+            {
+                if (chunk.empty())
+                    return;
+                buf->append(chunk);
+                // coalesce: a command printing one word at a time must not turn
+                // into one frame per word
+                if (buf->size() < 1024 && buf->find('\n') == std::string::npos)
+                    return;
+                flush();
+            };
+            bool ok = false;
+            try
+            {
+                ok = opt.on_cli(line, sink, err);
+            }
+            catch (const std::exception &e)
+            {
+                err = std::string("remote console failed: ") + e.what();
+                return json{};
+            }
+            flush(); // the tail of a partial line still has to reach the peer
+            if (!ok && !err.empty())
+                return json{};
+            return json{{"ok", true}, {"exit", ok ? 0 : 1}};
         }
 
         // A peer sent us a transfer: the JSONL file lands in links/<sender>/ and
@@ -12062,11 +12774,11 @@ namespace cell
         {
             json out = json::array();
             auto metas = st.all_meta();
-            std::map<std::string, peer_state> disc;
+            std::map<std::string, presence> disc;
             std::map<std::string, bool> online;
             {
                 std::lock_guard<std::mutex> lk(mx);
-                disc = discovered;
+                disc = present;
                 for (auto &[id, c] : sessions)
                     online[id] = c->ready;
             }
@@ -12077,23 +12789,27 @@ namespace cell
                 seen.insert(m.id);
                 const bool on = online.count(m.id) && online[m.id];
                 const auto it = disc.find(m.id);
+                json addrs = json::array();
+                if (it != disc.end())
+                    for (const auto &a : it->second.addrs)
+                        addrs.push_back(a);
                 json e{{"client_id", m.id},
                        {"name", m.name.empty() ? m.id.substr(0, 8) : m.name},
                        {"paired", true},
                        {"online", on},
+                       {"present", it != disc.end()},
                        // Discovery is newer than the persisted pairing record: a
-                       // restarted peer gets a new random port, and the UI must show
+                       // restarted peer gets a new port, and the UI must show
                        // where it is now, not where it was when the link was made.
-                       {"addr", it != disc.end() && !it->second.addr.empty() ? it->second.addr : m.addr},
+                       {"addr", it != disc.end() && !it->second.addrs.empty() ? it->second.addrs.front() : m.addr},
+                       {"addrs", addrs},
                        {"port", it != disc.end() && it->second.port != 0 ? it->second.port : m.port},
-                       {"rx_port", it != disc.end() ? it->second.rx_port : 0},
-                       {"disc_port", it != disc.end() ? it->second.disc_port : 0},
                        {"paired_at", m.paired_at},
-                       {"last_seen", on ? now : m.last_seen},
+                       {"last_seen", on ? now : (it != disc.end() ? it->second.seen : m.last_seen)},
                        {"via", m.via},
-                       {"os", m.os},
-                       {"tz", m.tz},
-                       {"lang", m.lang},
+                       {"os", m.os.empty() && it != disc.end() ? it->second.os : m.os},
+                       {"tz", m.tz.empty() && it != disc.end() ? it->second.tz : m.tz},
+                       {"lang", m.lang.empty() && it != disc.end() ? it->second.lang : m.lang},
                        {"trusted", st.has_key(m.id)},
                        {"discovered", it != disc.end()},
                        {"pairing", it != disc.end() && it->second.pairing_open}};
@@ -12103,16 +12819,19 @@ namespace cell
             {
                 if (seen.count(id))
                     continue;
+                json addrs = json::array();
+                for (const auto &a : p.addrs)
+                    addrs.push_back(a);
                 out.push_back({{"client_id", id},
                                {"name", p.name.empty() ? id.substr(0, 8) : p.name},
                                {"paired", false},
-                               {"online", false},
-                               {"addr", p.addr},
+                               {"online", online.count(id) && online[id]},
+                               {"present", true},
+                               {"addr", p.addrs.empty() ? "" : p.addrs.front()},
+                               {"addrs", addrs},
                                {"port", p.port},
-                               {"rx_port", p.rx_port},
-                               {"disc_port", p.disc_port},
                                {"paired_at", 0},
-                               {"last_seen", p.last_seen},
+                               {"last_seen", p.seen},
                                {"via", ""},
                                {"os", p.os},
                                {"tz", p.tz},
@@ -12140,74 +12859,41 @@ namespace cell
                         {"fails", pairing.fails}};
             }
             auto [unread, total] = st.transmission_counts();
-            // Discovery diagnostics: which adapters we see, every address a beacon
-            // goes to (and through which mechanism), whether anything arrives, and
-            // why a degraded state happened. "0 台设备" is otherwise impossible to
-            // tell apart from "the firewall eats the broadcast".
-            json targets = json::array();
-            json ifaces = json::array();
-            json rx;
-            std::string rv_error;
-            std::uint16_t rv_port = 0;
-            unsigned long long anns = 0, probes = 0;
-            {
-                std::lock_guard<std::mutex> lk(mx);
-                for (const auto &t : announce_targets)
-                    targets.push_back({{"addr", t.addr}, {"port", t.port},
-                                       {"kind", t.kind}, {"label", t.label}});
-                for (const auto &i : local_ifaces)
-                    ifaces.push_back({{"name", i.name}, {"addr", i.addr}, {"prefix", i.prefix},
-                                      {"broadcast", i.bcast}, {"gateway", i.gw}});
-                anns = rx_announce;
-                probes = rx_probe;
-                rv_error = rendezvous_error;
-                rv_port = rendezvous_port;
-                rx = {{"announce", anns}, {"probe", probes},
-                      {"sent", tx_sent.load()}, {"errors", tx_errors.load()},
-                      {"last_from", rx_last_from}, {"since", started_at}};
-            }
             const bool on = alive.load();
-            const char *state = !on || !opt.announce
-                                    ? "off"
-                                    : (rv_port != 0 ? "active" : "probe-only");
+            const json disc = discovery_json();
             std::vector<std::string> hints;
-            if (on && opt.announce)
-            {
-                if (rv_port == 0 && !rv_error.empty())
-                    hints.push_back(std::format(
-                        "发现端口 {} 被占用（{}）：本机改用随机的接收端口继续主动探测，仍能被及时发现。",
-                        opt.discovery_port, rv_error));
-                if (!beacon_sock)
-                    hints.push_back("UDP 套接字打开失败，自动发现不可用；配对与传输仍可用「按地址探测」建立。");
-                else if (anns == 0 && probes == 0)
-                    hints.push_back("还没有收到任何广播或探测。若对方在 WSL 里、跨了 NAT 或被防火墙挡住，"
-                                    "用下面的「按地址探测」填对方的地址，或在设置里添加额外发现地址。");
-            }
+            if (on && !discovery_on.load())
+                hints.push_back("设备发现已关闭：本机不再广播，也不再监听 mDNS；配对与已配对设备的重连不受影响。");
+            else if (on && !mdns_error.empty())
+                hints.push_back(std::format("mDNS 端口 {} 被占用（{}）：已改用随机端口，能收单播应答但收不到组播广播。",
+                                            opt.mdns_port, mdns_error));
+            else if (on && rx_response.load() == 0 && rx_query.load() == 0)
+                hints.push_back("还没有收到任何 mDNS 报文。若对方在 WSL 里、跨了 NAT 或被防火墙挡住，"
+                                "用「按地址探测」填对方的地址，或在设置里添加额外发现地址。");
             return json{{"enabled", on},
                         {"client_id", client_id},
                         {"name", name},
                         {"port", bound_port},
                         {"port_preferred", opt.port},
-                        {"rx_port", on ? rx_port : 0},
-                        {"discovery_port", opt.discovery_port},
-                        {"discovery_bound", rv_port},
-                        {"discovery_state", state},
+                        {"discovery_port", opt.mdns_port},
+                        {"discovery_bound", mdns_bound4},
+                        {"discovery_state", disc.value("state", std::string("off"))},
+                        {"mdns", disc},
+                        {"addresses", disc["addresses"]},
                         {"announce", opt.announce},
                         {"accept_remote", opt.accept_remote},
                         {"settings", st.settings()},
                         {"pairing", pair},
                         {"peers", peers_json()},
-                        {"interfaces", ifaces},
-                        {"targets", targets},
-                        {"rx", rx},
+                        {"discovered", presence_json()},
                         {"hints", hints},
                         {"workspaces", link_workspaces_json()},
                         {"transmissions", {{"unread", unread}, {"total", total}}}};
         }
 
         // =========================================================================
-        //  service — the public face (pimpl: the header stays readable and impl
-        //  internals never leak into the shell)
+        //  service — the public face (pimpl: the internals never leak into the
+        //  frontends that mount it)
         // =========================================================================
         class service
         {
@@ -12234,6 +12920,19 @@ namespace cell
                 p_->handlers.insert_or_assign(std::move(method), std::move(shared));
             }
 
+            // ---- discovery -----------------------------------------------------
+            // The management page's "stop discovering" switch: sockets close, the
+            // goodbye goes out, and pairing/reconnect keep working.
+            bool set_discovery(bool on, std::string &err) { return p_->set_discovery(on, err); }
+            bool discovery_on() const { return p_->discovery_on.load(); }
+            // one browse burst; answers arrive asynchronously
+            void scan()
+            {
+                if (running())
+                    p_->discovery_query(2);
+            }
+            json presence() { return p_->presence_json(); }
+
             // ---- pairing -------------------------------------------------------
             json pair_begin(int ttl_seconds)
             {
@@ -12250,18 +12949,22 @@ namespace cell
                     std::lock_guard<std::mutex> lk(p_->mx);
                     p_->pairing = ps;
                 }
-                // make sure the other side can find us even if announce is off
-                p_->probe_now();
-                p_->announce_once(true, nullptr);
+                // the TXT record carries the flag; announce the change so a peer
+                // browsing right now sees the window without waiting for a TTL
+                p_->announce(2);
                 return json{{"ok", true}, {"code", ps.display}, {"raw", ps.code},
                             {"expires", ps.expires}, {"client_id", p_->client_id}, {"name", p_->name}};
             }
 
             json pair_cancel()
             {
-                std::lock_guard<std::mutex> lk(p_->mx);
-                const bool was = p_->pairing.open;
-                p_->pairing = impl::pairing_state{};
+                bool was = false;
+                {
+                    std::lock_guard<std::mutex> lk(p_->mx);
+                    was = p_->pairing.open;
+                    p_->pairing = impl::pairing_state{};
+                }
+                p_->announce(1);
                 return json{{"ok", true}, {"was_open", was}};
             }
 
@@ -12285,8 +12988,21 @@ namespace cell
                 boost::system::error_code ec;
                 std::string host = addr;
                 std::uint16_t port = 0;
-                const auto colon = host.rfind(':');
-                if (colon != std::string::npos && host.find(':') == colon)
+                if (!host.empty() && host.front() == '[')
+                {
+                    const auto close = host.find(']');
+                    if (close == std::string::npos)
+                    {
+                        err = "bad address: " + addr;
+                        return json{};
+                    }
+                    const std::string tail = host.substr(close + 1);
+                    host = host.substr(1, close - 1);
+                    if (!tail.empty() && tail.front() == ':')
+                        port = (std::uint16_t)std::atoi(tail.c_str() + 1);
+                }
+                else if (const auto colon = host.rfind(':'); colon != std::string::npos &&
+                                                            host.find(':') == colon)
                 {
                     port = (std::uint16_t)std::atoi(host.c_str() + colon + 1);
                     host = host.substr(0, colon);
@@ -12302,32 +13018,27 @@ namespace cell
                 auto add_known = [&](const std::string &want_addr, bool only_pairing)
                 {
                     std::lock_guard<std::mutex> lk(p_->mx);
-                    for (const auto &[id, ps] : p_->discovered)
+                    for (const auto &[id, ps] : p_->present)
                     {
                         if (only_pairing && !ps.pairing_open)
                             continue;
-                        if (!want_addr.empty() && ps.addr != want_addr)
+                        if (!want_addr.empty() &&
+                            std::ranges::find(ps.addrs, want_addr) == ps.addrs.end())
                             continue;
                         if (ps.port == 0)
                             continue;
                         bool added = false;
-                        for (const auto &e : ps.endpoints)
+                        for (const auto &a : ps.addrs)
                         {
                             boost::system::error_code aec;
-                            const auto a = asio::ip::make_address(e.first, aec);
+                            const auto ip = asio::ip::make_address(a, aec);
                             if (!aec)
                             {
-                                add_target(tcp::endpoint(a, ps.port));
+                                add_target(tcp::endpoint(ip, ps.port));
                                 added = true;
                             }
                         }
-                        if (!added && !ps.addr.empty())
-                        {
-                            boost::system::error_code aec;
-                            const auto a = asio::ip::make_address(ps.addr, aec);
-                            if (!aec)
-                                add_target(tcp::endpoint(a, ps.port));
-                        }
+                        (void)added;
                     }
                 };
                 if (!host.empty())
@@ -12344,13 +13055,12 @@ namespace cell
                     {
                         // No port typed: discovery knows the (possibly random)
                         // transport port. If we have not heard from the peer yet,
-                        // unicast a probe to the typed address and wait a moment —
-                        // this is the WSL/NAT/firewall fallback path.
+                        // unicast a probe to the typed address and wait a moment.
                         add_known(host, false);
                         if (targets.empty())
                         {
-                            udp::endpoint probe_ep(a, kDefaultDiscoveryPort);
-                            p_->probe_now(&probe_ep);
+                            udp::endpoint probe_ep(a, p_->opt.mdns_port);
+                            p_->send_unicast(dns::query(0, kServiceType, dns::t_ptr), probe_ep);
                             for (int i = 0; i < 12 && targets.empty(); ++i)
                             {
                                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -12363,16 +13073,15 @@ namespace cell
                 }
                 else
                 {
-                    // Ask the network. Probes go out immediately; a pairing window is
-                    // a user action, so wait a few seconds for the answer instead of
-                    // the old fixed 700 ms (which failed on a busy LAN).
-                    p_->probe_now();
-                    for (int i = 0; i < 20 && targets.empty(); ++i)
+                    // Ask the network. A pairing window is a user action, so wait a
+                    // few seconds for the answer instead of a fixed millisecond.
+                    p_->discovery_query(2);
+                    for (int i = 0; i < 24 && targets.empty(); ++i)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                         add_known({}, true);
-                        if (i == 4 || i == 10)
-                            p_->probe_now(); // one lost datagram must not end pairing
+                        if (i == 6 || i == 14)
+                            p_->discovery_query(1); // one lost datagram must not end pairing
                     }
                     if (targets.empty())
                     {
@@ -12424,7 +13133,7 @@ namespace cell
                     return false;
                 }
                 std::lock_guard<std::mutex> lk(p_->mx);
-                p_->discovered.erase(id);
+                p_->present.erase(id);
                 return true;
             }
             bool disconnect(const std::string &id, std::string &err)
@@ -12457,8 +13166,6 @@ namespace cell
             }
 
             // ---- transfers -----------------------------------------------------
-            // The session's messages travel as JSONL; the peer writes the file and
-            // indexes it in links/transmission.json.
             json send_transfer(const std::string &peer, const json &item, std::string &err)
             {
                 std::string why;
@@ -12499,7 +13206,7 @@ namespace cell
                 return json{{"ok", p_->st.mark_transmission(id, read)}};
             }
 
-            // ---- settings / FlowLink workspaces (links.json) --------------------
+            // ---- settings / FlowLink workspaces --------------------------------
             json settings() { return p_->st.settings(); }
             json update_settings(const json &patch)
             {
@@ -12540,26 +13247,22 @@ namespace cell
                 return ok;
             }
 
+            // the peer's last published list (on disk, so it renders while offline)
+            json remote_workspaces(const std::string &cell)
+            {
+                return p_->st.load_peer_workspaces(cell);
+            }
+            // what this cell offers its peers (the remote picker reads this)
+            void publish_workspaces(const json &list) { p_->publish_workspaces(list); }
+
             // fire-and-forget event to one peer (remote turn streaming, workspace
             // notifications): the peer sees it as a "peer_event"
             bool notify(const std::string &peer, const std::string &method, const json &params)
             {
-                std::shared_ptr<impl::conn> c;
-                {
-                    std::lock_guard<std::mutex> lk(p_->mx);
-                    auto it = p_->sessions.find(peer);
-                    if (it != p_->sessions.end())
-                        c = it->second;
-                }
-                if (!c || !c->ready)
-                    return false;
-                json payload{{"t", "evt"}, {"m", method}, {"p", params}};
-                asio::post(c->strand, [c, payload]
-                           { c->send_encrypted(payload); });
-                return true;
+                return p_->notify(peer, method, params);
             }
 
-            // ---- generic rpc (fs.*, tw.*, …) -----------------------------------
+            // ---- generic rpc (fs.*, tw.*, cli.*) -------------------------------
             json call(const std::string &peer, const std::string &method, const json &params,
                       int timeout_ms, std::string &err)
             {
@@ -12579,117 +13282,93 @@ namespace cell
                 return r;
             }
 
-            // no address: broadcast a probe to every target. With one: unicast to
-            // exactly that host, which is the fallback when discovery's broadcast
-            // cannot cross a NAT or a firewall.
+            // no address: one browse burst. With one: unicast the query to exactly
+            // that host, which is the way through a NAT or a firewall.
             json probe(const std::string &addr = {})
             {
                 if (!running())
                     return json{{"ok", false}, {"error", "flowlink is not running"}};
+                const auto q = dns::query(0, kServiceType, dns::t_ptr);
                 if (addr.empty())
                 {
-                    p_->probe_now();
+                    p_->discovery_query(1);
                     return json{{"ok", true}};
                 }
                 udp::endpoint ep;
-                const std::uint16_t dport = p_->opt.discovery_port != 0
-                                                ? p_->opt.discovery_port
-                                                : kDefaultDiscoveryPort;
-                if (!parse_endpoint_v4(addr, dport, ep))
+                if (!parse_endpoint(addr, p_->opt.mdns_port, ep))
                     return json{{"ok", false}, {"error", std::format("cannot parse address: {}", addr)}};
-                p_->probe_now(&ep);
-                return json{{"ok", true}, {"addr", ep.address().to_string()}, {"port", ep.port()}};
+                p_->send_unicast(q, ep);
+                return json{{"ok", true}, {"addr", addr_text(ep.address())}, {"port", ep.port()}};
             }
-            json discovered()
-            {
-                json out = json::array();
-                std::lock_guard<std::mutex> lk(p_->mx);
-                for (auto &[id, ps] : p_->discovered)
-                    out.push_back({{"client_id", id}, {"name", ps.name}, {"addr", ps.addr},
-                                   {"port", ps.port}, {"rx_port", ps.rx_port},
-                                   {"last_seen", ps.last_seen}, {"pairing", ps.pairing_open}});
-                return out;
-            }
+            json discovered() { return p_->presence_json(); }
             void log(const std::string &level, const std::string &msg) { p_->log(level, msg); }
             void emit(const json &ev) { p_->emit(ev); }
 
         private:
             std::shared_ptr<impl> p_;
         };
-    } // namespace flowlink
 
-    // ===== end of FlowLink =======================================================
-
-    // =========================================================================
-    //  link — the /link command's bridge to a FlowLink service.
-    //
-    //  The peer network (UDP discovery, pairing codes, end-to-end encrypted
-    //  messaging) is a HOST service: it needs its own io_context, sockets and
-    //  session state, and it must be mountable independently of the agent (the
-    //  desktop shell mounts it beside — not inside — the webview service). The
-    //  core therefore owns only the command: it parses /link, formats the answer
-    //  and hands the operation to whoever provides the service. With no provider
-    //  installed (the standalone CLI) /link says where the service lives instead
-    //  of pretending.
-    // =========================================================================
-    namespace link
-    {
-        // =====================================================================
-        //  FlowLink, mounted by the core.
+        // =========================================================================
+        //  host — the one mounted service, its settings, and the /link surface.
         //
-        //  One service per process. The CLI mounts it from `/link on`, the
-        //  desktop shell from its settings page — same object, same calls, same
-        //  protocol. Nothing exists (no thread, no socket, no allocation) until
-        //  enable() runs, and stop() joins everything again.
-        // =====================================================================
+        //  This used to be `namespace link`: a second copy of the settings
+        //  helpers and a command parser that had to be kept in step with the
+        //  protocol by hand. Merged here, the command names, the JSON shapes and
+        //  the wire protocol are one file region and one owner.
+        // =========================================================================
+
+        // How THIS frontend mounts the service (it owns on_call/on_cli, and only
+        // it knows its workspaces). Unset = /link on cannot mount here.
         struct mount_options
         {
             std::filesystem::path root;
             std::string name;
-            std::uint16_t port = 47822;
-            std::uint16_t discovery = 47821;
+            std::uint16_t port = kDefaultPort;
+            std::uint16_t discovery = kDefaultMdnsPort;
             bool announce = true;
             bool accept_remote = false;
             std::vector<std::string> extra_targets;
-            // where events (mail arrived, peer online, paired) go; a frontend
-            // wires this to its own event stream
+            // where events (mail arrived, peer online, paired) go
             std::function<void(const nlohmann::json &)> on_event;
             // fs.* / tw.* from a paired peer: only the frontend knows its
-            // workspaces, so it answers these (see serve_files / serve_teamwork)
+            // workspaces, so it answers these
             std::function<nlohmann::json(const std::string &, const nlohmann::json &, std::string &)> on_call;
+            // cli.exec: run one console line for a remote /link attach
+            std::function<bool(const std::string &, const output_fn &, std::string &)> on_cli;
         };
 
         // The one service slot. An atomic shared_ptr gives readers a
         // lock-free load (service() is called on every status/UI refresh) and
         // still keeps the object alive while a caller is using it.
-        inline std::atomic<std::shared_ptr<flowlink::service>> &slot()
+        inline std::atomic<std::shared_ptr<service>> &slot()
         {
-            static std::atomic<std::shared_ptr<flowlink::service>> s;
+            static std::atomic<std::shared_ptr<service>> s;
             return s;
         }
-        inline std::shared_ptr<flowlink::service> service()
+        inline std::shared_ptr<service> service_instance()
         {
             return slot().load(std::memory_order_acquire);
         }
         inline bool running()
         {
-            auto s = service();
+            auto s = service_instance();
             return s && s->running();
         }
 
         // mount (or re-mount) the service; "" on success
         inline bool enable(const mount_options &o, std::string &err)
         {
-            flowlink::service::options fo;
+            service::options fo;
             fo.root = o.root.empty() ? root : o.root;
             fo.name = o.name;
             fo.port = o.port;
-            fo.discovery_port = o.discovery;
+            fo.mdns_port = o.discovery;
             fo.announce = o.announce;
             fo.accept_remote = o.accept_remote;
             fo.extra_targets = o.extra_targets;
             fo.on_event = o.on_event;
             fo.on_call = o.on_call;
+            fo.on_cli = o.on_cli;
             fo.on_log = [](const std::string &level, const std::string &msg)
             {
                 if (level == "warn")
@@ -12697,7 +13376,7 @@ namespace cell
                 else
                     sys::logger::instance().info("flowlink", msg);
             };
-            auto svc = std::make_shared<flowlink::service>(std::move(fo));
+            auto svc = std::make_shared<service>(std::move(fo));
             if (!svc->start(err))
                 return false;
             // exchange keeps the previous service alive until we stop it, so a
@@ -12714,13 +13393,26 @@ namespace cell
                 old->stop();
         }
 
+        inline std::function<bool(std::string &)> &mount_hook()
+        {
+            static std::function<bool(std::string &)> fn;
+            return fn;
+        }
+        // ...and how it remembers that the service is off (each frontend keeps
+        // its own settings: config.json for the CLI, the same file for the shell)
+        inline std::function<void()> &unmount_hook()
+        {
+            static std::function<void()> fn;
+            return fn;
+        }
+
         // ---- settings: .cell/links/links.json -------------------------------
         // FlowLink's own settings, links and workspace list live with the
         // feature (not in the agent's config.json). These helpers work whether
         // or not the service is running, so the UI can edit them while off.
-        inline flowlink::store store_for(const std::filesystem::path &root_dir = {})
+        inline store store_for(const std::filesystem::path &root_dir = {})
         {
-            return flowlink::store{root_dir.empty() ? root : root_dir};
+            return store{root_dir.empty() ? root : root_dir};
         }
         inline nlohmann::json settings(const std::filesystem::path &root_dir = {})
         {
@@ -12741,7 +13433,7 @@ namespace cell
         inline nlohmann::json identity(const std::filesystem::path &root_dir = {})
         {
             auto st = store_for(root_dir);
-            return st.identity(flowlink::default_name());
+            return st.identity(default_name());
         }
         inline nlohmann::json links(const std::filesystem::path &root_dir = {})
         {
@@ -12816,46 +13508,32 @@ namespace cell
                 patch["accept"] = *v;
             if (auto v = take("link_workspace"); v && v->is_string())
                 patch["workspace"] = *v;
-            patch["version"] = 2;
+            patch["version"] = 3;
             auto merged = st.get_links();
             for (auto it = patch.begin(); it != patch.end(); ++it)
                 merged[it.key()] = *it;
             (void)st.save_links(merged);
         }
 
-        // How THIS frontend mounts the service (it owns on_call, and only it
-        // knows its workspaces). Unset = /link on cannot mount here.
-        inline std::function<bool(std::string &)> &mount_hook()
-        {
-            static std::function<bool(std::string &)> fn;
-            return fn;
-        }
-        // ...and how it remembers that the service is off (each frontend keeps
-        // its own settings: config.json for the CLI, the same file for the shell)
-        inline std::function<void()> &unmount_hook()
-        {
-            static std::function<void()> fn;
-            return fn;
-        }
-
         inline nlohmann::json status()
         {
-            auto svc = service();
+            auto svc = service_instance();
             if (!svc)
                 return {{"enabled", false},
                         {"client_id", ""},
                         {"name", ""},
                         {"port", 0},
                         {"port_preferred", 0},
-                        {"rx_port", 0},
-                        {"discovery_port", 0},
+                        {"discovery_port", kDefaultMdnsPort},
                         {"discovery_bound", 0},
                         {"discovery_state", "off"},
+                        {"mdns", nlohmann::json{{"on", false}, {"state", "off"},
+                                                {"addresses", nlohmann::json::array()}}},
+                        {"addresses", nlohmann::json::array()},
                         {"announce", false},
-                        {"interfaces", nlohmann::json::array()},
-                        {"targets", nlohmann::json::array()},
                         {"hints", nlohmann::json::array()},
                         {"peers", nlohmann::json::array()},
+                        {"discovered", nlohmann::json::array()},
                         {"transmissions", {{"unread", 0}, {"total", 0}}}};
             try
             {
@@ -13098,13 +13776,43 @@ namespace cell
                 r["ok"] = true;
                 return r;
             }
-            auto svc = service();
+            auto svc = service_instance();
             if (!svc || !svc->running())
                 return {{"ok", false}, {"error", "FlowLink is off — enable it with /link on"}};
             try
             {
                 if (name == "peers")
                     return {{"ok", true}, {"peers", svc->peers()}, {"discovered", svc->discovered()}};
+                if (name == "scan")
+                {
+                    // answers are asynchronous: a peer that booted at the same
+                    // moment needs its own announce burst before it can answer.
+                    // Three rounds cover a cold start on both sides.
+                    for (int i = 0; i < 3; i++)
+                    {
+                        svc->scan();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(420));
+                    }
+                    return {{"ok", true}, {"devices", svc->discovered()}, {"peers", svc->peers()}};
+                }
+                if (name == "discovery")
+                {
+                    const bool on = args.contains("on") && args["on"].is_boolean() ? args["on"].get<bool>() : true;
+                    std::string err;
+                    if (!svc->set_discovery(on, err))
+                        return {{"ok", false}, {"error", err}};
+                    nlohmann::json r = status();
+                    r["ok"] = true;
+                    return r;
+                }
+                if (name == "publish")
+                {
+                    svc->publish_workspaces(args.contains("workspaces") ? args["workspaces"]
+                                                                       : nlohmann::json::array());
+                    return {{"ok", true}};
+                }
+                if (name == "ws.remote")
+                    return {{"ok", true}, {"workspaces", svc->remote_workspaces(args.value("cell", ""))}};
                 if (name == "pair")
                 {
                     nlohmann::json r = svc->pair_begin(args.value("ttl", 0));
@@ -13125,7 +13833,7 @@ namespace cell
                 if (name == "cancel")
                     return svc->pair_cancel();
                 if (name == "probe")
-                    return svc->probe();
+                    return svc->probe(args.value("addr", ""));
                 if (name == "forget")
                 {
                     std::string err;
@@ -13214,8 +13922,8 @@ namespace cell
                 }
                 if (name == "call")
                 {
-                    // raw rpc to a paired cell (fs.*, tw.*, or anything a peer
-                    // registers) — used by the fl tool and by tests
+                    // raw rpc to a paired cell (fs.*, tw.*, cli.*, or anything a
+                    // peer registers) — used by the fl tool and by tests
                     std::string err;
                     nlohmann::json r = svc->call(args.value("cell", ""), args.value("method", ""),
                                                  args.contains("params") ? args["params"] : nlohmann::json::object(),
@@ -13235,7 +13943,7 @@ namespace cell
         // "cell" may be a client_id or a display name (first match wins)
         inline std::string resolve_cell(const std::string &ref)
         {
-            auto svc = service();
+            auto svc = service_instance();
             if (!svc)
                 return {};
             const std::string want = text::trim(ref);
@@ -13314,7 +14022,7 @@ namespace cell
             if (sub == "join")
             {
                 if (toks.size() < 3)
-                    return fail("usage: /link join CODE [IP[:PORT]]");
+                    return fail("usage: /link join CODE [ADDR]");
                 args["code"] = toks[2];
                 if (toks.size() > 3)
                     args["addr"] = toks[3];
@@ -13333,23 +14041,35 @@ namespace cell
                 args["cell"] = resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2]);
                 args["body"] = rest(3);
             }
-            else if (sub == "read" || sub == "forget")
+            else if (sub == "read" || sub == "forget" || sub == "disconnect" || sub == "ws.remote")
             {
                 if (toks.size() < 3)
                     return fail("usage: /link " + sub + " ID");
-                args[sub == "read" ? "id" : "client_id"] = sub == "forget" ? (resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2])) : toks[2];
+                args[sub == "read" ? "id" : "client_id"] =
+                    (sub == "read") ? toks[2]
+                                    : (resolve_cell(toks[2]).empty() ? toks[2] : resolve_cell(toks[2]));
             }
             else if (sub == "pair")
             {
                 if (toks.size() > 2)
                     args["ttl"] = std::atoi(toks[2].c_str());
             }
-            else if (sub != "status" && sub != "on" && sub != "off" && sub != "peers" &&
-                     sub != "cancel" && sub != "inbox" && sub != "transfers" && sub != "probe")
+            else if (sub == "discovery")
             {
-                line("usage: /link [status|on|off|peers|pair [TTL]|join CODE [ADDR]|");
-                line("             cancel|share CELL [SID]|send CELL TEXT|transfers|read ID|");
-                line("             forget CELL|probe]");
+                args["on"] = !(toks.size() > 2 && (toks[2] == "off" || toks[2] == "stop"));
+            }
+            else if (sub == "probe" && toks.size() > 2)
+            {
+                args["addr"] = toks[2];
+            }
+            else if (sub != "status" && sub != "on" && sub != "off" && sub != "peers" &&
+                     sub != "scan" && sub != "cancel" && sub != "inbox" && sub != "transfers" &&
+                     sub != "probe")
+            {
+                line("usage: /link [status|on|off|peers|scan|discovery on|off|");
+                line("             pair [TTL]|join CODE [ADDR]|cancel|attach CELL|detach|");
+                line("             share CELL [SID]|send CELL TEXT|transfers|read ID|");
+                line("             forget CELL|disconnect CELL|probe [ADDR]]");
                 return out;
             }
 
@@ -13363,31 +14083,39 @@ namespace cell
                 line(std::format("FlowLink: {}", on ? "on" : "off"));
                 if (!on)
                 {
-                    line("  mount it with /link on (settings live in config.json)");
+                    line("  mount it with /link on (settings live in .cell/links/links.json)");
                     return out;
                 }
-                line(std::format("  id    {}", r.value("client_id", "")));
-                line(std::format("  name  {}  transport {}  discovery {}",
-                                 r.value("name", ""), r.value("port", 0), r.value("discovery_port", 0)));
+                line(std::format("  id     {}", r.value("client_id", "")));
+                line(std::format("  name   {}  transport {}  mdns {}", r.value("name", ""),
+                                 r.value("port", 0), r.value("discovery_port", 0)));
+                const nlohmann::json mdns = r.contains("mdns") ? r["mdns"] : nlohmann::json::object();
+                line(std::format("  mdns   {}  ({} instance)", mdns.value("state", "off"),
+                                 mdns.value("instance", "")));
                 const nlohmann::json pair = r.contains("pairing") ? r["pairing"] : nlohmann::json::object();
                 if (pair.value("open", false))
                 {
                     const long long left = pair.value("expires", (long long)0) - (long long)std::time(nullptr);
                     line(std::format("  pairing window open, {}s left", left > 0 ? left : 0));
-                    line(std::format("  code  {}", pair.value("code", "")));
+                    line(std::format("  code   {}", pair.value("code", "")));
                 }
                 else if (pair.value("state", "") == "paired")
                 {
                     line(std::format("  pairing: paired with {}", pair.value("peer", "")));
                 }
                 const nlohmann::json peers = r.contains("peers") ? r["peers"] : nlohmann::json::array();
-                int online = 0;
+                int online = 0, present = 0;
                 for (const auto &p : peers)
+                {
                     if (p.value("online", false))
                         online++;
+                    if (p.value("present", false))
+                        present++;
+                }
                 const nlohmann::json inbox = r.contains("transmissions") ? r["transmissions"] : nlohmann::json::object();
-                line(std::format("  peers {} ({} online)   transfers {} unread / {}",
-                                 peers.size(), online, inbox.value("unread", 0), inbox.value("total", 0)));
+                line(std::format("  peers  {} ({} online, {} present)   transfers {} unread / {}",
+                                 peers.size(), online, present,
+                                 inbox.value("unread", 0), inbox.value("total", 0)));
                 return out;
             }
             if (sub == "peers")
@@ -13399,14 +14127,58 @@ namespace cell
                     return out;
                 }
                 for (const auto &p : peers)
-                    line(std::format("  {}{}  {}{}  {}{}", p.value("name", ""),
-                                     p.value("online", false) ? "" : " (offline)",
-                                     p.value("client_id", ""),
-                                     p.value("paired", false) ? "" : "  [unpaired]",
-                                     p.value("addr", ""),
-                                     p.value("port", 0) ? ":" + std::to_string(p.value("port", 0)) : ""));
+                {
+                    std::string addr = p.value("addr", "");
+                    for (const auto &a : p.value("addrs", nlohmann::json::array()))
+                        if (a.is_string() && a.get<std::string>().find(':') != std::string::npos)
+                        {
+                            addr = a.get<std::string>(); // prefer a v6 address when there is one
+                            break;
+                        }
+                    const std::string state = p.value("online", false) ? "online"
+                                              : p.value("present", false) ? "present"
+                                                                          : "offline";
+                    line(std::format("  {} [{}]{}{}  {}{}  {}", p.value("name", ""), state,
+                                     p.value("paired", false) ? "" : " [unpaired]",
+                                     p.value("pairing", false) ? " [pairing]" : "",
+                                     addr,
+                                     p.value("port", 0) ? ":" + std::to_string(p.value("port", 0)) : "",
+                                     p.value("client_id", "")));
+                }
                 return out;
             }
+            if (sub == "scan")
+            {
+                const nlohmann::json devs = r.contains("devices") ? r["devices"] : nlohmann::json::array();
+                if (devs.empty())
+                {
+                    line("no cell answered the browse — check /link discovery, or /link probe ADDR");
+                    return out;
+                }
+                for (const auto &d : devs)
+                {
+                    const nlohmann::json addrs = d.value("addrs", nlohmann::json::array());
+                    std::string addr;
+                    for (const auto &a : addrs)
+                        if (a.is_string() && a.get<std::string>().find(':') != std::string::npos)
+                        {
+                            addr = a.get<std::string>(); // prefer a v6 address
+                            break;
+                        }
+                    if (addr.empty() && !addrs.empty() && addrs[0].is_string())
+                        addr = addrs[0].get<std::string>();
+                    line(std::format("  {}  {}{}{}  {}  {}", d.value("name", ""), addr,
+                                     d.value("port", 0) ? ":" + std::to_string(d.value("port", 0)) : "",
+                                     d.value("pairing", false) ? "  [pairing]" : "",
+                                     d.value("os", ""), d.value("client_id", "")));
+                }
+                return out;
+            }
+            if (sub == "discovery")
+                return line(r.value("mdns", nlohmann::json::object()).value("on", false)
+                                ? "discovery on — announcing and browsing"
+                                : "discovery off — no announcements, no browsing"),
+                       out;
             if (sub == "pair")
             {
                 const int ttl = args.value("ttl", 0) > 0 ? args.value("ttl", 0) : 300;
@@ -13430,9 +14202,10 @@ namespace cell
                 line("probe sent — /link peers in a second");
                 return out;
             }
-            if (sub == "forget")
+            if (sub == "forget" || sub == "disconnect")
             {
-                line(std::format("forgotten {} (link key deleted)", toks.size() > 2 ? toks[2] : ""));
+                line(std::format("{} {}", sub == "forget" ? "forgotten" : "disconnected",
+                                 toks.size() > 2 ? toks[2] : ""));
                 return out;
             }
             if (sub == "share")
@@ -13457,7 +14230,7 @@ namespace cell
                 for (const auto &m : items)
                     line(std::format("  {}  {}{}  from {}  {}  {}B", m.value("id", ""), m.value("subject", ""),
                                      m.value("read", false) ? "" : " [unread]", m.value("from_name", ""),
-                                     flowlink::now_iso(m.value("created", (long long)0)),
+                                     now_iso(m.value("created", (long long)0)),
                                      m.value("bytes", (long long)0)));
                 line("read one with /link read ID");
                 return out;
@@ -13503,7 +14276,8 @@ namespace cell
                 toks.push_back(cur);
             return toks;
         }
-    } // namespace link
+    } // namespace flowlink
+
 
     // =========================================================================
     //  tools — the tool abstraction: execution policy (Deny / Ask / Allow), the
@@ -23170,18 +23944,22 @@ static void print_help()
     cell::sys::println("  /notices seen [list]        list the accumulated notice audit trail (seen.jsonl)");
     cell::sys::println("  /notices seen clear         archive seen.jsonl to saved/notice-<UTC time>.jsonl and empty it");
     cell::sys::println("  /notices seen rm ID         delete one accumulated notice by id");
-    cell::sys::println("  /link                       FlowLink status: identity, pairing window, peers, transfers");
-    cell::sys::println("  /link on | off              mount / unmount the FlowLink service (desktop shell only)");
+    cell::sys::println("  /link                       FlowLink status: mDNS state, pairing window, peers, transfers");
+    cell::sys::println("  /link on | off              mount / unmount the FlowLink service");
     cell::sys::println("  /link peers                 list the cells on this network (paired and discovered)");
+    cell::sys::println("  /link scan                  send one mDNS browse and list the answers");
+    cell::sys::println("  /link discovery on | off    start / stop announcing and browsing (service stays up)");
     cell::sys::println("  /link pair [TTL]            open a pairing window and print the 512-bit code");
-    cell::sys::println("  /link join CODE [IP[:PORT]] pair with the cell that shows CODE (address optional)");
+    cell::sys::println("  /link join CODE [ADDR]      pair with the cell that shows CODE (address optional)");
     cell::sys::println("  /link cancel                close the pairing window");
+    cell::sys::println("  /link attach CELL           run every following line on that cell (remote console)");
+    cell::sys::println("  /link detach                come back to the local console");
     cell::sys::println("  /link share CELL [SID]      send a session's conversation to a paired cell");
     cell::sys::println("  /link send CELL TEXT...     send a short message to a paired cell");
     cell::sys::println("  /link transfers             list received transfers (shared / archived sessions)");
     cell::sys::println("  /link read ID               read one transfer");
     cell::sys::println("  /link forget CELL           drop a pairing (deletes the stored link key)");
-    cell::sys::println("  /link probe                 broadcast a discovery probe");
+    cell::sys::println("  /link probe [ADDR]          send one mDNS query (unicast when ADDR is given)");
     cell::sys::println("  /save                       save the current session");
     cell::sys::println("  /tasks                      list background tasks (processes started by exec with background=true)");
     cell::sys::println("  /tasks show ID              print the captured output tail of a background task");
@@ -27657,6 +28435,177 @@ static int run_selftest()
         R.expect(present == 32, "async_io::flush leaves every queued write on disk");
     }
 
+    // ---- FlowLink: DNS wire format + discovery names ----------------------
+    {
+        namespace fl = cell::flowlink;
+        namespace dn = cell::flowlink::dns;
+
+        // name codec: labels, root, trailing dot
+        {
+            std::string wire;
+            R.expect(dn::put_name(wire, "_cell._tcp.local"),
+                     "dns: name encodes");
+            R.expect(wire.size() == 18 && (unsigned char)wire[0] == 5 && wire.substr(1, 5) == "_cell",
+                     "dns: name wire layout");
+            std::size_t at = 0;
+            std::string back;
+            R.expect(dn::read_name(wire, at, back) && back == "_cell._tcp.local" && at == wire.size(),
+                     "dns: name round-trips");
+            std::string rootwire = "\x00";
+            std::size_t zero = 0;
+            std::string root;
+            R.expect(!dn::read_name(rootwire, zero, root) && root.empty(),
+                     "dns: the root name decodes to empty");
+        }
+
+        // compression: the service name first, then "x.<ptr back to offset 0>"
+        {
+            std::string packet;
+            dn::put_name(packet, "_cell._tcp.local");
+            const std::size_t svc_len = packet.size();
+            packet += std::string("\x01x\xc0\x00", 4); // label "x" + pointer to offset 0
+            std::size_t at = svc_len;
+            std::string decoded;
+            R.expect(dn::read_name(packet, at, decoded) && decoded == "x._cell._tcp.local",
+                     "dns: compression pointer decodes");
+            R.expect(at == svc_len + 4, "dns: the cursor advances past the pointer, not behind it");
+            // a forward pointer must be refused (it would loop or read garbage)
+            std::string bad = "\xc0\x02\x00";
+            std::size_t bat = 0;
+            std::string junk;
+            R.expect(!dn::read_name(bad, bat, junk), "dns: forward pointer is refused");
+        }
+
+        // query + response round-trip through the parser
+        {
+            const auto q = dn::query(0, fl::kServiceType, dn::t_ptr);
+            dn::message m;
+            R.expect(!q.empty() && dn::parse(q, m), "dns: query parses");
+            R.expect(!m.is_response() && m.qs.size() == 1 && m.qs[0].type == dn::t_ptr &&
+                         dn::name_is(m.qs[0].name, fl::kServiceType),
+                     "dns: query carries the service question");
+
+            std::vector<dn::rr> recs;
+            dn::rr ptr;
+            ptr.name = std::string(fl::kServiceType);
+            ptr.type = dn::t_ptr;
+            ptr.ttl = 120;
+            ptr.target = "box-0123456789abcdef._cell._tcp.local";
+            recs.push_back(ptr);
+            dn::rr srv;
+            srv.name = ptr.target;
+            srv.type = dn::t_srv;
+            srv.cls = (std::uint16_t)(dn::c_in | 0x8000);
+            srv.ttl = 120;
+            srv.port = 47822;
+            srv.target = "cell-01234567.local";
+            recs.push_back(srv);
+            dn::rr txt;
+            txt.name = ptr.target;
+            txt.type = dn::t_txt;
+            txt.cls = (std::uint16_t)(dn::c_in | 0x8000);
+            txt.ttl = 120;
+            txt.txt = {"id=0123456789abcdef0123456789abcdef", "name=box", "acc=0"};
+            recs.push_back(txt);
+            dn::rr a;
+            a.name = srv.target;
+            a.type = dn::t_a;
+            a.ttl = 120;
+            a.addr = "192.168.1.7";
+            recs.push_back(a);
+            dn::rr aaaa;
+            aaaa.name = srv.target;
+            aaaa.type = dn::t_aaaa;
+            aaaa.ttl = 120;
+            aaaa.addr = "fe80::1";
+            recs.push_back(aaaa);
+
+            const auto rsp = dn::response(0, recs);
+            dn::message parsed;
+            R.expect(!rsp.empty() && dn::parse(rsp, parsed), "dns: response parses");
+            R.expect(parsed.is_response() && parsed.an.size() == 5, "dns: every record survives the round-trip");
+            R.expect(parsed.an[0].type == dn::t_ptr && parsed.an[0].target == ptr.target, "dns: PTR target");
+            R.expect(parsed.an[1].type == dn::t_srv && parsed.an[1].port == 47822 &&
+                         parsed.an[1].target == "cell-01234567.local",
+                     "dns: SRV port + target");
+            R.expect(parsed.an[2].type == dn::t_txt && parsed.an[2].txt.size() == 3 &&
+                         parsed.an[2].txt[0] == "id=0123456789abcdef0123456789abcdef",
+                     "dns: TXT chunks");
+            R.expect(parsed.an[3].type == dn::t_a && parsed.an[3].addr == "192.168.1.7", "dns: A rdata");
+            R.expect(parsed.an[4].type == dn::t_aaaa && parsed.an[4].addr == "fe80::1", "dns: AAAA rdata");
+            // the unique-record cache-flush bit is preserved on the class field
+            R.expect((parsed.an[1].cls & 0x8000) != 0 && (parsed.an[1].cls & 0x7fff) == dn::c_in,
+                     "dns: cache-flush bit survives");
+            // a goodbye (TTL 0) is just a normal record
+            std::vector<dn::rr> bye{ptr};
+            bye[0].ttl = 0;
+            dn::message gone;
+            R.expect(dn::parse(dn::response(0, bye), gone) && gone.an.size() == 1 && gone.an[0].ttl == 0,
+                     "dns: goodbye carries TTL 0");
+        }
+
+        // truncated / hostile input never parses into a partial message
+        {
+            const auto q = dn::query(0, fl::kServiceType, dn::t_ptr);
+            for (std::size_t cut : {std::size_t(1), std::size_t(11), q.size() / 2, q.size() - 1})
+            {
+                dn::message m;
+                R.expect(!dn::parse(q.substr(0, cut), m), "dns: truncated message is refused");
+            }
+            dn::message m;
+            R.expect(!dn::parse(std::string(8, '\xff'), m), "dns: short buffer is refused");
+        }
+
+        // name helpers
+        R.expect(dn::name_is("_CELL._tcp.local.", "_cell._tcp.local"), "dns: names compare case-insensitively");
+        R.expect(dn::name_ends_with("box-1234._cell._tcp.local", fl::kServiceType),
+                 "dns: instance names end with the service type");
+        R.expect(!dn::name_ends_with("box-1234._other._tcp.local", fl::kServiceType),
+                 "dns: a different service type does not match");
+
+        // instance labels are DNS-safe and unique per client id
+        R.expect(fl::instance_label("My Box!", "0123456789abcdef") == "My-Box-01234567",
+                 "flowlink: instance label is DNS-safe and carries the id prefix");
+        R.expect(fl::instance_label("", "0123456789abcdef") == "cell-01234567",
+                 "flowlink: an empty name still yields a usable instance");
+        R.expect(fl::instance_label("a.b.c", "0123456789abcdef") == "a-b-c-01234567",
+                 "flowlink: dots in the name do not split the label");
+
+        // endpoint parsing: v4, v4:port, [v6]:port, bare v6
+        {
+            cell::flowlink::udp::endpoint ep;
+            R.expect(fl::parse_endpoint("192.168.1.9", 5353, ep) && ep.port() == 5353 &&
+                         ep.address().to_string() == "192.168.1.9",
+                     "flowlink: bare v4 endpoint");
+            R.expect(fl::parse_endpoint("192.168.1.9:47822", 5353, ep) && ep.port() == 47822,
+                     "flowlink: v4 endpoint with port");
+            R.expect(fl::parse_endpoint("[fe80::1%12]:47822", 5353, ep) && ep.port() == 47822 &&
+                         ep.address().is_v6(),
+                     "flowlink: scoped v6 endpoint with port");
+            R.expect(fl::parse_endpoint("fe80::1", 5353, ep) && ep.port() == 5353 && ep.address().is_v6(),
+                     "flowlink: bare v6 endpoint keeps the default port");
+            R.expect(!fl::parse_endpoint("", 5353, ep), "flowlink: an empty endpoint is refused");
+            R.expect(!fl::parse_endpoint("nonsense", 5353, ep), "flowlink: a malformed endpoint is refused");
+        }
+
+        // presence / workspace cache round-trip through the real store
+        {
+            const auto dir = cell::root / "flowlink-selftest";
+            std::error_code sec;
+            std::filesystem::remove_all(dir, sec);
+            cell::flowlink::store st(dir);
+            const std::string id = "00112233445566778899aabbccddeeff";
+            nlohmann::json list = nlohmann::json::array(
+                {{{"ws", "w1"}, {"cwd", "/tmp/a"}}, {{"ws", "w2"}, {"cwd", "/tmp/b"}}});
+            R.expect(st.save_peer_workspaces(id, list, 1234), "flowlink: peer workspace list is cached");
+            long long updated = 0;
+            const auto back = st.load_peer_workspaces(id, &updated);
+            R.expect(back == list && updated == 1234, "flowlink: peer workspace list round-trips");
+            R.expect(!st.save_peer_workspaces("bad-id", list, 1), "flowlink: a bad client id is refused");
+            std::filesystem::remove_all(dir, sec);
+        }
+    }
+
     R.print_summary();
     return R.exit_code();
 }
@@ -29634,18 +30583,29 @@ int repl::run()
     // come from the working directory, remote teamwork runs through the same
     // runner the REPL drives, and events print on the console. `/link on` uses
     // exactly this hook, so the CLI has the full feature set — no shell needed.
-    cell::link::mount_hook() = [&cfg, &h, &eng](std::string &err) -> bool
+    //
+    // The remote console (/link attach) needs the slash dispatcher, which is
+    // built further down: the hook is filled in once that table exists. A peer
+    // that connects in the millisecond before it does gets a clear error instead
+    // of a silent hang.
+    std::function<bool(const std::string &, const cell::flowlink::output_fn &, std::string &)> remote_cli;
+    // /link attach state: while `attach_peer` is set, every line this console
+    // reads is executed on that cell and its output is streamed back under
+    // `attach_rid`. Empty = local prompt.
+    std::string attach_peer;
+    std::string attach_rid;
+    cell::flowlink::mount_hook() = [&cfg, &h, &eng, &remote_cli, &attach_rid](std::string &err) -> bool
     {
         // settings come from .cell/links/links.json, not from config.json
-        const nlohmann::json fl = cell::link::settings();
-        cell::link::mount_options o;
+        const nlohmann::json fl = cell::flowlink::settings();
+        cell::flowlink::mount_options o;
         o.root = cell::root;
         o.name = fl.value("name", "");
         o.port = (std::uint16_t)std::clamp(fl.value("port", 47822), 0, 65535);
-        o.discovery = (std::uint16_t)std::clamp(fl.value("discovery", 47821), 0, 65535);
+        o.discovery = (std::uint16_t)std::clamp(fl.value("discovery", 5353), 0, 65535);
         o.announce = fl.value("announce", true);
         o.accept_remote = fl.value("accept", false);
-        o.on_event = [](const nlohmann::json &ev)
+        o.on_event = [&attach_rid](const nlohmann::json &ev)
         {
             const std::string type = ev.value("type", "");
             if (type == "mail")
@@ -29654,10 +30614,20 @@ int repl::run()
                 cell::sys::println("flowlink: paired with {}", ev.value("name", ""));
             else if (type == "discovered")
                 cell::sys::println("flowlink: found {} ({})", ev.value("name", ""), ev.value("client_id", ""));
+            else if (type == "peer_event")
+            {
+                const std::string method = ev.value("method", "");
+                const nlohmann::json p = ev.contains("params") ? ev["params"] : nlohmann::json::object();
+                // streamed output of a remote console line: write it as it
+                // arrives, no added newline (the peer already formatted it)
+                if (method == "cli.out" && !attach_rid.empty() &&
+                    p.value("rid", "") == attach_rid)
+                    cell::sys::print("{}", p.value("text", ""));
+            }
         };
         o.on_call = [&cfg, &h, &eng](const std::string &method, const nlohmann::json &p, std::string &e) -> nlohmann::json
         {
-            const nlohmann::json fls = cell::link::settings();
+            const nlohmann::json fls = cell::flowlink::settings();
             if (!fls.value("accept", false))
             {
                 e = "this cell does not accept remote work (FlowLink settings)";
@@ -29667,7 +30637,7 @@ int repl::run()
             const std::filesystem::path base = ws_dir.empty() ? cell::workdir()
                                                               : std::filesystem::path(ws_dir);
             if (method == "fs.ls" || method == "fs.read" || method == "fs.stat")
-                return cell::link::serve_files(base, method, p, e);
+                return cell::flowlink::serve_files(base, method, p, e);
             if (method == "tw.new" || method == "tw.run")
             {
                 // a remote job runs in THIS session's teamwork store, so its
@@ -29702,20 +30672,39 @@ int repl::run()
             e = "unknown method: " + method;
             return nlohmann::json{};
         };
-        if (!cell::link::enable(o, err))
+        o.on_cli = [&remote_cli](const std::string &line, const cell::flowlink::output_fn &sink,
+                                 std::string &e) -> bool
+        {
+            if (!remote_cli)
+            {
+                e = "this cell is still starting up: try again in a moment";
+                return false;
+            }
+            return remote_cli(line, sink, e);
+        };
+        if (!cell::flowlink::enable(o, err))
             return false;
-        cell::link::set_enabled(true);
+        cell::flowlink::set_enabled(true);
+        // this console is one workspace; publish it so a peer's picker can
+        // offer it (and so /link attach on the other side has a target)
+        if (auto svc = cell::flowlink::service_instance())
+            svc->publish_workspaces(nlohmann::json::array(
+                {{{"ws", "console"},
+                  {"cwd", cell::workdir().string()},
+                  {"session", h.now().id()},
+                  {"busy", false},
+                  {"active", true}}}));
         return true;
     };
-    cell::link::unmount_hook() = []
+    cell::flowlink::unmount_hook() = []
     {
-        cell::link::set_enabled(false);
+        cell::flowlink::set_enabled(false);
     };
-    cell::link::migrate_legacy_settings();
-    if (cell::link::settings().value("enabled", false))
+    cell::flowlink::migrate_legacy_settings();
+    if (cell::flowlink::settings().value("enabled", false))
     {
         std::string err;
-        if (!cell::link::mount_hook()(err))
+        if (!cell::flowlink::mount_hook()(err))
         {
             log.warn("flowlink", "could not mount: " + err);
             cell::sys::warn("flowlink: could not start: {}", err);
@@ -30131,6 +31120,9 @@ int repl::run()
                                      cell::async_io::flush(); // persist queued writes before terminating
                                  });
         bool running = true;
+        // set while a remote console line (cli.exec) is being executed: a turn
+        // must not end the local loop when /link attach drives a headless cell
+        bool serving_remote = false;
         // One agent turn, driven through the engine runner. The terminal
         // presentation lives in the `ev` callbacks above; drive_turn only resets
         // the per-turn display state, shows the prompt and forwards the call.
@@ -30145,7 +31137,7 @@ int repl::run()
             cell::sys::print("reply> ");
             eng.run_turn(input, resume_turn, ev);
             clear_stream_line(); // a failed transfer may leave the ticker open
-            if (!interactive)
+            if (!interactive && !serving_remote)
                 running = false;
         };
         // ---- slash-command table ------------------------------------------------
@@ -30156,6 +31148,35 @@ int repl::run()
         {
             handled,
             exit,
+        };
+        // One line for the attached cell: the peer runs it in its own session and
+        // streams the output back (peer_event cli.out). The result carries text
+        // only for a peer that cannot stream.
+        auto attach_send = [&](const std::string &line)
+        {
+            auto svc = cell::flowlink::service_instance();
+            if (!svc || !svc->running())
+            {
+                cell::sys::error("flowlink is not running — leaving the remote console");
+                attach_peer.clear();
+                attach_rid.clear();
+                return;
+            }
+            std::string err;
+            const nlohmann::json r = svc->call(attach_peer, "cli.exec",
+                                               {{"line", line}, {"rid", attach_rid}},
+                                               600000, err);
+            if (!err.empty())
+            {
+                cell::sys::error("remote: {}", err);
+                return;
+            }
+            if (r.contains("text") && r["text"].is_string())
+            {
+                const std::string text = r["text"].get<std::string>();
+                if (!text.empty())
+                    cell::sys::print("{}", text);
+            }
         };
         using cmd_fn = std::function<cmd_flow(const std::vector<std::string> &, std::string &)>;
         const std::unordered_map<std::string, cmd_fn> commands = {
@@ -31241,10 +32262,69 @@ int repl::run()
             {"/link", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
              {
                  // /link — FlowLink：局域网里的其他 cell（发现 / 配对 / 邮箱 /
-                 // 远程工作区 / 远程工作流）。服务本体由宿主提供，核心只做命令
-                 // 解析与排版（见 cell::link::run），所以 CLI 与桌面外壳共用一套。
+                 // 远程工作区 / 远程工作流 / 远程控制台）。服务本体与命令表面
+                 // 都在 cell::flowlink 里（见 flowlink::run），所以 CLI 与桌面
+                 // 外壳共用一套。
+                 const std::string sub = toks.size() > 1 ? toks[1] : "";
+                 if (sub == "attach" || sub == "detach")
+                 {
+                     if (sub == "detach")
+                     {
+                         if (attach_peer.empty())
+                             cell::sys::println("not attached");
+                         else
+                         {
+                             cell::sys::println("detached from {}", attach_peer.substr(0, 8));
+                             attach_peer.clear();
+                             attach_rid.clear();
+                         }
+                         return cmd_flow::handled;
+                     }
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /link attach CELL   (ids come from /link peers)");
+                         return cmd_flow::handled;
+                     }
+                     if (!attach_peer.empty())
+                     {
+                         cell::sys::error("already attached to {} — /detach first", attach_peer.substr(0, 8));
+                         return cmd_flow::handled;
+                     }
+                     const std::string id = cell::flowlink::resolve_cell(toks[2]);
+                     if (id.empty())
+                     {
+                         cell::sys::error("no such cell: {} (see /link peers)", toks[2]);
+                         return cmd_flow::handled;
+                     }
+                     auto svc = cell::flowlink::service_instance();
+                     if (!svc || !svc->running())
+                     {
+                         cell::sys::error("FlowLink is off — /link on first");
+                         return cmd_flow::handled;
+                     }
+                     // wake the session now so the first typed line does not pay
+                     // for the handshake; a failure here is not fatal (the line
+                     // itself will report it)
+                     std::string why;
+                     (void)svc->call(id, "ping", nlohmann::json::object(), 8000, why);
+                     attach_peer = id;
+                     attach_rid = std::format("c-{}-{}", (long long)std::time(nullptr),
+                                              cell::flowlink::hex_encode(cell::flowlink::random_bytes(4)));
+                     const nlohmann::json peers = svc->peers();
+                     std::string peer_name = id.substr(0, 8);
+                     for (const auto &p : peers)
+                         if (p.value("client_id", "") == id)
+                             peer_name = p.value("name", peer_name);
+                     cell::sys::println("attached to {} ({}) — every line now runs on that cell; /detach returns",
+                                        peer_name, id.substr(0, 8));
+                     if (why.empty())
+                         cell::sys::println("  link is up");
+                     else
+                         cell::sys::warn("  link is not up yet: {}", why);
+                     return cmd_flow::handled;
+                 }
                  bool ok = true;
-                 std::string text = cell::link::run(toks, h.now().id(), ok);
+                 std::string text = cell::flowlink::run(toks, h.now().id(), ok);
                  if (text.empty())
                      return cmd_flow::handled;
                  if (ok)
@@ -31752,12 +32832,48 @@ int repl::run()
                  return cmd_flow::handled;
              }},
         };
+        // ---- the peer side of /link attach -----------------------------------
+        // Runs a line exactly as this console would — the same command table, the
+        // same turn runner — with console output captured and streamed back. The
+        // capture is thread-local, so this thread's output goes to the peer while
+        // every other thread keeps writing its own console.
+        struct serving_flag
+        {
+            bool &f;
+            explicit serving_flag(bool &x) : f(x) { f = true; }
+            ~serving_flag() { f = false; }
+        };
+        remote_cli = [&](const std::string &line, const cell::flowlink::output_fn &sink, std::string &) -> bool
+        {
+            cell::sys::capture_scope cap(sink);
+            std::vector<std::string> toks = cell::flowlink::tokenize(line);
+            if (toks.empty())
+                return true;
+            if (toks[0].rfind("/", 0) == 0)
+            {
+                const auto it = commands.find(toks[0]);
+                if (it == commands.end())
+                {
+                    cell::sys::error("unknown command: {} (try /help)", toks[0]);
+                    return false;
+                }
+                serving_flag guard(serving_remote);
+                std::string input = line;
+                return it->second(toks, input) != cmd_flow::exit;
+            }
+            serving_flag guard(serving_remote);
+            drive_turn(false, line);
+            return true;
+        };
         while (running)
         {
             std::string input;
             if (interactive)
             {
-                cell::plat::read_result rr = cell::plat::read_line("> ", input_history, input);
+                const std::string prompt = attach_peer.empty()
+                                               ? std::string("> ")
+                                               : "[" + attach_peer.substr(0, 8) + "]> ";
+                cell::plat::read_result rr = cell::plat::read_line(prompt, input_history, input);
                 if (rr == cell::plat::read_result::eof)
                     break;
                 if (rr == cell::plat::read_result::interrupt)
@@ -31779,6 +32895,21 @@ int repl::run()
                 input.erase(0, 3);
             if (input.empty())
                 continue;
+
+            // attached: every line belongs to the peer's console, not this one
+            if (!attach_peer.empty())
+            {
+                if (input == "/detach" || input.rfind("/detach ", 0) == 0 ||
+                    input.rfind("/link detach", 0) == 0)
+                {
+                    cell::sys::println("detached from {}", attach_peer.substr(0, 8));
+                    attach_peer.clear();
+                    attach_rid.clear();
+                    continue;
+                }
+                attach_send(input);
+                continue;
+            }
 
             if (input[0] == '/')
             {
@@ -31803,18 +32934,22 @@ int repl::run()
     {
         log.error("core", std::format("fatal: {}", e.what()));
         cell::sys::error("fatal: {}", e.what());
+        // the service holds callbacks into this frame: join its threads before
+        // the locals go away (the normal path does the same just above)
+        cell::flowlink::disable();
         return 1; // the RAII exit guard saves the session + config and cleans up curl
     }
     catch (const std::exception &e)
     {
         log.error("core", std::format("unhandled: {}", e.what()));
         cell::sys::error("unhandled exception: {}", e.what());
+        cell::flowlink::disable();
         return 1;
     }
 
     // FlowLink joins its threads before anything else is torn down: a remote
     // handler may still be reading the session or the workspace.
-    cell::link::disable();
+    cell::flowlink::disable();
     log.info("exit", std::format("uptime={:.2f}s llm_requests={} tool_calls={}",
                                  cell::sys::elapsed_ms(t_start) / 1000.0, eng.llm_requests(), eng.tool_calls()));
     return 0;

@@ -171,7 +171,10 @@ exported 5 message(s) to cell-export-20260921-065306.html
 - **libcurl** (any recent backend), **libsodium**, **nlohmann/json** (header-only).
 - **Boost.Asio** (header-only) for FlowLink — the peer network inside `cell.cpp`
   (`boost/asio.hpp`, `boost/asio/ip/multicast.hpp`). No Boost library is linked;
-  headers are enough.
+  headers are enough. Discovery is real DNS-SD over mDNS (`_cell._tcp.local`),
+  so interface addresses come from Asio's resolver and the multicast joins take
+  those addresses directly: no `winsock2.h`, no `iphlpapi.h`, no
+  `GetAdaptersAddresses`.
 - Recommended package manager: [vcpkg](https://github.com/microsoft/vcpkg)
 
 ```bash
@@ -184,12 +187,13 @@ vcpkg install curl nlohmann-json libsodium boost-asio
 # POSIX
 g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
 
-# Windows / MSYS2 (the CA-bundle export walks the system certificate store: crypt32;
-# ws2_32 is the winsock library Asio uses)
-g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32 -lws2_32 -lmswsock -lole32
+# Windows / MSYS2: crypt32 is the CA-bundle export (system certificate store);
+# ws2_32 + mswsock are what Boost.Asio itself needs on MinGW (its IOCP socket
+# layer calls AcceptEx). Nothing else: discovery no longer touches iphlpapi.
+g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32 -lws2_32 -lmswsock
 
 # MSVC
-cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib ws2_32.lib mswsock.lib ole32.lib
+cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib ws2_32.lib mswsock.lib
 ```
 
 ### Run
