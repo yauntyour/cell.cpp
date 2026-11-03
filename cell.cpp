@@ -10157,12 +10157,16 @@ namespace cell
             std::vector<peer_meta> all_meta()
             {
                 const json doc = get_links();
-                auto out = doc["links"] | std::views::transform([](const json &e)
-                                                                { return peer_meta::from_json(e); }) |
-                           std::views::filter([](const peer_meta &m)
-                                              { return is_hex_id(m.id, 32); }) |
-                           std::ranges::to<std::vector>();
-                std::ranges::sort(out, {}, &peer_meta::name);
+                std::vector<peer_meta> out;
+                out.reserve(doc["links"].size());
+                for (const auto &e : doc["links"])
+                {
+                    peer_meta m = peer_meta::from_json(e);
+                    if (is_hex_id(m.id, 32))
+                        out.push_back(std::move(m));
+                }
+                std::sort(out.begin(), out.end(), [](const peer_meta &a, const peer_meta &b)
+                          { return a.name < b.name; });
                 return out;
             }
             // drop the record AND the received files (used by "forget")
@@ -10302,11 +10306,12 @@ namespace cell
                 const json index = read_doc(transmission_file());
                 if (!index.contains("items") || !index["items"].is_array())
                     return {};
-                auto out = index["items"] | std::views::transform([](const json &e)
-                                                                  { return transmission_from_json(e); }) |
-                           std::ranges::to<std::vector>();
-                std::ranges::sort(out, {}, &transmission::created);
-                std::ranges::reverse(out);
+                std::vector<transmission> out;
+                out.reserve(index["items"].size());
+                for (const auto &e : index["items"])
+                    out.push_back(transmission_from_json(e));
+                std::sort(out.begin(), out.end(), [](const transmission &a, const transmission &b)
+                          { return a.created > b.created; });
                 return out;
             }
 

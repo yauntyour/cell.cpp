@@ -185,15 +185,15 @@ vcpkg install curl nlohmann-json libsodium boost-asio
 
 ```bash
 # POSIX
-g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
+g++ -std=c++26 -O3 -flto=auto -march=native -Wall -Wextra cell.cpp -o bin/cell -lcurl -lsodium
 
 # Windows / MSYS2: crypt32 is the CA-bundle export (system certificate store);
 # ws2_32 + mswsock are what Boost.Asio itself needs on MinGW (its IOCP socket
 # layer calls AcceptEx). Nothing else: discovery no longer touches iphlpapi.
-g++ -std=c++26 -O2 -o bin/cell.exe cell.cpp -lcurl -lsodium -lcrypt32 -lws2_32 -lmswsock
+g++ -std=c++26 -O3 -flto=auto -march=native -Wall -Wextra .\cell.cpp -o .\bin\cell.exe -lcurl -lsodium -lcrypt32
 
 # MSVC
-cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib ws2_32.lib mswsock.lib
+cl /std:c++latest /O3 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib crypt32.lib ws2_32.lib mswsock.lib
 ```
 
 ### Run
