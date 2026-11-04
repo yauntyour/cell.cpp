@@ -11773,6 +11773,17 @@ namespace cell
             {
                 mdns4->set_option(udp::socket::reuse_address(true), ec);
                 mdns4->set_option(udp::socket::broadcast(true), ec);
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+                // BSD hands a multicast datagram to exactly ONE socket bound to
+                // the port unless that socket asked for SO_REUSEPORT (plain
+                // SO_REUSEADDR only lets the second bind succeed). Two
+                // responders on one host — the smoke run, or two cell instances
+                // — would leave one of them deaf. Linux fans out to every
+                // joined socket and Windows has no such rule, so this stays
+                // BSD-only. Must precede bind().
+                int reuse_port = 1;
+                ::setsockopt(mdns4->native_handle(), SOL_SOCKET, SO_REUSEPORT, &reuse_port, sizeof reuse_port);
+#endif
                 mdns4->bind(udp::endpoint(asio::ip::address_v4::any(), opt.mdns_port), ec);
                 if (ec)
                 {
@@ -11802,6 +11813,11 @@ namespace cell
             if (!ec)
             {
                 mdns6->set_option(udp::socket::reuse_address(true), ec);
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+                // see the v4 socket above: BSD needs SO_REUSEPORT before bind()
+                int reuse_port6 = 1;
+                ::setsockopt(mdns6->native_handle(), SOL_SOCKET, SO_REUSEPORT, &reuse_port6, sizeof reuse_port6);
+#endif
                 mdns6->bind(udp::endpoint(asio::ip::address_v6::any(), opt.mdns_port), ec);
                 if (ec)
                 {
