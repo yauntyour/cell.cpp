@@ -9528,6 +9528,16 @@ namespace cell
             std::string name;
             std::string addr;       // last known address
             std::uint16_t port = 0; // last known TCP port
+            // the name the peer publishes (cell-xxxx.local): survives a DHCP
+            // change, and resolves through mDNS / MagicDNS / DNS where a bare
+            // address would be stale
+            std::string host;
+            // Where this peer has actually been reachable from, newest first.
+            // A DHCP lease change moves the address and a restart can move the
+            // port; remembering the last few means a peer that comes back on a
+            // familiar address is found even where discovery cannot see it
+            // (another subnet, a VPN with no multicast).
+            std::vector<std::pair<std::string, std::uint16_t>> addrs;
             long long paired_at = 0;
             long long last_seen = 0;
             std::string via = "code"; // "code" = we showed the code, "entered" = we typed theirs
@@ -9536,9 +9546,30 @@ namespace cell
             std::string tz;
             std::string lang;
 
+            json addrs_json() const
+            {
+                json a = json::array();
+                for (const auto &[h, p] : addrs)
+                    a.push_back({{"addr", h}, {"port", p}});
+                return a;
+            }
+            // remember where the peer just answered from (newest first, deduped)
+            void remember(const std::string &h, std::uint16_t p, std::size_t cap = 4)
+            {
+                if (h.empty())
+                    return;
+                addrs.erase(std::remove_if(addrs.begin(), addrs.end(),
+                                           [&](const auto &e)
+                                           { return e.first == h && e.second == p; }),
+                            addrs.end());
+                addrs.insert(addrs.begin(), {h, p});
+                if (addrs.size() > cap)
+                    addrs.resize(cap);
+            }
+
             json to_json() const
             {
-                return {{"client_id", id}, {"name", name}, {"addr", addr}, {"port", port}, {"paired_at", paired_at}, {"last_seen", last_seen}, {"via", via}, {"paired", paired}, {"os", os}, {"tz", tz}, {"lang", lang}};
+                return {{"client_id", id}, {"name", name}, {"addr", addr}, {"port", port}, {"host", host}, {"addrs", addrs_json()}, {"paired_at", paired_at}, {"last_seen", last_seen}, {"via", via}, {"paired", paired}, {"os", os}, {"tz", tz}, {"lang", lang}};
             }
             static peer_meta from_json(const json &j)
             {
@@ -9548,6 +9579,7 @@ namespace cell
                 m.id = jstr(j, "client_id");
                 m.name = jstr(j, "name");
                 m.addr = jstr(j, "addr");
+                m.host = jstr(j, "host");
                 m.port = (std::uint16_t)std::clamp(jint(j, "port"), 0LL, 65535LL);
                 m.paired_at = jint(j, "paired_at");
                 m.last_seen = jint(j, "last_seen");
@@ -9556,6 +9588,17 @@ namespace cell
                 m.os = jstr(j, "os");
                 m.tz = jstr(j, "tz");
                 m.lang = jstr(j, "lang");
+                if (auto it = j.find("addrs"); it != j.end() && it->is_array())
+                    for (const auto &e : *it)
+                        if (e.is_object())
+                        {
+                            const std::string h = jstr(e, "addr");
+                            const auto p = (std::uint16_t)std::clamp(jint(e, "port"), 0LL, 65535LL);
+                            if (!h.empty())
+                                m.addrs.emplace_back(h, p);
+                        }
+                if (m.addrs.empty() && !m.addr.empty())
+                    m.addrs.emplace_back(m.addr, m.port); // an older record: seed the history
                 return m;
             }
         };
@@ -10268,6 +10311,10 @@ namespace cell
                 bool ready = false;
                 std::string peer_id, peer_name;
                 std::string peer_os, peer_tz, peer_lang;
+                // the name the peer publishes in mDNS (cell-xxxx.local): the only
+                // handle that survives a DHCP change on a network where mDNS
+                // cannot reach us — the dialer resolves it
+                std::string peer_host;
                 std::uint16_t peer_port = 0; // the port the peer LISTENS on (its source port is ephemeral)
                 std::string peer_addr;       // remote address of this connection
                 std::string my_eph_pub, my_eph_sec;
@@ -10490,6 +10537,8 @@ namespace cell
 
             // ---- sessions -----------------------------------------------------
             std::shared_ptr<conn> session_for(const std::string &peer, int timeout_ms, std::string &err);
+            // pin a paired peer's address by hand (no discovery needed)
+            bool set_peer_addr(const std::string &id, const std::string &host, std::uint16_t port, std::string &err);
             void register_session(const std::shared_ptr<conn> &c);
             void drop_session(const std::string &peer, const std::shared_ptr<conn> &c);
             void send_workspaces(const std::shared_ptr<conn> &c);
@@ -10552,6 +10601,7 @@ namespace cell
                        {"v", kVersion},
                        {"id", svc->client_id},
                        {"name", svc->name},
+                       {"host", svc->host_name},
                        {"eph", b64_encode(my_eph_pub)},
                        {"port", svc->bound_port},
                        {"os", os_name()},
@@ -10811,6 +10861,7 @@ namespace cell
             peer_os = clean_name(jstr(j, "os"), 24);
             peer_tz = clean_name(jstr(j, "tz"), 48);
             peer_lang = clean_name(jstr(j, "lang"), 24);
+            peer_host = clean_name(jstr(j, "host"), 64);
             if (!b64_decode(jstr(j, "eph"), peer_eph_pub) ||
                 peer_eph_pub.size() != crypto_kx_PUBLICKEYBYTES)
                 return fail("bad ephemeral key");
@@ -10860,6 +10911,7 @@ namespace cell
                      {"v", kVersion},
                      {"id", svc->client_id},
                      {"name", svc->name},
+                     {"host", svc->host_name},
                      {"eph", b64_encode(my_eph_pub)},
                      {"port", svc->bound_port},
                      {"os", os_name()},
@@ -10895,6 +10947,7 @@ namespace cell
             peer_os = clean_name(jstr(j, "os"), 24);
             peer_tz = clean_name(jstr(j, "tz"), 48);
             peer_lang = clean_name(jstr(j, "lang"), 24);
+            peer_host = clean_name(jstr(j, "host"), 64);
             if (!b64_decode(jstr(j, "eph"), peer_eph_pub) || peer_eph_pub.size() != crypto_kx_PUBLICKEYBYTES)
                 return fail("bad ephemeral key");
 
@@ -11149,6 +11202,9 @@ namespace cell
                 m->port = peer_port ? peer_port : m->port;
                 m->last_seen = (long long)std::time(nullptr);
                 m->paired = true;
+                m->remember(m->addr, m->port);
+                if (!peer_host.empty())
+                    m->host = peer_host; // the handle that survives DHCP
                 if (!peer_os.empty())
                     m->os = peer_os;
                 if (!peer_tz.empty())
@@ -12229,11 +12285,19 @@ namespace cell
                         p.name = f.name;
                     p.instance = inst;
                     p.host = f.host;
-                    for (const auto &a : addrs)
-                        if (std::ranges::find(p.addrs, a) == p.addrs.end())
-                            p.addrs.push_back(a);
-                    if (p.addrs.size() > 6)
-                        p.addrs.resize(6);
+                    // The addresses in THIS response are where the peer is now:
+                    // put them first instead of appending behind the old ones.
+                    // A DHCP lease change used to leave the stale address at the
+                    // head of the list forever — peers_json reports addrs.front()
+                    // (what the UI shows) and session_for dials it first, so the
+                    // peer looked like it lived at an address nobody answers on.
+                    std::vector<std::string> merged = addrs;
+                    for (const auto &a : p.addrs)
+                        if (std::ranges::find(merged, a) == merged.end())
+                            merged.push_back(a);
+                    if (merged.size() > 6)
+                        merged.resize(6);
+                    p.addrs = std::move(merged);
                     if (f.port != 0)
                         p.port = f.port;
                     if (!f.os.empty())
@@ -12357,7 +12421,18 @@ namespace cell
                 }
             }
             if (removed)
+            {
+                // the record should say when we last actually heard from the
+                // peer, not when the link was made — that is what the UI shows
+                // for an offline device
+                const long long rx = c->last_rx.load();
+                if (auto m = st.load_meta(peer); m && m->paired && rx > m->last_seen)
+                {
+                    m->last_seen = rx;
+                    (void)st.save_meta(*m);
+                }
                 emit({{"type", "offline"}, {"client_id", peer}});
+            }
         }
 
         inline void impl::send_workspaces(const std::shared_ptr<conn> &c)
@@ -12607,8 +12682,21 @@ namespace cell
                     }
                 }
                 if (auto m = st.load_meta(peer))
+                {
                     if (!m->addr.empty() && m->port != 0)
                         out.emplace_back(m->addr, m->port);
+                    // the published name, if the peer told us: a DHCP change
+                    // makes every remembered address wrong, the name still
+                    // resolves (mDNS on the LAN, MagicDNS/DNS beyond it)
+                    if (!m->host.empty() && m->port != 0)
+                        out.emplace_back(m->host, m->port);
+                    // every address this peer has answered from, newest first: a
+                    // peer that moved back onto a familiar address (or that
+                    // discovery cannot see at all) is still reachable
+                    for (const auto &[host, port] : m->addrs)
+                        if (!host.empty() && port != 0)
+                            out.emplace_back(host, port);
+                }
                 for (const auto &c : out)
                     if (std::ranges::find(unique, c) == unique.end())
                         unique.push_back(c);
@@ -12629,8 +12717,17 @@ namespace cell
                 err = "peer address unknown: it is not on the network right now";
                 return nullptr;
             }
+            // newest first (presence, then the last handshake, then history): the
+            // tail is only a fallback, and every candidate costs a connect timeout
+            if (unique.size() > 4)
+                unique.resize(4);
             std::vector<std::pair<std::string, std::uint16_t>> tried;
             std::string last_err;
+            // The caller's timeout is the whole budget, not one attempt's: with a
+            // history of addresses a dead peer would otherwise burn 4 timeouts
+            // (the probe thread runs this every 15s and must not drift).
+            const auto started = std::chrono::steady_clock::now();
+            const auto budget = std::chrono::milliseconds(std::max(1200, timeout_ms));
             for (int round = 0; round < 2; ++round)
             {
                 std::vector<std::pair<std::string, std::uint16_t>> batch;
@@ -12644,6 +12741,12 @@ namespace cell
                     timeout_ms / (int)std::min<std::size_t>(batch.size() + 1, 3), 2500, 15000);
                 for (const auto &[addr, port] : batch)
                 {
+                    const long long left = (long long)budget.count() -
+                                           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now() - started)
+                                               .count();
+                    if (left < 600)
+                        break; // out of budget: report what we have
                     tried.emplace_back(addr, port);
                     auto c = make_conn(tcp::socket(io));
                     c->inbound = false;
@@ -12652,21 +12755,49 @@ namespace cell
                         sessions[peer] = c; // provisional: concurrent callers join this attempt
                     }
                     boost::system::error_code ec;
-                    const auto address = asio::ip::make_address(addr, ec);
-                    if (ec)
+                    std::vector<tcp::endpoint> eps;
+                    if (const auto address = asio::ip::make_address(addr, ec); !ec)
+                    {
+                        eps.emplace_back(address, port);
+                    }
+                    else
+                    {
+                        // Not a number but a host name: a DHCP change moves the
+                        // address, and on a routed network (no multicast, so no
+                        // mDNS) the name is the only thing still pointing at the
+                        // peer. The system resolver decides what it means —
+                        // `.local` via mDNS on Windows 10+, MagicDNS on
+                        // Tailscale, plain DNS anywhere else.
+                        boost::system::error_code rec;
+                        tcp::resolver res(io);
+                        const auto found = res.resolve(addr, std::to_string(port), rec);
+                        if (!rec)
+                            for (const auto &e : found)
+                            {
+                                const auto ep = e.endpoint();
+                                if (std::ranges::find(eps, ep) == eps.end())
+                                    eps.push_back(ep);
+                                if (eps.size() >= 4)
+                                    break;
+                            }
+                    }
+                    if (eps.empty())
                     {
                         drop_session(peer, c);
-                        last_err = "bad peer address: " + addr;
+                        last_err = "cannot resolve peer address: " + addr;
                         continue;
                     }
-                    const tcp::endpoint ep(address, port);
                     log("info", std::format("connecting to {} at {}:{}", peer.substr(0, 8), addr, port));
-                    c->sock.async_connect(ep, asio::bind_executor(c->strand, [c](const boost::system::error_code &e)
-                                                                  {
+                    // a name can resolve to several addresses (v4/v6, several
+                    // A records): try them in order before giving up on this one
+                    asio::async_connect(c->sock, eps, asio::bind_executor(c->strand, [c](const boost::system::error_code &e, const tcp::endpoint &)
+                                                                                  {
                         if (e) { c->fail("connect failed: " + e.message()); return; }
                         c->start_outbound("resume", ""); }));
                     std::string why;
-                    if (c->wait_ready(per_try, why))
+                    const int try_ms = (int)std::clamp<long long>(
+                        std::min<long long>(per_try, left), 1200, 15000);
+                    if (c->wait_ready(try_ms, why))
                         return c;
                     drop_session(peer, c);
                     c->close("handshake failed");
@@ -12916,17 +13047,95 @@ namespace cell
         // -------------------------------------------------------------------------
         //  impl — views
         // -------------------------------------------------------------------------
+        // Pin a peer's address by hand — the last resort when discovery cannot
+        // reach it (another subnet, a VPN with no multicast) and DHCP moved it.
+        // What session_for dials *is* this record, so the link comes back
+        // without re-pairing; identity is still the link key, the address is
+        // only a hint. "host:port" in one field is what the UI asks for.
+        inline bool impl::set_peer_addr(const std::string &id, const std::string &host_in,
+                                        std::uint16_t port, std::string &err)
+        {
+            if (!is_hex_id(id, 32))
+            {
+                err = "bad client id";
+                return false;
+            }
+            std::string host = cell::text::trim(host_in);
+            if (host.empty())
+            {
+                err = "an address is required";
+                return false;
+            }
+            auto m = st.load_meta(id);
+            if (!m || !m->paired)
+            {
+                err = "that cell is not paired with this one";
+                return false;
+            }
+            // exactly one colon and a numeric tail = "host:port"; a bare IPv6
+            // address has several colons and is left alone
+            if (const auto colon = host.rfind(':'); colon != std::string::npos &&
+                                                    host.find(':') == colon && colon + 1 < host.size())
+            {
+                const std::string tail = host.substr(colon + 1);
+                if (std::ranges::all_of(tail, [](unsigned char c)
+                                        { return std::isdigit(c) != 0; }))
+                {
+                    const long p = std::strtol(tail.c_str(), nullptr, 10);
+                    if (p > 0 && p <= 65535)
+                    {
+                        port = (std::uint16_t)p;
+                        host = host.substr(0, colon);
+                    }
+                }
+            }
+            if (host.empty())
+            {
+                err = "an address is required";
+                return false;
+            }
+            if (port == 0)
+                port = m->port;
+            if (port == 0)
+            {
+                err = "a port is required (address:port)";
+                return false;
+            }
+            m->addr = host;
+            m->port = port;
+            m->remember(host, port);
+            if (!st.save_meta(*m))
+            {
+                err = "could not write the link record";
+                return false;
+            }
+            // a session opened against the old address is no longer the truth
+            std::shared_ptr<conn> stale;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                if (auto it = sessions.find(id); it != sessions.end())
+                    stale = it->second;
+            }
+            if (stale)
+                stale->close("address changed by hand");
+            return true;
+        }
+
         inline json impl::peers_json()
         {
             json out = json::array();
             auto metas = st.all_meta();
             std::map<std::string, presence> disc;
             std::map<std::string, bool> online;
+            std::map<std::string, long long> heard; // last frame from a live session
             {
                 std::lock_guard<std::mutex> lk(mx);
                 disc = present;
                 for (auto &[id, c] : sessions)
+                {
                     online[id] = c->ready;
+                    heard[id] = c->last_rx.load();
+                }
             }
             const long long now = (long long)std::time(nullptr);
             std::set<std::string> seen;
@@ -12939,6 +13148,15 @@ namespace cell
                 if (it != disc.end())
                     for (const auto &a : it->second.addrs)
                         addrs.push_back(a);
+                // "last seen" is the last time we actually heard from the peer —
+                // not "now" just because a socket is open. A live session refreshes
+                // it on every heartbeat (~10s), so the UI can tell a peer that is
+                // quiet-but-connected from one that just came back.
+                long long last = on ? (heard.count(m.id) ? heard[m.id] : now) : 0;
+                if (!last && it != disc.end())
+                    last = it->second.seen;
+                if (!last)
+                    last = m.last_seen;
                 json e{{"client_id", m.id},
                        {"name", m.name.empty() ? m.id.substr(0, 8) : m.name},
                        {"paired", true},
@@ -12949,9 +13167,10 @@ namespace cell
                        // where it is now, not where it was when the link was made.
                        {"addr", it != disc.end() && !it->second.addrs.empty() ? it->second.addrs.front() : m.addr},
                        {"addrs", addrs},
+                       {"host", m.host.empty() && it != disc.end() ? it->second.host : m.host},
                        {"port", it != disc.end() && it->second.port != 0 ? it->second.port : m.port},
                        {"paired_at", m.paired_at},
-                       {"last_seen", on ? now : (it != disc.end() ? it->second.seen : m.last_seen)},
+                       {"last_seen", last},
                        {"via", m.via},
                        {"os", m.os.empty() && it != disc.end() ? it->second.os : m.os},
                        {"tz", m.tz.empty() && it != disc.end() ? it->second.tz : m.tz},
@@ -13084,6 +13303,17 @@ namespace cell
             // goodbye goes out, and pairing/reconnect keep working.
             bool set_discovery(bool on, std::string &err) { return p_->set_discovery(on, err); }
             bool discovery_on() const { return p_->discovery_on.load(); }
+            // Pin a paired peer's address (host, host:port, or a name the system
+            // resolver knows). The last resort for a peer discovery cannot see.
+            bool set_peer_addr(const std::string &id, const std::string &host, std::uint16_t port, std::string &err)
+            {
+                if (!running())
+                {
+                    err = "flowlink is not running";
+                    return false;
+                }
+                return p_->set_peer_addr(id, host, port, err);
+            }
             // one browse burst; answers arrive asynchronously
             void scan()
             {
