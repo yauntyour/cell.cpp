@@ -11701,6 +11701,13 @@ namespace cell
                 if (!a.v6)
                     s->set_option(asio::ip::multicast::outbound_interface(addr.to_v4()), sec);
                 s->set_option(asio::ip::multicast::hops(1), sec);
+                // Loopback is a per-SOCKET option, and these are the sockets the
+                // announcements and query answers actually leave through. macOS
+                // leaves IP_MULTICAST_LOOP off by default, so without this a
+                // second instance on the same host never heard the first (Linux
+                // and Windows loop back by default, which is why only the macOS
+                // smoke run missed the peer).
+                s->set_option(asio::ip::multicast::enable_loopback(true), sec);
                 s->bind(udp::endpoint(addr, 0), sec);
                 if (sec)
                 {
