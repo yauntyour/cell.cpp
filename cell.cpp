@@ -374,6 +374,44 @@ namespace cell
 #endif
     }
 
+    // std::atomic<std::shared_ptr<T>> is the C++20 spelling for a published
+    // shared pointer, but libc++ never implemented it: on macOS (Homebrew LLVM
+    // 23 / libc++) the primary template is picked up instead and the
+    // "is_trivially_copyable" mandate rejects the type outright. libstdc++ and
+    // MSVC have it, libc++ does not — so both slots that want one (the FlowLink
+    // service and the event bus' sink table) go through this instead. Both are
+    // control-plane state (a status refresh, an add/remove), not hot loops, so a
+    // short uncontended lock is far below the cost of what surrounds it — and
+    // one implementation keeps all three toolchains on the same code path.
+    template <class T>
+    class atomic_shared
+    {
+    public:
+        atomic_shared() = default;
+        explicit atomic_shared(std::shared_ptr<T> v) : v_(std::move(v)) {}
+
+        std::shared_ptr<T> load() const
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            return v_;
+        }
+        void store(std::shared_ptr<T> v)
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            v_ = std::move(v);
+        }
+        // returns the previous value, which stays alive until the caller drops it
+        std::shared_ptr<T> exchange(std::shared_ptr<T> v)
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            return std::exchange(v_, std::move(v));
+        }
+
+    private:
+        mutable std::mutex m_;
+        std::shared_ptr<T> v_;
+    };
+
     // =========================================================================
     //  async_io — coalescing background file writer (submit / submit_append /
     //  flush)
@@ -10375,6 +10413,7 @@ namespace cell
                 void fail(const std::string &why);
 
                 void send_raw(std::string text);
+                void enqueue_frame(std::string text); // strand only, behind send_raw
                 void send_encrypted(const json &payload);
                 void do_write();
                 void close(const std::string &why);
@@ -10678,9 +10717,30 @@ namespace cell
                     if (!self->closed.load()) self->read_header(); }));
         }
 
+        // wq/writing are strand-owned: do_write() pops the queue there. Callers
+        // are on any thread — request() (service::call / send_transfer) on a
+        // command thread, start_inbound() on the acceptor's io handler — so an
+        // off-strand send hops over first; pushing into the deque from outside
+        // the strand raced do_write() and corrupted the heap.
         inline void impl::conn::send_raw(std::string text)
         {
             if (closed.load() || text.size() > kMaxFrame)
+                return;
+            // already on the strand: enqueue inline, so a caller that sends and
+            // then arms close_after_flush() keeps that order (its first tick
+            // looks at wq right away)
+            if (strand.running_in_this_thread())
+            {
+                enqueue_frame(std::move(text));
+                return;
+            }
+            asio::post(strand, [self = shared_from_this(), text = std::move(text)]
+                       { self->enqueue_frame(std::move(text)); });
+        }
+
+        inline void impl::conn::enqueue_frame(std::string text) // strand only
+        {
+            if (closed.load())
                 return;
             std::string frame(4, '\0');
             std::uint32_t len = static_cast<std::uint32_t>(text.size());
@@ -13774,17 +13834,17 @@ namespace cell
             std::function<bool(const std::string &, const output_fn &, std::string &)> on_cli;
         };
 
-        // The one service slot. An atomic shared_ptr gives readers a
-        // lock-free load (service() is called on every status/UI refresh) and
-        // still keeps the object alive while a caller is using it.
-        inline std::atomic<std::shared_ptr<service>> &slot()
+        // The one service slot. A shared_ptr published through cell::atomic_shared
+        // gives readers a copy that keeps the object alive while they use it (see
+        // the note there: libc++ has no atomic<shared_ptr>).
+        inline atomic_shared<service> &slot()
         {
-            static std::atomic<std::shared_ptr<service>> s;
+            static atomic_shared<service> s;
             return s;
         }
         inline std::shared_ptr<service> service_instance()
         {
-            return slot().load(std::memory_order_acquire);
+            return slot().load();
         }
         inline bool running()
         {
@@ -13818,14 +13878,14 @@ namespace cell
                 return false;
             // exchange keeps the previous service alive until we stop it, so a
             // concurrent reader never sees a destroyed object
-            auto old = slot().exchange(std::move(svc), std::memory_order_acq_rel);
+            auto old = slot().exchange(std::move(svc));
             if (old)
                 old->stop();
             return true;
         }
         inline void disable()
         {
-            auto old = slot().exchange(nullptr, std::memory_order_acq_rel);
+            auto old = slot().exchange(nullptr);
             if (old)
                 old->stop();
         }
