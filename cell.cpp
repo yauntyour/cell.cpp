@@ -7691,6 +7691,10 @@ namespace cell
             std::string sandbox_mode = "full-access"; // exec sandbox: "read-only" | "edit-only" | "full-access" (default)
             bool autoallow = false;                   // autoallow mode: LLM decides whether exec commands run (only in full-access)
             bool compact_auto = true;                 // auto-compress after long agent runs (default on)
+            // 回合被中断（轮次上限）后自动压缩了上下文时，再自动发一条
+            // "Continue to finish the work." 把没做完的活接上。默认关：自动
+            // 续跑会花掉额度，只有明确打开的人才会遇到。
+            bool auto_continue = false;
             std::string compact_provider;             // compression provider name (empty => session provider)
             std::string compact_model;                // compression model name (empty => session model)
             // 空串 = 不向模型发送任何 system 消息（默认）。只有用户在设置页
@@ -7933,6 +7937,7 @@ namespace cell
                 s.sandbox_mode = jstr(j, "sandbox_mode", "full-access");
                 s.autoallow = jbool(j, "autoallow", false);
                 s.compact_auto = jbool(j, "compact_auto", true);
+                s.auto_continue = jbool(j, "auto_continue", false);
                 s.compact_provider = jstr(j, "compact_provider", "");
                 s.compact_model = jstr(j, "compact_model", "");
                 if (j.contains("active_sessions") && j["active_sessions"].is_object())
@@ -7967,6 +7972,7 @@ namespace cell
             j["sandbox_mode"] = s.sandbox_mode;
             j["autoallow"] = s.autoallow;
             j["compact_auto"] = s.compact_auto;
+            j["auto_continue"] = s.auto_continue;
             j["compact_provider"] = s.compact_provider;
             j["compact_model"] = s.compact_model;
             j["system"] = s.system_prompt;
@@ -28885,6 +28891,12 @@ namespace cell
             int rounds = 0;
             long long tool_calls = 0;
             long long thinking_entries = 0;
+            // the turn ended on an abort and auto-compacted its own context on
+            // the way out (today: the round cap, the one abort with a clean
+            // boundary). The transcript was rewritten after the model was cut
+            // off, so nothing can resume it as-is — a frontend that wants the
+            // work finished has to say so again (see config::auto_continue).
+            bool auto_compacted = false;
         };
         // The frontend contract. Every callback is optional; the ones that matter
         // for a working UI are on_answer, on_status, on_error, on_tool_end and
@@ -30382,6 +30394,10 @@ namespace cell
                     if (ev.on_status)
                         ev.on_status(std::format("[auto-compact] {}", result));
                     cell::box::reset_read_log(h_.box_context());
+                    // an abort that compacted: the model was cut off AND the
+                    // transcript it was working from is gone. Report both, so a
+                    // frontend can offer to carry on (config::auto_continue).
+                    tv.auto_compacted = true;
                 }
             }
             h_.now().unload();
@@ -32036,6 +32052,23 @@ int repl::run()
                  cell::config::save(cfg);
                  log.info("autoallow", std::format("enabled={}", cell::box::autoallow_enabled() ? "on" : "off"));
                  cell::sys::println("autoallow: {} (LLM decides whether exec commands run)", cell::box::autoallow_enabled() ? "ON" : "off");
+                 return cmd_flow::handled;
+             }},
+            {"/auto-continue", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+             {
+                 // 中断（轮次上限）导致自动压缩后，是否自动发一条继续指令
+                 if (toks.size() >= 2 && (toks[1] == "on" || toks[1] == "off"))
+                     cfg.auto_continue = (toks[1] == "on");
+                 else if (toks.size() >= 2)
+                 {
+                     cell::sys::error("usage: /auto-continue [on|off]");
+                     return cmd_flow::handled;
+                 }
+                 else
+                     cfg.auto_continue = !cfg.auto_continue;
+                 cell::config::save(cfg);
+                 log.info("llm", std::format("auto_continue={}", cfg.auto_continue));
+                 cell::sys::println("auto-continue: {}", cfg.auto_continue ? "on" : "off");
                  return cmd_flow::handled;
              }},
             {"/sessions", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
