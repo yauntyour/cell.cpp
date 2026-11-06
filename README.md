@@ -122,6 +122,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 - [Quick start](#quick-start)
 - [Command-line options](#command-line-options)
 - [Slash commands](#slash-commands)
+- [Account balance](#account-balance)
 - [Tools](#tools)
 - [Teamwork](#teamwork)
 - [Notices](#notices)
@@ -143,6 +144,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 | --- | --- | --- |
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
+| 💰 | **Account balance** — `/balance` (or `cell --balance`) for every API style: the per-vendor account route is probed and normalized to one envelope (DeepSeek `balance_infos`, OpenRouter credits, legacy OpenAI grants, SiliconFlow/Moonshot balances, the Anthropic Admin cost report), so switching providers never changes the command | `cell::llm::query_balance` |
 | 🔧 | **9 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw`, `notice` | `cell::box`, `cell::tools` |
 | 👥 | **Teamwork** — supervised child agents with configurable workflows (`tw` tool + `/teamworks`): named stages with per-stage dispatch mode, supervisor gates, same-job reuse, background runs with cooperative stops, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), queryable history & reports, and a **file lease** — per-child write grants plus mandatory review of every change they make to the file you granted | `cell::teamwork` |
 | 📣 | **Notices** — a token-free message bus between agent sessions: Teamwork children report progress, the supervisor idles in `/notices wait` and is woken instantly, all without a single LLM round-trip | `cell::notice` |
@@ -254,6 +256,7 @@ usage: cell [options]        # verbatim from print_usage — the --sandbox line 
 | `--sandbox` | `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` | Sets the exec sandbox mode and persists it as `sandbox_mode`. An unknown value warns and rewrites the stored value to `full-access`. |
 | `--no-color` | flag | Disables ANSI colors (color is only used when stdout is a terminal anyway). |
 | `--verbose` | flag | Mirrors `DEBUG` log lines to the console (they always go to the log file). |
+| `--balance` | flag | Prints the current provider's account balance (the same query as `/balance`, all three API styles) and exits without starting a session — exit code `0` when an account route answered, `1` when none did or no provider is configured. Nothing is persisted: `--provider`/`--base`/`--key` on the same line only shape the probe |
 | `--selftest` | flag | Runs the built-in test suite in an isolated `.cell-selftest/` directory and exits (`0` = all passed). |
 | `--help`, `-h` | flag | Prints the usage summary and exits with `0`. |
 
@@ -287,6 +290,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/provide update NAME [base:[API_STYLE:]URL] [key:KEY] [proxy:URL] [name:NEW_NAME]` | Update an existing provider in place. The API style is set together with the base URL it applies to, e.g. `base:anthropic:https://api.anthropic.com`; `base:URL` alone keeps the current style. Only supplied fields change; renaming the provider carries its encrypted vault key to the new vault id, and a requested name that already exists is made unique as `NEW_NAME-N`. |
 | `/provide rm NAME` | Delete a provider and its vault key; if it was current, selection moves to the first remaining provider and the model name is cleared |
 | `/models` | Fetch and print the current provider's model list (`<current>` marks the active one) |
+| `/balance [PROVIDER] [--json]` | Query the account balance of the current (or named) provider — one command for all three API styles. Each style has its own account route: OpenAI-style providers are probed for `{base}/user/balance` (DeepSeek and clones), `{base}/credits` (OpenRouter), `{base}/dashboard/billing/credit_grants` (legacy OpenAI billing), `{base}/user/info` (SiliconFlow) and `{base}/users/me/balance` (Moonshot), each tried against the base **and** its `/v1`- and `/anthropic`-stripped roots, so an account route mounted at the host root is still found; the `anthropic` style first asks the Admin API cost report (`{base}/v1/organizations/cost_report`, needs an organization admin key) and then the same bearer routes, which is what Anthropic-compatible gateways answer. Only a 404 — or a 200 that is not an account document — moves on to the next candidate; an auth error is reported as-is. `--json` prints the normalized envelope instead of the one-line summary; `cell --balance` runs the same query without starting a session |
 | `/model NAME` | Switch model; warns if the name is not in the fetched list |
 | `/model NAME [api_style:STYLE]` | Optionally switch the current provider's API wire style on the fly (`openai-chat` \| `openai-responses` \| `anthropic`; `openai` is accepted as an alias of `openai-chat`); the new style is persisted in `config.json` and shown by `/model` and `/provides` |
 | `/think [off\|low\|med\|high\|max]` | Set the chain-of-thought level (persisted; an unknown level prints the usage and keeps the previous one); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192); bare `/think` shows the current level and budget |
@@ -411,6 +415,42 @@ messages out of the array into `system` / `instructions` anyway.
 - **After long agent runs** — when `compact_auto` is on (the default) and a turn recorded
   ≥ 3 tool calls plus reasoning/thinking entries, the context is compacted after the turn
   (`[auto-compact] …`). Disable with `/compact auto off`.
+
+## Account balance
+
+`/balance` (and `cell --balance`) asks the active provider what is left on the account. There is no
+portable balance API, so `cell::llm::query_balance` probes a per-style candidate list and normalizes
+whatever answers into one envelope every frontend renders:
+
+| API style | Routes probed, in order |
+| --- | --- |
+| `openai-chat`, `openai-responses` | `{base}/user/balance` (DeepSeek, `is_available` + `balance_infos[]`), `{base}/credits` (OpenRouter, `total_credits` − `total_usage`), `{base}/dashboard/billing/credit_grants` (legacy OpenAI billing), `{base}/user/info` (SiliconFlow, `data.totalBalance`), `{base}/users/me/balance` (Moonshot, `data.available_balance`) |
+| `anthropic` | `{base}/v1/organizations/cost_report` (Admin API, `x-api-key`, last 30 days, summed per currency — a **cost** figure, marked `"kind":"cost"`), then the same bearer routes as above, which is what Anthropic-compatible gateways (DeepSeek's `/anthropic` base, Moonshot, …) answer |
+
+Each route is tried against `base` **and** its stripped roots (`…/v1` and `…/anthropic` removed), so a
+balance mounted at the host root is still found when chats go to `…/v1` — DeepSeek is exactly that
+case (`https://api.deepseek.com/v1` for chats, `https://api.deepseek.com/user/balance` for the
+balance). Probe order is "route first, root second", the first answer that parses stops the walk, and
+at most ten routes are tried; only a 404 — or a 200 that is not an account document (a CDN page, a
+proxy's HTML error) — moves on. An auth error (401/403) is reported as it came back, so a bad key never
+looks like "this provider has no balance endpoint".
+
+The resulting envelope is what `--json` prints and what the desktop app's `balance.fetch` returns:
+
+```json
+{
+  "ok": true, "api_style": "openai-chat", "kind": "balance",
+  "endpoint": "https://api.deepseek.com/user/balance",
+  "available": true,
+  "items": [{"currency": "CNY", "total": "110.00", "granted": "10.00"}],
+  "summary": "CNY total 110.00, granted 10.00",
+  "raw": {"is_available": true, "balance_infos": [{"currency": "CNY", "total_balance": "110.00"}]}
+}
+```
+
+Amounts stay strings exactly as the provider spelled them; `remaining` is only derived (total − used)
+when the provider does not report it itself. On failure the envelope is `{"ok":false,"error":…}` with
+the last endpoint and HTTP status attached. `raw` is dropped above 64 KiB.
 
 ## Tools
 
@@ -928,7 +968,8 @@ cell::sys        print/println/eprintln/pprintln, structured logger + rotation, 
 cell::config     provider registry, settings, load/save + legacy migration
 cell::encrypt    base64, secure_string, Argon2id + AES-256-GCM vault
 cell::tools      Policy (Deny/Ask/Allow), tool base class, callable_tool (approval + gates)
-cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResponses / Anthropic clients
+cell::llm        SSE parsers (generator + incremental feed), OpenAI / OpenAIResponses / Anthropic clients,
+                 query_balance (per-style account probes + one normalized envelope)
 cell::chat       session (per-cwd persistence) and history (in-memory session map)
 cell::skills     front-matter parser, recursive scanner, metadata prompt
 cell::stats      usage counters in .cell/usages.json

@@ -15631,6 +15631,387 @@ namespace cell
         {
             return {"Content-Type: application/json", xapi_key_header(api_key), "anthropic-version: 2023-06-01"};
         }
+
+        // -------- account balance --------------------------------------------
+        // None of the three API styles has a portable balance route. What exists
+        // is a per-vendor account endpoint next to the chat surface — DeepSeek
+        // /user/balance, OpenRouter /credits, the legacy OpenAI billing grants,
+        // SiliconFlow /user/info, Moonshot /users/me/balance — and, on the
+        // native Anthropic surface, only an organisation cost report (a spend
+        // figure, not a balance). So the query walks an ordered candidate list
+        // per style (404 = "no such route on this host", try the next one) and
+        // normalizes whatever answers into ONE envelope:
+        //
+        //   {"ok":true,"api_style":"…","endpoint":"…","kind":"balance"|"cost",
+        //    "available":true,"items":[{"currency","total","used","remaining",
+        //    "granted"}],"summary":"CNY remaining 110.00","raw":{…}}
+        //
+        // `/balance` in the CLI and `balance.fetch` in the desktop app render
+        // this same shape, so a new vendor only ever means a new parser here.
+        // Non-streaming, own CURL handle: /balance may run while a turn streams.
+        constexpr size_t kMaxBalanceProbes = 10;
+        constexpr long kBalanceTimeoutSec = 8;
+
+        // 4 decimals, trailing zeros trimmed: enough for every credit / token
+        // price scale, and no "%f" noise in front of the user
+        static std::string amount_fmt(double v)
+        {
+            std::string s = std::format("{:.4f}", v);
+            while (!s.empty() && s.back() == '0')
+                s.pop_back();
+            if (!s.empty() && s.back() == '.')
+                s.pop_back();
+            return s;
+        }
+        static std::optional<double> amount_num(const std::string &s)
+        {
+            if (s.empty())
+                return std::nullopt;
+            double v{};
+            const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+            return ec == std::errc{} && end == s.data() + s.size() ? std::optional<double>{v} : std::nullopt;
+        }
+        // the amount of the first key that carries one, exactly as the provider
+        // spelled it (a quoted decimal stays a string: its precision is kept)
+        static std::string amount_of(const nlohmann::json &j, std::initializer_list<const char *> keys)
+        {
+            for (const char *k : keys)
+            {
+                const nlohmann::json *f = jfield(j, k);
+                if (!f)
+                    continue;
+                if (f->is_string())
+                    return f->get_ref<const std::string &>();
+                if (f->is_number_unsigned())
+                    return std::to_string(f->get<unsigned long long>());
+                if (f->is_number_integer())
+                    return std::to_string(f->get<long long>());
+                if (f->is_number_float())
+                    return amount_fmt(f->get<double>());
+            }
+            return "";
+        }
+        // one currency row; `remaining` is derived when the provider reports
+        // only a total and a usage figure (OpenRouter, the OpenAI grants)
+        static nlohmann::json amount_row(std::string currency, std::string total, std::string used,
+                                         std::string granted, std::string remaining = {})
+        {
+            if (remaining.empty())
+                if (const auto t = amount_num(total), u = amount_num(used); t && u)
+                    remaining = amount_fmt(*t - *u);
+            nlohmann::json row = nlohmann::json::object();
+            if (!currency.empty())
+                row["currency"] = std::move(currency);
+            if (!total.empty())
+                row["total"] = std::move(total);
+            if (!used.empty())
+                row["used"] = std::move(used);
+            if (!granted.empty())
+                row["granted"] = std::move(granted);
+            if (!remaining.empty())
+                row["remaining"] = std::move(remaining);
+            return row;
+        }
+
+        // Normalize one provider answer. `{}` = "not a balance document" and the
+        // probe moves on — a CDN error page answers 200 too.
+        static nlohmann::json balance_parse(const std::string &body)
+        {
+            nlohmann::json j;
+            try
+            {
+                j = nlohmann::json::parse(body);
+            }
+            catch (const std::exception &)
+            {
+                return {};
+            }
+            nlohmann::json out = nlohmann::json::object();
+            nlohmann::json items = nlohmann::json::array();
+
+            // DeepSeek & clones: {"is_available":true,
+            //   "balance_infos":[{currency,total_balance,granted_balance,topped_up_balance}]}
+            if (const nlohmann::json *infos = jfield(j, "balance_infos"); infos && infos->is_array())
+            {
+                for (const auto &b : *infos)
+                    if (b.is_object())
+                        items.push_back(amount_row(jstr(b, "currency", ""), amount_of(b, {"total_balance", "total"}),
+                                                   "", amount_of(b, {"granted_balance", "granted"})));
+                if (const nlohmann::json *av = jfield(j, "is_available"); av && av->is_boolean())
+                    out["available"] = av->get<bool>();
+            }
+            // OpenRouter: {"data":{"total_credits":N,"total_usage":M}} — credits in USD
+            else if (const nlohmann::json *d = jfield(j, "data");
+                     d && d->is_object() && (d->contains("total_credits") || d->contains("total_usage")))
+                items.push_back(amount_row(jstr(*d, "currency", "USD"), amount_of(*d, {"total_credits"}),
+                                           amount_of(*d, {"total_usage"}), "", ""));
+            // OpenAI legacy platform: {"total_granted","total_used","total_available"}
+            else if (j.is_object() && (j.contains("total_granted") || j.contains("total_available")))
+                items.push_back(amount_row("USD", amount_of(j, {"total_granted"}), amount_of(j, {"total_used"}),
+                                           "", amount_of(j, {"total_available"})));
+            // SiliconFlow: {"data":{"balance","chargeBalance","totalBalance"}}
+            else if (const nlohmann::json *d = jfield(j, "data");
+                     d && d->is_object() && (d->contains("totalBalance") || d->contains("chargeBalance")))
+                items.push_back(amount_row(jstr(*d, "currency", "CNY"), amount_of(*d, {"totalBalance"}),
+                                           "", amount_of(*d, {"balance"}), ""));
+            // Moonshot: {"data":{"available_balance","voucher_balance","cash_balance"}}
+            else if (const nlohmann::json *d = jfield(j, "data");
+                     d && d->is_object() &&
+                         (d->contains("available_balance") || d->contains("cash_balance") || d->contains("voucher_balance")))
+                items.push_back(amount_row(jstr(*d, "currency", "CNY"), "", "",
+                                           amount_of(*d, {"voucher_balance"}), amount_of(*d, {"available_balance"})));
+            // Anthropic Admin API cost report: {"data":[{"results":[{"amount","currency"}]}]}
+            // — summed per currency, reported as `kind":"cost"` (spend, not balance)
+            else if (const nlohmann::json *d = jfield(j, "data"); d && d->is_array())
+            {
+                std::vector<std::pair<std::string, double>> sums;
+                for (const auto &bucket : *d)
+                {
+                    const nlohmann::json *results = jfield(bucket, "results");
+                    if (!results || !results->is_array())
+                        continue;
+                    for (const auto &row : *results)
+                    {
+                        const auto amount = row.is_object() ? amount_num(amount_of(row, {"amount"})) : std::nullopt;
+                        if (!amount)
+                            continue;
+                        const std::string cur = jstr(row, "currency", "USD");
+                        if (auto it = std::ranges::find(sums, cur, &std::pair<std::string, double>::first); it != sums.end())
+                            it->second += *amount;
+                        else
+                            sums.emplace_back(cur, *amount);
+                    }
+                }
+                for (const auto &[cur, sum] : sums)
+                    items.push_back(amount_row(cur, "", amount_fmt(sum), "", ""));
+                if (!items.empty())
+                    out["kind"] = "cost";
+            }
+            // last resort: a plain balance object, top-level or under "data"
+            if (items.empty())
+            {
+                const nlohmann::json *root = &j;
+                if (const nlohmann::json *d = jfield(j, "data"); d && d->is_object())
+                    root = d;
+                if (root->is_object())
+                {
+                    const std::string total = amount_of(*root, {"balance", "total_balance", "credits", "total", "totalBalance"});
+                    const std::string remaining = amount_of(*root, {"remaining", "available", "available_balance", "remaining_balance", "credit_balance"});
+                    const std::string used = amount_of(*root, {"used", "usage", "total_usage", "spent"});
+                    if (!total.empty() || !remaining.empty() || !used.empty())
+                        items.push_back(amount_row(jstr(*root, "currency", jstr(j, "currency", "")), total, used, "", remaining));
+                }
+            }
+            if (items.empty())
+                return {};
+            if (!out.contains("kind"))
+                out["kind"] = "balance";
+            out["items"] = std::move(items);
+            // the provider's own body, for `balance.fetch` clients that want the
+            // detail view; a hostile multi-megabyte page is not worth keeping
+            if (body.size() <= 64 * 1024)
+                out["raw"] = std::move(j);
+            return out;
+        }
+
+        // One line for the terminal and the toast, e.g. "CNY remaining 110.00 (of 110.00), granted 10.00"
+        static std::string balance_summary(const nlohmann::json &b)
+        {
+            const nlohmann::json *items = jfield(b, "items");
+            if (!items || !items->is_array() || items->empty())
+                return "";
+            const bool cost = jstr(b, "kind", "") == "cost";
+            std::string out;
+            for (const auto &row : *items)
+            {
+                if (!row.is_object())
+                    continue;
+                if (!out.empty())
+                    out += " · ";
+                const std::string cur = jstr(row, "currency", "");
+                if (!cur.empty())
+                    out += cur + " ";
+                if (cost)
+                {
+                    out += "used " + jstr(row, "used", "?");
+                    continue;
+                }
+                const std::string remaining = jstr(row, "remaining", "");
+                const std::string total = jstr(row, "total", "");
+                if (!remaining.empty())
+                    out += "remaining " + remaining;
+                else if (!total.empty())
+                    out += "total " + total;
+                else
+                    out += "?";
+                if (!remaining.empty() && !total.empty() && remaining != total)
+                    out += " (of " + total + ")";
+                if (const std::string used = jstr(row, "used", ""); !used.empty())
+                    out += ", used " + used;
+                if (const std::string granted = jstr(row, "granted", ""); !granted.empty() && granted != "0")
+                    out += ", granted " + granted;
+            }
+            if (const nlohmann::json *av = jfield(b, "available"); av && av->is_boolean() && !av->get<bool>())
+                out += " (account not available)";
+            return out;
+        }
+
+        // Printable block for the CLI (`/balance`, `--balance`)
+        static std::string balance_text(const nlohmann::json &b, const std::string &provider)
+        {
+            const std::string head = std::format("{} ({})", provider.empty() ? "provider" : provider,
+                                                 jstr(b, "api_style", "?"));
+            if (!jbool(b, "ok"))
+                return std::format("{}: balance unavailable\n  {}", head, jstr(b, "error", "unknown error"));
+            std::string out = std::format("{} · {}\n  {}", head, jstr(b, "kind", "balance"),
+                                          balance_summary(b).empty() ? "(no amount reported)" : balance_summary(b));
+            if (const std::string ep = jstr(b, "endpoint", ""); !ep.empty())
+                out += "\n  endpoint: " + ep;
+            if (jstr(b, "kind", "") == "cost")
+                out += "\n  (the provider reports spending, not a balance — this is the cost report)";
+            return out;
+        }
+
+        // UTC timestamp in the ISO-8601 form the Anthropic Admin API wants
+        static std::string iso8601_utc(std::time_t t)
+        {
+            std::tm tm{};
+#ifdef _WIN32
+            gmtime_s(&tm, &t);
+#else
+            gmtime_r(&t, &tm);
+#endif
+            return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z", tm.tm_year + 1900, tm.tm_mon + 1,
+                               tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+
+        struct balance_probe
+        {
+            std::string url;
+            bool anthropic_auth = false; // x-api-key + anthropic-version instead of a bearer token
+        };
+
+        // Candidate routes in probe order. An account surface usually sits at the
+        // API root while `base` points at /v1, /api/v1 or (compatible gateways)
+        // /anthropic, so every route is tried against the base and its stripped
+        // variants — DeepSeek, for one, serves chats under …/v1 and its balance
+        // under the bare host.
+        static std::vector<balance_probe> balance_candidates(const std::string &api_style, const std::string &base)
+        {
+            std::vector<std::string> roots;
+            auto add_root = [&roots](std::string r)
+            {
+                while (!r.empty() && r.back() == '/')
+                    r.pop_back();
+                if (!r.empty() && std::ranges::find(roots, r) == roots.end())
+                    roots.push_back(std::move(r));
+            };
+            add_root(normalize_api_base(base));
+            // two passes: "…/anthropic/v1" strips /v1 first, /anthropic second
+            for (int pass = 0; pass < 2; pass++)
+                for (const std::string r : std::vector<std::string>(roots)) // copy: roots grows below
+                    for (const std::string_view suffix : {"/v1", "/anthropic"})
+                        if (r.size() > suffix.size() && std::string_view(r).ends_with(suffix))
+                            add_root(r.substr(0, r.size() - suffix.size()));
+
+            std::vector<balance_probe> out;
+            auto add = [&out](std::string url, bool anthropic_auth)
+            { out.push_back({std::move(url), anthropic_auth}); };
+            if (api_style == "anthropic")
+                // native Admin API: a cost report over the last 30 days, needs an
+                // organisation admin key (sk-ant-admin…) — a normal key fails here
+                // and the generic routes below take over
+                for (const std::string &r : roots)
+                    add(r + std::format("/v1/organizations/cost_report?starting_at={}&bucket_width=1d&limit=31",
+                                        iso8601_utc(std::time(nullptr) - 30 * 86400)),
+                        true);
+            // generic account routes, most specific first
+            for (const char *path : {"user/balance", "credits", "dashboard/billing/credit_grants", "user/info", "users/me/balance"})
+                for (const std::string &r : roots)
+                    add(r + "/" + path, false);
+            return out;
+        }
+
+        // The whole query: probe, parse, normalize. `ok` tells whether an account
+        // route answered; `error` why not (the provider's own message when it sent
+        // one — "bad key" must not be reported as "no balance endpoint").
+        static nlohmann::json query_balance(const std::string &api_style, const std::string &base,
+                                            const std::string &proxy, const encrypt::secure_string &api_key)
+        {
+            nlohmann::json out = nlohmann::json{{"ok", false}, {"api_style", api_style}};
+            if (normalize_api_base(base).empty())
+            {
+                out["error"] = "the provider has no base url";
+                return out;
+            }
+            if (api_key.empty())
+            {
+                out["error"] = "no api key stored for this provider";
+                return out;
+            }
+            CURL *c = curl_easy_init();
+            if (!c)
+            {
+                out["error"] = "curl is unavailable";
+                return out;
+            }
+            std::string last_error = "the provider exposes no account balance endpoint";
+            std::string last_url;
+            long last_code = 0;
+            size_t tried = 0;
+            for (const balance_probe &probe : balance_candidates(api_style, base))
+            {
+                if (tried++ >= kMaxBalanceProbes)
+                    break;
+                std::vector<std::string> hdrs = probe.anthropic_auth ? api_key_headers(api_key) : bearer_headers(api_key);
+                std::string buf, err;
+                long code = 0;
+                const bool ok = net::CURL_get(c, probe.url.c_str(), hdrs, buf, &code, &err,
+                                              proxy.empty() ? nullptr : proxy.c_str(), kBalanceTimeoutSec);
+                for (auto &h : hdrs)
+                    encrypt::wipe(h);
+                last_url = probe.url;
+                last_code = code;
+                if (ok && code == 200)
+                {
+                    if (nlohmann::json parsed = balance_parse(buf); parsed.is_object() && !parsed.empty())
+                    {
+                        parsed["ok"] = true;
+                        parsed["api_style"] = api_style;
+                        parsed["endpoint"] = probe.url;
+                        parsed["summary"] = balance_summary(parsed);
+                        curl_easy_cleanup(c);
+                        return parsed;
+                    }
+                    // 200 with something else (a CDN page, a proxy's HTML error):
+                    // this host simply does not serve a balance here
+                    last_error = std::format("unrecognized balance response from {}", probe.url);
+                    continue;
+                }
+                // the provider's own message beats a bare HTTP code: "Incorrect
+                // API key" must not read as "no balance endpoint"
+                last_error = !err.empty() ? err
+                             : code != 0  ? std::format("HTTP {}", code)
+                                          : std::string("request failed");
+                if (code == 0)
+                {
+                    // no HTTP status at all = the host did not answer (DNS, TLS,
+                    // proxy, timeout). Every remaining route lives on the same
+                    // host, so stop here instead of burning one timeout each.
+                    last_error += std::format(" [{}]", probe.url);
+                    break;
+                }
+                if (code == 401 || code == 403)
+                    last_error += std::format(" [{}]", probe.url);
+            }
+            curl_easy_cleanup(c);
+            out["error"] = last_error;
+            if (!last_url.empty())
+                out["endpoint"] = last_url;
+            if (last_code != 0)
+                out["http_status"] = last_code;
+            return out;
+        }
         // non-streaming counterpart of the finish_stream epilogue: POST a JSON
         // body with `hdrs`, then wipe the header copies that carried the key
         static bool post_json(CURL *curl, const std::string &url, const std::string &proxy,
@@ -24410,6 +24791,7 @@ static void print_usage(const char *prog)
     cell::sys::println("  --sandbox MODE               exec sandbox mode: read-only | edit-only | full-access (default)");
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
+    cell::sys::println("  --balance                    print the current provider's account balance and exit");
     cell::sys::println("  --selftest                   run internal self tests");
     cell::sys::println("  --help, -h                   show this usage summary and exit");
 }
@@ -24425,6 +24807,7 @@ static void print_help()
     cell::sys::println("      e.g. /provide add openai:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("      e.g. /provide add openai-responses:https://api.openai.com/v1 key:sk-xxx");
     cell::sys::println("  /models                     fetch the model list from the current provider");
+    cell::sys::println("  /balance [PROVIDER] [--json]   account balance of the current (or named) provider — all three API styles");
     cell::sys::println("  /model NAME [api_style:STYLE]  switch model; optionally pick the API style (openai-chat|openai-responses|anthropic)");
     cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
@@ -27573,6 +27956,75 @@ static int run_selftest()
         R.expect(cell::chat::message_display_text(preview[4]).empty(), "session preview omits tool results");
         R.expect(cell::chat::message_display_text(preview[5]).empty(), "session preview omits Anthropic tool results");
         R.expect(cell::chat::message_display_text(preview[6]) == "visible block", "session preview keeps text blocks only");
+    }
+
+    // Account balance: the three API styles answer with completely different
+    // documents — DeepSeek a currency list, OpenRouter a credits/usage pair, the
+    // legacy OpenAI platform a grant table, SiliconFlow/Moonshot a nested data
+    // object, the Anthropic Admin API a cost report — and one normalizer has to
+    // turn all of them into the same envelope the CLI and the app render.
+    {
+        // DeepSeek
+        auto ds = cell::llm::balance_parse(
+            R"({"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]})");
+        R.expect(ds.is_object() && ds["kind"] == "balance", "balance: DeepSeek body is a balance");
+        R.expect(ds["items"].size() == 1 && ds["items"][0]["currency"] == "CNY" &&
+                     ds["items"][0]["total"] == "110.00" && ds["items"][0]["granted"] == "10.00",
+                 "balance: DeepSeek amounts are kept verbatim");
+        R.expect(ds["available"] == true, "balance: DeepSeek availability is carried over");
+        R.expect(cell::llm::balance_summary(ds).find("CNY") == 0 &&
+                     cell::llm::balance_summary(ds).find("110.00") != std::string::npos,
+                 "balance: summary names the currency and the amount");
+        // OpenRouter: remaining is derived from credits - usage
+        auto orc = cell::llm::balance_parse(R"({"data":{"total_credits":10,"total_usage":1.5}})");
+        R.expect(orc["items"].size() == 1 && orc["items"][0]["currency"] == "USD" &&
+                     orc["items"][0]["remaining"] == "8.5" && orc["items"][0]["used"] == "1.5",
+                 "balance: OpenRouter credits derive the remaining amount");
+        // OpenAI legacy grants: total_available wins over the derived value
+        auto oai = cell::llm::balance_parse(R"({"object":"credit_summary","total_granted":18,"total_used":2,"total_available":16})");
+        R.expect(oai["items"].size() == 1 && oai["items"][0]["total"] == "18" &&
+                     oai["items"][0]["remaining"] == "16",
+                 "balance: OpenAI grant table keeps the reported available amount");
+        // SiliconFlow / Moonshot
+        auto sf = cell::llm::balance_parse(R"({"code":20000,"data":{"balance":"8","chargeBalance":"80","totalBalance":"88"}})");
+        R.expect(sf["items"].size() == 1 && sf["items"][0]["currency"] == "CNY" &&
+                     sf["items"][0]["total"] == "88",
+                 "balance: SiliconFlow totalBalance is the balance");
+        auto ms = cell::llm::balance_parse(R"({"code":0,"data":{"available_balance":49.58,"voucher_balance":0,"cash_balance":49.58}})");
+        R.expect(ms["items"].size() == 1 && ms["items"][0]["remaining"] == "49.58" &&
+                     ms["items"][0]["currency"] == "CNY",
+                 "balance: Moonshot available_balance is the remaining amount");
+        // Anthropic Admin cost report: summed per currency and marked as cost
+        auto cost = cell::llm::balance_parse(
+            R"({"data":[{"results":[{"amount":"1.25","currency":"USD"},{"amount":"0.75","currency":"USD"}]},{"results":[{"amount":"2","currency":"EUR"}]}]})");
+        R.expect(cost["kind"] == "cost", "balance: a cost report is not a balance");
+        R.expect(cost["items"].size() == 2 && cost["items"][0]["used"] == "2" &&
+                     cost["items"][1]["used"] == "2",
+                 "balance: cost buckets are summed per currency");
+        R.expect(cell::llm::balance_summary(cost).starts_with("USD used 2"), "balance: cost summary reports spending");
+        // anything that is not an account document must not look like one
+        R.expect(cell::llm::balance_parse(R"({"choices":[{"message":{"content":"hi"}}]})").is_null(),
+                 "balance: a chat completion is not a balance document");
+        R.expect(cell::llm::balance_parse("<!doctype html><h1>gateway</h1>").is_null(),
+                 "balance: an HTML page is not a balance document");
+        // probe order: the account route is tried on the base AND on its
+        // stripped roots (DeepSeek serves chats under /v1, balance at the root)
+        auto probes = cell::llm::balance_candidates("openai-chat", "https://api.deepseek.com/v1");
+        bool root_balance = false;
+        for (const auto &pb : probes)
+            root_balance |= pb.url == "https://api.deepseek.com/user/balance";
+        R.expect(root_balance, "balance: candidates include the stripped root route");
+        auto aprobes = cell::llm::balance_candidates("anthropic", "https://api.anthropic.com");
+        bool cost_probe = false, bearer_fallback = false;
+        for (const auto &pb : aprobes)
+        {
+            cost_probe |= pb.anthropic_auth && pb.url.find("/v1/organizations/cost_report") != std::string::npos;
+            bearer_fallback |= !pb.anthropic_auth && pb.url == "https://api.anthropic.com/user/balance";
+        }
+        R.expect(cost_probe, "balance: the anthropic style probes the admin cost report first");
+        R.expect(bearer_fallback, "balance: the anthropic style falls back to bearer account routes");
+        R.expect(!cell::llm::balance_candidates("openai-responses", "https://api.openai.com/v1").empty(),
+                 "balance: the responses style has its own probe list");
     }
 
     // OpenAI-style requests must convert the internal transcript into the shape
@@ -30744,11 +31196,11 @@ class repl
 {
 public:
     repl(cell::config::settings settings, std::string provider_arg, std::string base_arg,
-         std::string model_arg, std::string proxy_arg, std::string key_arg)
+         std::string model_arg, std::string proxy_arg, std::string key_arg, bool balance_only = false)
         : cfg(std::move(settings)),
           provider_arg_(std::move(provider_arg)), base_arg_(std::move(base_arg)),
           model_arg_(std::move(model_arg)), proxy_arg_(std::move(proxy_arg)),
-          key_arg_(std::move(key_arg)) {}
+          key_arg_(std::move(key_arg)), balance_only_(balance_only) {}
 
     // run the session loop; returns the process exit code
     int run();
@@ -30756,6 +31208,8 @@ public:
 private:
     cell::config::settings cfg; // owned; persisted on exit
     std::string provider_arg_, base_arg_, model_arg_, proxy_arg_, key_arg_;
+    // --balance: query the account balance, print it and exit (no session)
+    bool balance_only_ = false;
 };
 
 // =============================================================================
@@ -30769,6 +31223,7 @@ int main(int argc, char const *argv[])
     bool selftest = false;
     bool no_color = false;
     bool verbose = false;
+    bool balance_only = false;
     std::string key_arg;
     std::string provider_arg, base_arg, model_arg, proxy_arg;
     cell::config::settings cfg;
@@ -30817,6 +31272,8 @@ int main(int argc, char const *argv[])
             no_color = true;
         else if (arg == "--verbose")
             verbose = true;
+        else if (arg == "--balance")
+            balance_only = true;
         else if (arg == "--selftest")
             selftest = true;
         else if (arg == "--help" || arg == "-h")
@@ -30854,7 +31311,7 @@ int main(int argc, char const *argv[])
     }
 
     repl app(std::move(cfg), std::move(provider_arg), std::move(base_arg),
-             std::move(model_arg), std::move(proxy_arg), std::move(key_arg));
+             std::move(model_arg), std::move(proxy_arg), std::move(key_arg), balance_only);
     return app.run();
 }
 
@@ -30945,6 +31402,28 @@ int repl::run()
             cell::sys::warn("--key ignored: no provider is configured (add one with --provider NAME or /provide add)");
             sodium_memzero(key_arg.data(), key_arg.size());
         }
+    }
+
+    // ---- --balance: query the account and exit ------------------------------
+    // Runs right after the CLI overrides, so `cell --provider openai --key … --balance`
+    // queries the endpoint those arguments configure rather than the stored one.
+    // Exit code: 0 = an account route answered, 1 = nothing did (or no provider).
+    if (balance_only_)
+    {
+        const cell::config::provider_entry *p = cfg.current_provider_entry();
+        if (!p)
+        {
+            cell::sys::error("no provider configured - add one with --provider NAME or /provide add");
+            cell::net::curl_global_shutdown();
+            return 1;
+        }
+        cell::encrypt::secure_string key = resolve_provider_key(*p, vault);
+        const nlohmann::json b = cell::llm::query_balance(p->api_style, p->base, p->proxy, key);
+        cell::sys::println("{}", cell::llm::balance_text(b, p->name));
+        log.info("balance", std::format("provider={} style={} ok={} summary={}", p->name, p->api_style,
+                                        jbool(b, "ok") ? "yes" : "no", jstr(b, "summary", jstr(b, "error", ""))));
+        cell::net::curl_global_shutdown();
+        return jbool(b, "ok") ? 0 : 1;
     }
 
     // -------- phase: session bootstrap — resume, cwd follow, skills injection,
@@ -32215,6 +32694,57 @@ int repl::run()
                  }
                  for (auto &m : models)
                      cell::sys::println("  {}{}", m, (m == cfg.current_model) ? "  <current>" : "");
+                 return cmd_flow::handled;
+             }},
+            {"/balance", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+             {
+                 // /balance [PROVIDER] [--json] — account balance of the active (or
+                 // named) provider. Each of the three API styles has its own
+                 // account route; cell::llm::query_balance probes them and hands
+                 // back one normalized envelope (see the llm notes).
+                 bool as_json = false;
+                 std::string want;
+                 for (size_t i = 1; i < toks.size(); i++)
+                 {
+                     if (toks[i] == "--json" || toks[i] == "json")
+                         as_json = true;
+                     else if (want.empty())
+                         want = toks[i];
+                     else
+                     {
+                         cell::sys::error("usage: /balance [PROVIDER] [--json]");
+                         return cmd_flow::handled;
+                     }
+                 }
+                 const cell::config::provider_entry *p = cfg.current_provider_entry();
+                 if (!want.empty())
+                 {
+                     const int idx = cell::config::find(cfg, want);
+                     if (idx < 0)
+                     {
+                         cell::sys::error("provider not found: {} (see /provides)", want);
+                         return cmd_flow::handled;
+                     }
+                     p = &cfg.providers[(size_t)idx];
+                 }
+                 if (!p)
+                 {
+                     cell::sys::error("no provider configured - add one with /provide add openai:URL");
+                     return cmd_flow::handled;
+                 }
+                 cell::encrypt::secure_string key = resolve_provider_key(*p, vault);
+                 const nlohmann::json b = cell::llm::query_balance(p->api_style, p->base, p->proxy, key);
+                 if (as_json)
+                 {
+                     cell::sys::println("{}", dump_safe(b, 2));
+                     return cmd_flow::handled;
+                 }
+                 if (jbool(b, "ok"))
+                     cell::sys::println("{}", cell::llm::balance_text(b, p->name));
+                 else
+                     cell::sys::error("{}", cell::llm::balance_text(b, p->name));
+                 log.info("balance", std::format("provider={} style={} ok={} summary={}", p->name, p->api_style,
+                                                 jbool(b, "ok") ? "yes" : "no", jstr(b, "summary", jstr(b, "error", ""))));
                  return cmd_flow::handled;
              }},
             {"/model", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
