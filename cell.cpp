@@ -347,6 +347,14 @@ namespace cell
     {
         struct runtime_context;
     }
+    // bg tasks (defined above notice) report completion into the session via a
+    // notice; keep the dependency one-way with a forward declaration.
+    namespace notice
+    {
+        static bool send_to(const std::string &session_id, const std::string &from,
+                            const std::string &topic, const std::string &body, std::string &err,
+                            std::string *, bool, const std::string &);
+    }
 
     // LF -> CRLF on Windows when `crlf` is set (the default, which preserves the
     // historical behaviour for the internal session/config files); LF unchanged
@@ -3534,26 +3542,61 @@ namespace cell
 #endif
         }
 
-        // Sensitive path substrings for exec command checking.
-        // These are checked against the lowercased command string to prevent
-        // data exfiltration via exec (e.g., "cat .key", "cat .crypt").
+        static std::vector<std::string> tokens(std::string_view s);
+
+        // Only a genuine path argument is subject to the sensitive/protected
+        // path rules. A raw substring match over the whole command wrongly read
+        // URLs ("http://h/logs/x"), options ("--opt=/logs") and slash switches
+        // ("/s", "/c") as paths. Tokenize first, then keep arguments that
+        // actually look like a filesystem path. This is path-only gating (the
+        // exec rule never parsed commands), so dropping flag-like tokens loses
+        // no path protection.
+        static bool arg_is_path_like(std::string_view tok)
+        {
+            if (tok.empty())
+                return false;
+            if (tok.size() >= 2 && ((tok.front() == '"' && tok.back() == '"') ||
+                                    (tok.front() == '\'' && tok.back() == '\'')))
+                tok = tok.substr(1, tok.size() - 2);
+            if (tok.empty())
+                return false;
+            if (tok.find("://") != std::string_view::npos) // URL, not a path
+                return false;
+            if (tok.front() == '-')                        // -x / --long / --k=v
+                return false;
+            if (tok.find_first_of("/\\") == std::string_view::npos) // no path separator
+                return false;
+            // A leading separator with no further separator or extension is a
+            // bare switch ("/s", "/c", "\E"), not an absolute path. Keep real
+            // absolute paths such as "/config.json" or "C:\dir\file".
+            if (tok.front() == '/' || tok.front() == '\\')
+            {
+                std::string_view rest = tok.substr(1);
+                if (rest.find_first_of("/\\") == std::string_view::npos &&
+                    rest.find('.') == std::string_view::npos)
+                    return false;
+            }
+            return true;
+        }
+
+        // Sensitive path substrings for exec command checking. Matched per
+        // path-like argument (not over the raw command) to avoid false positives.
         static bool exec_references_sensitive_path(std::string_view lower_cmd)
         {
             static constexpr std::string_view sensitive_terms[] = {
-                "/.crypt",
-                "\\.crypt",
-                "/.key",
-                "\\.key",
-                "/config.json",
-                "\\config.json",
-                "/sessions/",
-                "\\sessions\\",
-                "/logs/",
-                "\\logs\\",
+                "/.crypt", "\\.crypt", "/.key", "\\.key",
+                "/config.json", "\\config.json", "/sessions/", "\\sessions\\",
+                "/logs/", "\\logs\\",
             };
-            for (auto &term : sensitive_terms)
-                if (lower_cmd.contains(term))
-                    return true;
+            for (auto &raw : tokens(lower_cmd))
+            {
+                if (!arg_is_path_like(raw))
+                    continue;
+                const std::string tok = to_lower(raw);
+                for (auto &term : sensitive_terms)
+                    if (tok.contains(term))
+                        return true;
+            }
             return false;
         }
 
@@ -3632,10 +3675,25 @@ namespace cell
             // being inside "/a/proj"
             return ps.size() == wd.size() || ps[wd.size()] == '/' || ps[wd.size()] == '\\';
         }
-        // check if a command/string contains path traversal attempts
+        // Check for a ".." path COMPONENT, not a raw ".." substring. The latter
+        // flagged regexes (a..b), version ranges (1..2) and slash args (/..x),
+        // which are not paths. A ".." only counts when it is a whole component,
+        // i.e. bounded by a path separator or the start/end of the argument.
         static bool has_path_traversal(std::string_view call)
         {
-            return call.contains("..");
+            static auto is_boundary = [](char c)
+            { return c == '/' || c == '\\' || c == '"' || c == '\'' || c == ' ' || c == '\t'; };
+            size_t pos = 0;
+            while ((pos = call.find("..", pos)) != std::string_view::npos)
+            {
+                const bool left = pos == 0 || is_boundary(call[pos - 1]);
+                const size_t after = pos + 2;
+                const bool right = after == call.size() || is_boundary(call[after]);
+                if (left && right)
+                    return true;
+                pos = after;
+            }
+            return false;
         }
 
         // ---- host-protected roots (read-only to the agent) -------------------
@@ -3762,16 +3820,32 @@ namespace cell
         // composite tools): path restrictions only
         bool check(std::string_view call)
         {
+            // `call` may be a whole command (exec fallback) or a single path
+            // argument (Ask-policy fallback). Either way, path rules apply only
+            // to real path components — never to flags, URLs or regex content.
             if (has_path_traversal(call))
                 return false;
-            // Check if the command references sensitive paths
-            std::string lower = to_lower(call);
-            if (is_sensitive_path(lower))
-                return false;
-            if (is_protected_path(call))
-                return false;
-            if (has_windows_trailing_dot_or_space(call))
-                return false; // Windows strips the dot/space: ".cell." -> ".cell"
+            // A single path argument (no whitespace) is checked as-is: it IS the
+            // path. A multi-token command is checked per path-like token.
+            std::vector<std::string> parts = tokens(call);
+            if (parts.empty())
+                parts.push_back(std::string(call));
+            for (auto &raw : parts)
+            {
+                std::string_view tok(raw);
+                // The whole-call single-token case must always be checked even
+                // if it lacks separators (e.g. "config.json"); a command token
+                // without separators is never a path anyway.
+                if (parts.size() > 1 && !arg_is_path_like(tok))
+                    continue;
+                const std::string low = to_lower(tok);
+                if (is_sensitive_path(low))
+                    return false;
+                if (is_protected_path(tok))
+                    return false;
+                if (has_windows_trailing_dot_or_space(tok))
+                    return false; // Windows strips the dot/space: ".cell." -> ".cell"
+            }
             return true;
         }
         // Split on whitespace, honouring double quotes so an argument can contain
@@ -7418,14 +7492,29 @@ namespace cell
                                       [t]
                                       { return t->cancel.load(std::memory_order_acquire); },
                                       chunk);
+                std::string final_tail;
                 {
                     std::lock_guard lk(t->mx);
                     t->running = false;
                     t->exit_code = code;
+                    final_tail = t->tail;
                 }
                 t->done.store(true, std::memory_order_release);
                 t->cv.notify_all();
                 cell::sys::logger::instance().info("bg", std::format("task_finished id={} exit={} cmd={}", t->id, code, t->cmd));
+                // Report completion into the spawning session as a notice so the
+                // next turn delivers it to the model via inject_notices — no
+                // more polling /tasks with a notice wait. Include exit code and
+                // output tail (bounded) so the model can judge the result.
+                if (!t->session.empty())
+                {
+                    std::string tail = final_tail.size() > 4096 ? final_tail.substr(final_tail.size() - 4096) : final_tail;
+                    std::string body = std::format("Background task {} finished (exit={}).\ncmd: {}\noutput tail:\n{}",
+                                                   t->id, code, t->cmd, tail.empty() ? std::string("(no output)") : tail);
+                    std::string nerr;
+                    if (!notice::send_to(t->session, "bg-task", "background-task-finished", body, nerr, nullptr, true, ""))
+                        cell::sys::logger::instance().warn("bg", std::format("completion notice failed id={} err={}", t->id, nerr));
+                }
                 notify_watcher(); });
                 worker.detach();
             }
@@ -19335,6 +19424,8 @@ details{break-inside:avoid}
             std::filesystem::path file;                        // dir / "messages.jsonl"
             std::filesystem::path interrupt_file;              // dir / "interrupt.json"
             std::string interrupt_reason;                      // non-empty while the last turn is interrupted
+            std::filesystem::path meta_file;                  // dir / "meta.json" (per-session prefs)
+            bool qa_mode = false;                             // Q&A-only: no tools, no auto-compact (session-scoped)
             bool loaded = false;
             // transcript persistence bookkeeping: the file holds
             // messages[0..flushed) in order, so a turn that only pushed new
@@ -19369,8 +19460,32 @@ details{break-inside:avoid}
                                                      ? std::string()
                                                      : dump_safe(nlohmann::json{{"reason", interrupt_reason}}));
             }
+            // Per-session Q&A-only mode. Stored in a sidecar so it survives a
+            // reload and stays scoped to this session (not the global config).
+            void load_meta()
+            {
+                std::ifstream f(meta_file);
+                if (!f)
+                    return;
+                std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                auto j = nlohmann::json::parse(text, nullptr, false);
+                if (j.is_object() && j.contains("qa") && j["qa"].is_boolean())
+                    qa_mode = j["qa"].get<bool>();
+            }
+            void persist_meta()
+            {
+                async_io::submit(meta_file, dump_safe(nlohmann::json{{"qa", qa_mode}}));
+            }
 
         public:
+            bool qa() const { return qa_mode; }
+            void set_qa(bool on)
+            {
+                if (qa_mode == on)
+                    return;
+                qa_mode = on;
+                persist_meta();
+            }
             session() : session(cell::make_session_id()) {}
             session(const std::string &id) : session(id, workdir()) {}
             // `fallback_cwd` is where the session lives when the id prefix has
@@ -19378,7 +19493,8 @@ details{break-inside:avoid}
             // workspace for a multi-workspace engine.
             session(const std::string &id, const std::filesystem::path &fallback_cwd)
                 : session_id(id), dir(cell::session_dir(session_id)), sessions_root_(cell::sessions_root()),
-                  file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json")
+                  file(dir / "messages.jsonl"), interrupt_file(dir / "interrupt.json"),
+                  meta_file(dir / "meta.json")
             {
                 // a session folder may live under another cwd's group: the index
                 // maps the id prefix (the cwd key) back to the real directory
@@ -19411,6 +19527,7 @@ details{break-inside:avoid}
                 }
                 loaded = true;
                 load_interrupt();
+                load_meta();
                 if (!std::filesystem::exists(file))
                 {
                     cell::sys::logger::instance().debug("sess", std::format("created id={} (no file on disk)", session_id));
@@ -20348,6 +20465,23 @@ details{break-inside:avoid}
             bump(m);
             save_async();
         }
+        // Ensure a zeroed usage record exists for a freshly created session.
+        // The session directory already exists (made in the session ctor); its
+        // transcript file does not until the first turn persists. prune() now
+        // keys off the directory so this record survives until then — a session
+        // is therefore visible in usages.summary the moment it is created.
+        // Does not bump counters; add() still owns all request accounting.
+        static void touch(const std::string &session_id, const std::string &model)
+        {
+            std::lock_guard<std::mutex> lk(stats_mutex());
+            auto &j = mem();
+            auto &sess = j["sessions"][session_id];
+            if (!sess.is_object())
+                sess = nlohmann::json::object();
+            if (!sess.contains("model") || sess["model"].empty())
+                sess["model"] = model;
+            save_async();
+        }
         // remove the usage record of one session (used when a session is deleted)
         static void remove(const std::string &session_id)
         {
@@ -20369,7 +20503,12 @@ details{break-inside:avoid}
             for (auto &[k, v] : sess.items())
             {
                 std::error_code ec;
-                if (!std::filesystem::exists(session_file(k), ec))
+                // The session directory is created in the session ctor, before
+                // its transcript file exists (which happens on first persist).
+                // Keying off the directory keeps a just-created session's zeroed
+                // usage record alive; a deleted session loses its whole dir via
+                // remove_all, so it is still pruned.
+                if (!std::filesystem::is_directory(session_dir(k), ec))
                     gone.push_back(k);
             }
             if (gone.empty())
@@ -25041,7 +25180,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return out;
         });
     add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input. High-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) require a second confirmation.\n"
-                "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). Progress is not reported back automatically — poll /tasks or its output tail.",
+                "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). When the task finishes you receive a notice automatically on your next turn with its exit code and output tail — do NOT poll /tasks or call the notice wait tool to wait for it; just continue your work or tell the user it is running and the result will arrive.",
         {{"cmd", str_prop("shell command to execute")},
          {"timeout", num_prop("timeout in seconds, default 30, max 300 (ignored when background=true)")},
          {"wd", str_prop("working directory for the command (optional, defaults to cwd)")},
@@ -25628,6 +25767,14 @@ static int run_selftest()
     R.expect(cell::box::check("FORMAT C:"), "box::check allows format (path-only checks)");
     R.expect(!cell::box::check("cat ../etc/passwd"), "box::check rejects path traversal");
     R.expect(cell::box::check("echo hi"), "box::check allows echo");
+    // 2026-11-17: ".." and slash args must only count as paths when they are
+    // real path components — regexes, version ranges, URLs and flags aren't.
+    R.expect(cell::box::check("rg 'a..b' src"), "traversal check allows regex a..b");
+    R.expect(cell::box::check("echo version 1..2"), "traversal check allows range 1..2");
+    R.expect(cell::box::check("cmd /c echo hi"), "slash switch /c is not a path");
+    R.expect(cell::box::check_exec("cmd /c echo hi"), "exec allows slash switch /c");
+    R.expect(cell::box::check_exec("curl http://host/logs/page"), "exec allows URL with /logs/");
+    R.expect(cell::box::check_exec("prog --opt=/logs/out run"), "exec allows option with slash value");
     R.expect(cell::box::check_path("src/main.cpp"), "box::check_path allows normal path");
     R.expect(!cell::box::check_path("../secret.txt"), "box::check_path rejects traversal");
     R.expect(cell::box::check_path(""), "box::check_path allows empty");
@@ -29693,6 +29840,10 @@ namespace cell
             std::function<bool(const std::string &tool, const std::string &args, std::string &reason)> on_approval;
             // Polled frequently during a transfer (must be cheap + thread-safe).
             std::function<bool()> cancelled;
+            // Live "interject": polled at each round boundary of a running turn.
+            // Returns pending user text (and clears it) so it can be injected into
+            // the SAME turn without waiting for it to finish. Empty = nothing now.
+            std::function<std::string()> take_input;
             // Recorded on the transcript when a turn is cut short by cancellation.
             std::string cancel_reason = "interrupted by the user during streaming";
             std::function<void(const turn_view &)> on_turn_end;
@@ -30542,6 +30693,27 @@ namespace cell
             constexpr int kMaxRoundsPerTurn = 200;
             while (!done)
             {
+                // Live interject: pull any user text queued while this turn was
+                // running and feed it in as a fresh user message at this clean
+                // round boundary (between tool calls). It becomes part of THIS
+                // turn's transcript, so the model sees it immediately instead of
+                // after the current turn ends.
+                if (ev.take_input)
+                {
+                    std::string live = ev.take_input();
+                    if (!live.empty())
+                    {
+                        h_.now().msg().push_back({{"role", "user"}, {"content", live}});
+                        log.info("user", std::format("interject chars={} text={}", live.size(), live));
+                        if (ev.on_status)
+                            ev.on_status("[interject] user message injected into the running turn");
+                        // a new user message supersedes a prior interruption
+                        if (!h_.now().interrupt_state().empty())
+                            h_.now().clear_interrupt();
+                        // in_chars/before are re-baselined at the top of every
+                        // round (below), so the usage delta stays correct.
+                    }
+                }
                 if (++rounds > kMaxRoundsPerTurn)
                 {
                     log.warn("llm", std::format("turn aborted at the {} round limit", kMaxRoundsPerTurn));
@@ -30660,7 +30832,9 @@ namespace cell
                     if (cell::chat::fold_system_messages(h_.now().msg()))
                         h_.now().note_rewrite();
                     http_status = 0;
-                    ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools, cfg_.think_level, &xfer_poll, &xc, &http_status);
+                    // Q&A-only session: send no tool schema and ignore any tool
+                    // calls the model still emits (with_tools=false yields no_tools).
+                    ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools && !h_.now().qa(), cfg_.think_level, &xfer_poll, &xc, &http_status);
                     // the reply now exists on every path (success, cancel, error):
                     // stamp it before the overflow retry below may reset it
                     tag_reply();
@@ -30678,7 +30852,7 @@ namespace cell
                     }
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
-                    if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
+                    if (!ok && !compacted_this_round && !h_.now().qa() && cell::chat::is_context_overflow(err) &&
                         compact(h_.now(), ev).find("context compacted") != std::string::npos)
                     {
                         log.info("ctx", std::format("auto_compact_on_overflow ctx_msgs={} round={}", (long long)h_.now().msg().size(), rounds));
@@ -30810,6 +30984,16 @@ namespace cell
                     for (auto &b : reply["content"])
                         if (b.is_object() && (b.value("type", "") == "reasoning" || b.value("type", "") == "thinking"))
                             turn_thinking_entries++;
+                // Q&A-only session: the model was sent no tool schema, but a
+                // stubborn model may still emit calls. Drop them (do not execute)
+                // so the session stays answer-only; tell the user via status.
+                if (h_.now().qa() && !tool_calls.empty())
+                {
+                    log.info("llm", std::format("qa session dropped tool_calls={}", tool_calls.size()));
+                    if (ev.on_status)
+                        ev.on_status("[Q&A mode] tool calls are disabled for this session");
+                    tool_calls = nlohmann::json::array();
+                }
                 if (!tool_calls.empty())
                 {
                     struct tresult
@@ -31149,7 +31333,7 @@ namespace cell
             bool boundary_end = natural_end || limit_hit;
             long long ctx_chars = boundary_end ? content_chars(h_.now().msg()) : 0;
             bool oversized = ctx_chars >= kAutoCompactChars;
-            if (cfg_.compact_auto && boundary_end && (long_run || oversized))
+            if (cfg_.compact_auto && !h_.now().qa() && boundary_end && (long_run || oversized))
             {
                 std::string result = compact(h_.now(), ev);
                 if (result.contains("context compacted"))
