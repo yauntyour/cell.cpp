@@ -3579,27 +3579,6 @@ namespace cell
             return true;
         }
 
-        // Sensitive path substrings for exec command checking. Matched per
-        // path-like argument (not over the raw command) to avoid false positives.
-        static bool exec_references_sensitive_path(std::string_view lower_cmd)
-        {
-            static constexpr std::string_view sensitive_terms[] = {
-                "/.crypt", "\\.crypt", "/.key", "\\.key",
-                "/config.json", "\\config.json", "/sessions/", "\\sessions\\",
-                "/logs/", "\\logs\\",
-            };
-            for (auto &raw : tokens(lower_cmd))
-            {
-                if (!arg_is_path_like(raw))
-                    continue;
-                const std::string tok = to_lower(raw);
-                for (auto &term : sensitive_terms)
-                    if (tok.contains(term))
-                        return true;
-            }
-            return false;
-        }
-
         // -------- strict command sandboxing --------
         // exec is gated by the sandbox MODE plus a path-only command check (see
         // check_exec): it does not parse command names or block network egress.
@@ -3758,23 +3737,73 @@ namespace cell
                     return true;
             return false;
         }
-        // an exec command that keeps a path literal to the protected tree (or
-        // to the runtime root, from where it could cd into it) is refused. Like
-        // every other exec rule this is a path check, not command parsing.
-        static bool exec_references_protected_path(std::string_view lower_cmd)
+        // fs 组件级 under 判定：base 的每一级路径分量都要与 path 对应相等，
+        // 避免 "/a/proj_evil" 被当成在 "/a/proj" 里（旧的字符串 contains 会误伤）。
+        static bool fs_path_under(const std::filesystem::path &path, const std::filesystem::path &base)
         {
-            std::string cmd(lower_cmd);
-            for (char &c : cmd)
-                if (c == '\\')
-                    c = '/';
+            if (base.empty() || path.empty())
+                return false;
+            auto pi = path.begin(), pe = path.end();
+            for (auto bi = base.begin(), be = base.end(); bi != be; ++bi, ++pi)
+                if (pi == pe || *pi != *bi)
+                    return false;
+            return true;
+        }
+        // 取命令里每个 path-like token，按 std::filesystem 规范化（相对路径基于
+        // 执行 cwd），判定是否落进宿主保护根或运行时根。只拦真正的路径命中：
+        // URL、选项、纯 flag 一律跳过；字符串里恰好有 "/logs/" 之类的子串不再误报。
+        // 这是路径检查，不是命令解析——不解析命令名、不过滤网络出口。
+        static bool exec_references_protected_path(std::string_view call)
+        {
+            std::vector<std::filesystem::path> guards;
             {
                 std::lock_guard<std::mutex> lk(protected_mx());
-                for (auto &base : protected_roots_norm())
-                    if (!base.empty() && cmd.contains(base))
-                        return true;
+                for (auto &p : protected_roots_raw())
+                    if (!p.empty())
+                        guards.push_back(p);
             }
-            const std::string rt = cell::normalize_path(cell::root.string());
-            return !rt.empty() && cmd.contains(rt);
+            guards.push_back(cell::root); // 运行时根（vault / key / config）同样只读
+            std::error_code ec;
+            const std::filesystem::path cwd = cell::exec_cwd();
+            // A guard (and a relative token) can be expressed against either the
+            // process cwd or the execution cwd; selftest uses a relative root,
+            // production an absolute one. Canonicalise both bases so they match.
+            auto variants = [&](const std::filesystem::path &p, std::vector<std::filesystem::path> &out)
+            {
+                if (p.is_absolute())
+                    out.push_back(std::filesystem::weakly_canonical(p, ec).make_preferred());
+                else
+                {
+                    auto a = std::filesystem::weakly_canonical(p, ec);
+                    if (!ec) out.push_back(a.make_preferred());
+                    ec.clear();
+                    auto b = std::filesystem::weakly_canonical(cwd / p, ec);
+                    if (!ec) out.push_back(b.make_preferred());
+                }
+                ec.clear();
+            };
+            std::vector<std::filesystem::path> guard_canon;
+            for (auto &g : guards)
+                variants(g, guard_canon);
+            if (guard_canon.empty())
+                return false;
+            for (auto &raw : tokens(call))
+            {
+                std::string tok(raw);
+                // 去包裹引号；带 scheme 的一律当 URL 跳过
+                if (tok.size() >= 2 && ((tok.front() == '"' && tok.back() == '"') ||
+                                        (tok.front() == '\'' && tok.back() == '\'')))
+                    tok = tok.substr(1, tok.size() - 2);
+                if (tok.empty() || tok.front() == '-' || tok.find("://") != std::string::npos)
+                    continue;
+                std::vector<std::filesystem::path> cand;
+                variants(std::filesystem::path(tok), cand);
+                for (auto &c : cand)
+                    for (auto &g : guard_canon)
+                        if (fs_path_under(c, g))
+                            return true;
+            }
+            return false;
         }
 
         // check path-only tools (grep, read, exist): reject path traversal and
@@ -3880,20 +3909,20 @@ namespace cell
             }
             return toks;
         }
-        // exec gate: only path restriction checks (sensitive paths + workspace boundary)
+        // exec gate: path restrictions only. The old sensitive-word list (any
+        // token containing "/config.json", "/logs/", "/sessions/"…) produced
+        // endless false positives on ordinary commands; it is gone. What stays
+        // is a real boundary check using std::filesystem: path traversal, plus
+        // host-protected / runtime roots resolved canonically to path components.
         static bool check_exec(std::string_view call)
         {
-            // Check for path traversal
+            // Check for path traversal (a real ".." path component)
             if (has_path_traversal(call))
                 return false;
-            // Check if the command references sensitive paths
-            std::string lower = to_lower(call);
-            if (exec_references_sensitive_path(lower))
-                return false;
-            // Host-protected roots are read-only to the agent: exec cannot name
-            // them (it could not tell a read from a write), while the read tool
-            // still can.
-            if (exec_references_protected_path(lower))
+            // Host-protected roots and the runtime root are read-only to the
+            // agent: exec cannot name them. Canonically resolved, so a sibling
+            // like ".../proj_evil" no longer trips a "/proj" guard.
+            if (exec_references_protected_path(call))
                 return false;
             // In read-only mode, exec is blocked entirely
             if (sandbox_mode() == SandboxMode::ReadOnly)
@@ -7349,6 +7378,10 @@ namespace cell
             std::chrono::steady_clock::time_point started;
             std::atomic<bool> cancel{false};
             std::atomic<bool> done{false}; // the thread has finished
+            // set by bg::kill (the user's stop button): the completion notice
+            // then says the USER terminated this task instead of reporting it
+            // as an ordinary exit — the model must not wait for it or retry it
+            std::atomic<bool> user_kill{false};
             std::mutex mx;                 // guards everything below
             std::condition_variable cv;    // tid published / thread finished
             bool tid_set = false;
@@ -7499,22 +7532,39 @@ namespace cell
                     t->exit_code = code;
                     final_tail = t->tail;
                 }
-                t->done.store(true, std::memory_order_release);
-                t->cv.notify_all();
-                cell::sys::logger::instance().info("bg", std::format("task_finished id={} exit={} cmd={}", t->id, code, t->cmd));
                 // Report completion into the spawning session as a notice so the
                 // next turn delivers it to the model via inject_notices — no
                 // more polling /tasks with a notice wait. Include exit code and
                 // output tail (bounded) so the model can judge the result.
+                // A task the USER killed is reported as exactly that: the exit
+                // code alone would read as an ordinary failure and invite a
+                // pointless retry or a wait that never ends.
+                //
+                // Written BEFORE `done` is published: a user who stops a task and
+                // immediately sends the next message must have the notice in that
+                // turn. With the notice after `done`, tasks.kill returns first and
+                // the very next turn can drain an empty queue.
                 if (!t->session.empty())
                 {
                     std::string tail = final_tail.size() > 4096 ? final_tail.substr(final_tail.size() - 4096) : final_tail;
-                    std::string body = std::format("Background task {} finished (exit={}).\ncmd: {}\noutput tail:\n{}",
-                                                   t->id, code, t->cmd, tail.empty() ? std::string("(no output)") : tail);
+                    const bool by_user = t->user_kill.load(std::memory_order_acquire);
+                    const std::string body = by_user
+                        ? std::format("Background task {} was TERMINATED BY THE USER - its process tree was killed (exit={}), "
+                                      "so it will never finish and no further output will arrive.\ncmd: {}\n"
+                                      "Do not wait for it and do not restart it on your own; if the work still matters, "
+                                      "ask the user or continue without it.\noutput tail before the kill:\n{}",
+                                      t->id, code, t->cmd, tail.empty() ? std::string("(no output)") : tail)
+                        : std::format("Background task {} finished (exit={}).\ncmd: {}\noutput tail:\n{}",
+                                      t->id, code, t->cmd, tail.empty() ? std::string("(no output)") : tail);
                     std::string nerr;
-                    if (!notice::send_to(t->session, "bg-task", "background-task-finished", body, nerr, nullptr, true, ""))
+                    if (!notice::send_to(t->session, by_user ? "user" : "bg-task",
+                                         by_user ? "bg-task-terminated" : "background-task-finished",
+                                         body, nerr, nullptr, !by_user, ""))
                         cell::sys::logger::instance().warn("bg", std::format("completion notice failed id={} err={}", t->id, nerr));
                 }
+                t->done.store(true, std::memory_order_release);
+                t->cv.notify_all();
+                cell::sys::logger::instance().info("bg", std::format("task_finished id={} exit={} cmd={}", t->id, code, t->cmd));
                 notify_watcher(); });
                 worker.detach();
             }
@@ -7544,7 +7594,9 @@ namespace cell
             return t;
         }
         // Kill one task's whole process tree and wait (bounded) for its thread to
-        // finish. Returns a human-readable result either way.
+        // finish. Returns a human-readable result either way. Every caller is a
+        // user action (/task kill, the desktop task panel), so the flag is set
+        // here and the completion notice reports a user termination.
         inline std::string kill(const std::string &id)
         {
             auto t = find_task(id);
@@ -7555,6 +7607,7 @@ namespace cell
                 std::lock_guard lk(t->mx);
                 return std::format("task {} already finished (exit={})", t->id, t->exit_code);
             }
+            t->user_kill.store(true, std::memory_order_release);
             t->cancel.store(true, std::memory_order_release);
             std::unique_lock lk(t->mx);
             bool stopped = t->cv.wait_for(lk, std::chrono::seconds(5), [&t]
@@ -7580,6 +7633,7 @@ namespace cell
                                     {"wd", t->wd},
                                     {"session", t->session},
                                     {"running", t->running},
+                                    {"killed", t->user_kill.load(std::memory_order_acquire)},
                                     {"exit", t->running ? -1 : t->exit_code},
                                     {"elapsed", elapsed}};
                 if (tail_bytes)
@@ -14938,12 +14992,16 @@ namespace cell
         };
         // Scheduling phase for a tool call within a single agent turn. This is
         // orthogonal to Policy (which governs sandbox/approval gating):
-        //   Concurrent — may run on the shared worker pool in pass 1, in parallel
-        //                with other Concurrent tools (read-only, no shared state).
-        //   Deferred   — runs sequentially in pass 2, after every Concurrent tool
-        //                in the same assistant message has finished. Use this for
-        //                any tool that mutates shared session state or that must
-        //                observe the results of pass-1 reads (write/edit read-before-edit rule).
+        //   Concurrent — runs in the parallel pass, overlapping with every other
+        //                Concurrent call in the same assistant message. Calls that
+        //                name the same file share a conflict lane and still run in
+        //                submission order (see the runner's lane table), so
+        //                read→edit of one file stays ordered while writes to
+        //                different files — and separate exec commands — overlap.
+        //   Deferred   — runs sequentially in the serial pass, after the parallel
+        //                one has finished. Use this for any tool that mutates
+        //                shared session state (tw creates/edits jobs, host tools
+        //                that drive a single UI surface).
         enum class Phase : unsigned char
         {
             Concurrent = 0,
@@ -14959,6 +15017,35 @@ namespace cell
             autoallow,
             claim, // transient: the file is held by another session's agent loop
         };
+        // ---- per-call termination -------------------------------------------
+        // The frontend's tool list can terminate ONE running call while the turn
+        // keeps going, so the flag belongs to the call, not to the turn
+        // (runtime::cancelled stays the turn-wide channel the stop button uses).
+        // Tool calls execute on pool / worker threads, so the runner publishes
+        // the call's token through a thread_local around execute(); long-running
+        // tools poll tools::stop_hit() and give up as soon as it flips.
+        class call_token
+        {
+            std::atomic<bool> hit_{false};
+
+        public:
+            void request() { hit_.store(true, std::memory_order_release); }
+            bool requested() const { return hit_.load(std::memory_order_acquire); }
+        };
+        inline thread_local std::shared_ptr<call_token> active_call;
+        // RAII: publish `t` as the call this thread is executing (nested scopes
+        // restore the caller's token, so a host tool may run a tool itself)
+        struct call_scope
+        {
+            std::shared_ptr<call_token> prev;
+            explicit call_scope(std::shared_ptr<call_token> t)
+                : prev(std::move(active_call)) { active_call = std::move(t); }
+            ~call_scope() { active_call = std::move(prev); }
+            call_scope(const call_scope &) = delete;
+            call_scope &operator=(const call_scope &) = delete;
+        };
+        // the call running on this thread asked to stop
+        inline bool call_terminated() { return active_call && active_call->requested(); }
         // What the sandbox mode gates on: the tool's own declaration of what it
         // does, instead of a hard-coded name list. ReadOnly allows Read + Notice
         // (the notice bus writes only inside the runtime root and is how a
@@ -15009,6 +15096,12 @@ namespace cell
             // already-exhausted stdin and report "rejected by user" for every
             // exec, and a worker thread would race the main thread for input.
             std::function<bool(const std::string &tool, const std::string &args, std::string &reason)> approval_prompt;
+            // Serializes approval prompts. Ask tools now run in the parallel pass
+            // (exec keeps its process off the tool pool), so two of them can reach
+            // the prompt at the same time — while every frontend shows one card at
+            // a time. Taking this lock makes them queue instead of fighting over
+            // the card. Unset = no serialization (tests, a host-built runtime).
+            std::mutex *approval_mx = nullptr;
             // Enriches action_json before autoallow validation (tw run loads the
             // job config); returns the enriched JSON string.
             std::function<std::string(const std::string &, const std::string &)> action_enricher;
@@ -15048,6 +15141,36 @@ namespace cell
             // 未设置 = 不可取消（单元测试、宿主自建 runtime）。
             std::function<bool()> cancelled;
         };
+        // true when the running call must give up: the turn was stopped, or the
+        // user terminated this one call from the tool list. Every long-running
+        // tool polls this (exec passes it to spawn_cmd, which kills the tree).
+        inline bool stop_hit(const runtime &rt)
+        {
+            return call_terminated() || (rt.cancelled && rt.cancelled());
+        }
+        // ---- conflict lane for the parallel tool pass -------------------------
+        // Calls that name the same file share one lane and run in submission
+        // order; an empty key means "its own lane". Only the file tools expose a
+        // resource: a shell command is opaque, so every exec overlaps freely.
+        // The key is the absolutized, canonicalized path — two spellings of one
+        // file must not end up in different lanes.
+        inline std::string conflict_lane(const std::string &name, const std::string &args,
+                                         const std::filesystem::path &cwd)
+        {
+            if (name != "read" && name != "write" && name != "edit")
+                return "";
+            nlohmann::json j = nlohmann::json::parse(args, nullptr, false);
+            if (!j.is_object() || !j.contains("path") || !j["path"].is_string())
+                return "";
+            std::string p = cell::text::trim(j["path"].get<std::string>());
+            if (p.empty())
+                return "";
+            std::filesystem::path abs(p);
+            if (abs.is_relative() && !cwd.empty())
+                abs = cwd / abs;
+            std::string key = cell::normalize_path(abs.string());
+            return key.empty() ? abs.lexically_normal().generic_string() : key;
+        }
         // 宿主自定义工具：核心不认识、由前端自己实现的能力（舞台动作、设备控制、
         // 自家的业务接口……）。宿主用 runner::set_host_tools() 注册一个提供者，
         // build_tools 会把返回的每一条都当成普通工具挂进工具表 —— 名字、参数、
@@ -15176,9 +15299,28 @@ namespace cell
                     {
                         // approval goes through the installed channel (see
                         // tools::runtime::approval_prompt): never read stdin
-                        // directly here
+                        // directly here. Ask tools run in the parallel pass now,
+                        // so the prompt is taken under the runtime's approval
+                        // lock — one question at a time is what the frontend can
+                        // show (see runtime::approval_mx).
                         auto &prompt = rt.approval_prompt;
                         std::string reason;
+                        std::unique_lock<std::mutex> ap_lock;
+                        if (rt.approval_mx)
+                            ap_lock = std::unique_lock<std::mutex>(*rt.approval_mx);
+                        // The user may have terminated THIS call while it queued
+                        // behind another question: asking now would show a card
+                        // for a call that is already gone, and the answer could
+                        // never matter. Check under the lock, right before the
+                        // prompt, so only the window inside prompt() itself is
+                        // left (denying that card still ends in the marker).
+                        if (stop_hit(rt))
+                        {
+                            output = deny(rejection_reason::user,
+                                          std::format("[{}] the user terminated this call before it was asked about", name()),
+                                          "terminated_before_approval");
+                            return false;
+                        }
                         bool approved = prompt && prompt(name(), input, reason);
                         if (!approved)
                         {
@@ -25144,23 +25286,25 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             out.text = std::move(numbered);
             return out;
         });
-    add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).", {{"path", str_prop("file path")}, {"content", str_prop("text content")}}, {"path", "content"}, Policy::Allow, ToolKind::Write, [](const nlohmann::json &j, const cell::tools::runtime &) -> cell::ToolOutput
+    add("write", "Create a NEW file with the given content. Refuses to overwrite an existing file (use edit instead) and refuses when the parent directory is missing (create it first with exec: mkdir -p <dir>).\n"
+                 "Several write/edit/exec calls issued in ONE message run concurrently: write every independent file of a change set in the same message instead of one message per file. Two calls that name the same path stay ordered (submission order). A write into a directory another call of the same message creates still has to wait for a later message.", {{"path", str_prop("file path")}, {"content", str_prop("text content")}}, {"path", "content"}, Policy::Allow, ToolKind::Write, [](const nlohmann::json &j, const cell::tools::runtime &) -> cell::ToolOutput
         { cell::ToolOutput out;
           out.ok = cell::box::write_new(j.value("path", ""), j.value("content", ""), out.text);
-          return out; }, Phase::Deferred);
+          return out; });
     add("edit", "Modify an existing file. The 'mode' parameter selects the operation (default 'replace'):\n"
                 "  replace — find the unique 'search' text and replace it with 'content'. Use a short unique snippet for small precise changes, or a multi-line block with context for large whole-block rewrites. Non-unique search aborts with every match reported.\n"
                 "  insert  — insert 'content' immediately AFTER the unique 'search' text; if 'search' is empty, insert after the 1-based line given in 'from'.\n"
                 "  append  — append 'content' at the end of the file.\n"
                 "  delete  — delete the unique 'search' text; if 'search' is empty, delete the 1-based inclusive line range 'from'..'to'.\n"
                 "  query   — locate 'search' and report every match with line numbers and surrounding context; read-only, never modifies.\n"
-                "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.",
+                "Rule: the file (or the exact lines touched) must have been returned by a prior read tool call, otherwise the edit is refused. Paths must pass the sandbox.\n"
+                "Edits of DIFFERENT files issued in one message run concurrently; two calls on the SAME file run in submission order, and a read of that file in the same message always lands before the edit.",
         {{"path", str_prop("file path")}, {"mode", str_prop("replace | insert | append | delete | query (default replace)")}, {"search", str_prop("exact text block to locate (must be unique for replace/insert/delete)")}, {"content", str_prop("replacement text (replace) or text to insert/append")}, {"from", num_prop("1-based line: insert-after line, or delete range start")}, {"to", num_prop("1-based inclusive end line for delete range")}}, {"path"}, Policy::Allow, ToolKind::Write, [](const nlohmann::json &j, const cell::tools::runtime &) -> cell::ToolOutput
         { cell::ToolOutput out;
           out.ok = cell::box::edit(j.value("path", ""), j.value("mode", "replace"),
                                    j.value("search", ""), j.value("content", ""),
                                    num_arg(j, "from", 0), num_arg(j, "to", 0), out.text);
-          return out; }, Phase::Deferred);
+          return out; });
     add("rg", "Search file contents recursively with regex support. Skips hidden files/directories and .gitignore'd paths. Returns up to max_results matches grouped by file as 'line: content'. Supports case-insensitive search, context lines, file extension filtering, and count-only mode. Prefer this when searching by content.",
         {{"pattern", str_prop("regex pattern (supports full ECMAScript regex syntax)")},
          {"path", str_prop("directory to search (default .)")},
@@ -25180,7 +25324,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             return out;
         });
     add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input. High-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) require a second confirmation.\n"
-                "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). When the task finishes you receive a notice automatically on your next turn with its exit code and output tail — do NOT poll /tasks or call the notice wait tool to wait for it; just continue your work or tell the user it is running and the result will arrive.",
+                "Several exec calls issued in ONE message run concurrently (each on its own thread) — issue independent commands together. Commands are opaque, so the engine cannot order them: never put commands that depend on each other's result or touch the same tree into one message, split them across messages instead. Every exec asks for approval unless autoallow is on; the questions are asked one at a time.\n"
+                "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). When the task finishes you receive a notice automatically on your next turn with its exit code and output tail — do NOT poll /tasks or call the notice wait tool to wait for it; just continue your work or tell the user it is running and the result will arrive. If the USER stops that task from the task panel you get a notice saying so — it will never finish, so do not wait for it.",
         {{"cmd", str_prop("shell command to execute")},
          {"timeout", num_prop("timeout in seconds, default 30, max 300 (ignored when background=true)")},
          {"wd", str_prop("working directory for the command (optional, defaults to cwd)")},
@@ -25225,7 +25370,11 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             if (!(timeout > 0) || timeout > 300)
                 timeout = 30.0;
             int exit_code = 1;
-            out.ok = cell::box::exec(j.value("cmd", ""), timeout, out.text, exit_code, j.value("wd", ""), rt.cancelled);
+            // stop_hit() folds the turn-wide stop and the per-call terminate
+            // button into one flag: either one kills the process tree
+            out.ok = cell::box::exec(j.value("cmd", ""), timeout, out.text, exit_code, j.value("wd", ""),
+                                     [&rt]() -> bool
+                                     { return cell::tools::stop_hit(rt); });
             out.text += std::format("exitcode={}", exit_code);
             return out;
         });
@@ -25805,6 +25954,23 @@ static int run_selftest()
         R.expect(!cell::box::check_exec(std::format("cat {}", (cell::root / ".crypt").string())), "exec blocks vault file read");
         R.expect(!cell::box::check_exec(std::format("cat {}", (cell::root / ".key").string())), "exec blocks master key read");
         R.expect(!cell::box::check_exec(std::format("type {}", (cell::root / "config.json").string())), "exec blocks config read");
+        // 2026-11-17 relax: the old sensitive-word list falsely blocked ordinary
+        // commands merely containing /logs/, /sessions/ or config.json substrings.
+        // Only a REAL canonically-resolved path into a guard root may be refused.
+        R.expect(cell::box::check_exec("tail -n 20 logs/app.log"), "exec allows workspace log path");
+        R.expect(cell::box::check_exec("grep -r x sessions/"), "exec allows sessions/ substring off the runtime root");
+        R.expect(cell::box::check_exec("cat ./config.json"), "exec allows cwd config.json off the runtime root");
+        R.expect(cell::box::check_exec("node --config=./config.json build.js"), "exec allows option carrying config.json");
+        // fs boundary is component-wise: a sibling dir sharing the guard prefix
+        // is NOT inside it.
+        {
+            std::error_code pec;
+            auto sibling = cell::root.string() + "_evil";
+            std::filesystem::create_directories(sibling, pec);
+            R.expect(cell::box::check_exec("ls " + sibling),
+                     "exec allows guard prefix sibling (component boundary)");
+            std::filesystem::remove_all(sibling, pec);
+        }
         cell::box::sandbox_mode() = saved;
     }
 
@@ -26788,16 +26954,20 @@ static int run_selftest()
                      tool_list["edit"]->policy() == cell::tools::Policy::Allow &&
                      tool_list["exec"]->policy() == cell::tools::Policy::Ask,
                  "mutating tool policies: write/edit Allow, exec Ask");
-        // Phase is orthogonal to Policy: read-only tools are Concurrent (pass 1,
-        // parallel worker pool); write/edit are Deferred (pass 2, sequential).
+        // Phase is orthogonal to Policy: every file tool (and exec) runs in the
+        // parallel pass; only tools that mutate shared session state (tw, host
+        // tools) stay Deferred and therefore serial.
         R.expect(tool_list["ls"]->schedule() == cell::tools::Phase::Concurrent &&
                      tool_list["read"]->schedule() == cell::tools::Phase::Concurrent &&
                      tool_list["rg"]->schedule() == cell::tools::Phase::Concurrent &&
                      tool_list["find"]->schedule() == cell::tools::Phase::Concurrent,
                  "read-only tools are Concurrent phase");
-        R.expect(tool_list["write"]->schedule() == cell::tools::Phase::Deferred &&
-                     tool_list["edit"]->schedule() == cell::tools::Phase::Deferred,
-                 "write/edit are Deferred phase");
+        R.expect(tool_list["write"]->schedule() == cell::tools::Phase::Concurrent &&
+                     tool_list["edit"]->schedule() == cell::tools::Phase::Concurrent &&
+                     tool_list["exec"]->schedule() == cell::tools::Phase::Concurrent,
+                 "write/edit/exec are Concurrent phase (they overlap in one message)");
+        R.expect(tool_list["tw"]->schedule() == cell::tools::Phase::Deferred,
+                 "tw stays Deferred (it mutates shared job state)");
         for (auto &d : tool_defs)
             R.expect(d.contains("name") ? d.contains("description")
                                         : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
@@ -26872,6 +27042,139 @@ static int run_selftest()
         for (int i = 0; i < 16; i++)
             cell::box::remove(std::format("conc_dir/f{:02d}.txt", i));
         R.expect(cell::box::remove("conc_dir"), "conc cleanup");
+    }
+
+    {
+        // conflict lanes for the parallel tool pass: one lane per file (however
+        // the path is spelled), none for exec — that is what makes two edits of
+        // one file ordered while independent calls overlap
+        const std::filesystem::path ws_dir = "D:/ws";
+        const std::string a1 = cell::tools::conflict_lane("edit", R"({"path":"src/a.cpp"})", ws_dir);
+        const std::string a2 = cell::tools::conflict_lane("read", R"({"path":"./src/a.cpp"})", ws_dir);
+        const std::string b = cell::tools::conflict_lane("write", R"({"path":"src/b.cpp"})", ws_dir);
+        R.expect(!a1.empty() && a1 == a2, "same file, one conflict lane (any spelling)");
+        R.expect(a1 != b, "different files, different lanes");
+        R.expect(cell::tools::conflict_lane("exec", R"({"cmd":"make"})", ws_dir).empty(),
+                 "exec gets its own lane (parallel)");
+        R.expect(cell::tools::conflict_lane("edit", R"({"mode":"append"})", ws_dir).empty(),
+                 "a call without a path gets its own lane");
+    }
+
+    {
+        // per-call termination: the token published on this thread is what the
+        // long-running tools poll (exec hands it to spawn_cmd); a nested scope
+        // restores the caller's token, so a host tool may run a tool itself
+        auto outer = std::make_shared<cell::tools::call_token>();
+        auto inner = std::make_shared<cell::tools::call_token>();
+        cell::tools::runtime rt;
+        rt.cancelled = []() -> bool
+        { return false; };
+        R.expect(!cell::tools::stop_hit(rt), "no token published: nothing is cancelled");
+        {
+            cell::tools::call_scope s1(outer);
+            R.expect(!cell::tools::stop_hit(rt), "a fresh call is not cancelled");
+            inner->request();
+            {
+                cell::tools::call_scope s2(inner);
+                R.expect(cell::tools::stop_hit(rt), "a terminated call stops");
+            }
+            inner.reset();
+            R.expect(!cell::tools::stop_hit(rt), "the outer call is unaffected (scope restored)");
+            outer->request();
+            R.expect(cell::tools::stop_hit(rt), "the terminated outer call stops");
+        }
+        R.expect(!cell::tools::call_terminated(), "no call published after the scope exits");
+        rt.cancelled = []() -> bool
+        { return true; };
+        R.expect(cell::tools::stop_hit(rt), "the turn-wide stop also stops a call");
+    }
+
+    {
+        // a call terminated while it queued behind another approval question
+        // must not put a card on screen for something that is already gone
+        auto [tools, defs] = build_tools(false);
+        (void)defs;
+        auto it = tools.find("exec");
+        R.expect(it != tools.end(), "precondition: the exec tool is registered");
+        if (it != tools.end())
+        {
+            int asked = 0;
+            std::mutex ap_mx;
+            cell::tools::runtime rt;
+            rt.cancelled = []() -> bool
+            { return false; };
+            rt.approval_mx = &ap_mx;
+            rt.approval_prompt = [&asked](const std::string &, const std::string &, std::string &) -> bool
+            { ++asked; return false; }; // deny: nothing is ever executed here
+            auto tok = std::make_shared<cell::tools::call_token>();
+            cell::tools::call_scope scope(tok);
+
+            (void)it->second->execute(rt, R"({"cmd":"echo hi"})");
+            R.expect(asked == 1, "a live call still asks before it runs");
+
+            tok->request();
+            asked = 0;
+            cell::ToolOutput out = it->second->execute(rt, R"({"cmd":"echo hi"})");
+            R.expect(asked == 0, "a terminated call never shows an approval card");
+            R.expect(out.blocked, "it comes back blocked instead of running");
+            R.expect(out.text.find("terminated") != std::string::npos,
+                     "the reason names the user's termination");
+        }
+    }
+
+    {
+        // a background task the USER kills reports a user termination as a
+        // notice: an ordinary "finished (exit=...)" line reads like a failure
+        // and invites a pointless retry, or a wait that never ends
+#ifdef _WIN32
+        const std::string long_cmd = "cmd /c ping -n 30 127.0.0.1 >nul";
+#else
+        const std::string long_cmd = "sleep 30";
+#endif
+        const std::string sid = "selftest-bgkill";
+        std::error_code ec;
+        std::filesystem::remove_all(cell::session_dir(sid), ec);
+        std::string err;
+        auto task = cell::bg::spawn(long_cmd, "", sid, err);
+        R.expect(task != nullptr, "bg: a long command mounts on its own thread");
+        if (task)
+        {
+            const std::string msg = cell::bg::kill(task->id);
+            R.expect(msg.contains("killed"), "bg: the user kill stops the process tree");
+            // the notice is written right AFTER the task marks itself done, so
+            // the kill's return is not proof it already landed: poll briefly
+            nlohmann::json note;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline && note.is_null())
+            {
+                for (std::filesystem::directory_iterator it(cell::session_dir(sid) / "notices" / "pending", ec), end;
+                     !ec && it != end; it.increment(ec))
+                {
+                    if (it->path().extension() != ".json")
+                        continue;
+                    std::ifstream f(it->path(), std::ios::binary);
+                    auto j = nlohmann::json::parse(f, nullptr, false);
+                    if (j.is_object() && j.value("topic", "") == "bg-task-terminated")
+                    {
+                        note = j;
+                        break;
+                    }
+                }
+                if (note.is_null())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            R.expect(!note.is_null(), "bg: the user kill lands in the session as a notice");
+            if (!note.is_null())
+            {
+                R.expect(note.value("from", "") == "user", "bg: the termination notice comes from the user");
+                R.expect(note.value("body", "").contains("TERMINATED BY THE USER"),
+                         "bg: the notice says the user terminated the task");
+                R.expect(note.value("body", "").contains(task->id), "bg: the notice names the task");
+            }
+            R.expect(cell::bg::kill(task->id).contains("already finished"),
+                     "bg: killing a finished task reports it instead of killing again");
+        }
+        std::filesystem::remove_all(cell::session_dir(sid), ec);
     }
 
     {
@@ -29772,7 +30075,7 @@ static cell::encrypt::secure_string resolve_provider_key(const cell::config::pro
 //  compaction and interrupts are all reported through the `events` callbacks
 //  instead of stdout, so the terminal REPL and the WebView desktop shell
 //  (cell-app.cpp) drive the SAME rounds. The turn logic — round loop, retry
-//  policy, pass-1 concurrent / pass-2 deferred tool scheduling, overflow
+//  policy, the parallel / serial tool scheduling, overflow
 //  compaction, stats, transcript writes — lives HERE and only here: the REPL
 //  runs its turns through runner too, its former inline copy is gone.
 //  Threading contract: run_turn() runs on the caller's thread, the callbacks
@@ -29786,11 +30089,12 @@ namespace cell
         // ---- turn event payloads ---------------------------------------------
         struct tool_view
         {
+            std::string call;      // per-turn call id ("c7"): the terminate button's handle
             size_t seq = 0;        // 1-based position in the model's tool_call list
             std::string name;      // tool key (ls / read / exec / ...)
             std::string args;      // raw arguments JSON, truncated for display
             std::string policy;    // begin: allow|defer|ask|deny; end: unchanged
-            std::string status;    // end: ok|failed|blocked|unknown|exception
+            std::string status;    // end: ok|failed|blocked|unknown|exception|terminated
             std::string display;   // end: console-safe output, truncated for display
             std::string marker;    // end: path/cmd marker extracted by harden_tool_result
             double sec = 0;        // end: wall time of the execution
@@ -29996,6 +30300,11 @@ namespace cell
         // these bounds only keep one event payload sane for a frontend)
         constexpr size_t kToolArgsDisplayMax = 2048;
         constexpr size_t kToolOutputDisplayMax = 64 * 1024;
+        // What a call terminated from the tool list reports — to the model, to
+        // the transcript and to the frontend alike. Fixed text on purpose: the
+        // result must say WHO ended the call, not what the tool managed to
+        // produce before it was killed.
+        constexpr const char *kToolTerminated = "User terminated this toolcall";
 
         // ---- the turn runner --------------------------------------------------
         class runner
@@ -30113,6 +30422,23 @@ namespace cell
 
             // compact the live session on demand (a frontend's /compact)
             std::string compact_now(const events &ev) { return compact(h_.now(), ev); }
+
+            // Terminate ONE running tool call (the tool list's stop button):
+            // the call reports "User terminated this toolcall" and the turn
+            // continues. False = no such call — already finished, or the id is
+            // stale (a previous round's call).
+            bool terminate_call(const std::string &id, std::string &err)
+            {
+                std::lock_guard<std::mutex> lk(calls_mx_);
+                auto it = live_calls_.find(id);
+                if (it == live_calls_.end())
+                {
+                    err = std::format("no running tool call '{}' - it may already have finished", id);
+                    return false;
+                }
+                it->second->request();
+                return true;
+            }
 
             // pending notices -> transcript (+ on_notice events); also runs at the
             // start of every fresh turn. Returns how many were delivered.
@@ -30297,6 +30623,16 @@ namespace cell
             std::atomic<const events *> current_events_{nullptr};
             // cleared at the start of every turn, set by cancel_requested()
             std::atomic<bool> cancel_latched_{false};
+            // ---- per-call termination -----------------------------------------
+            // live_calls_ maps the id a frontend sees (tool_view::call) to the
+            // token its row's stop button flips. Repopulated per tool batch and
+            // cleared when the batch's results are in, so a stale id finds
+            // nothing instead of hitting an unrelated later call.
+            std::mutex calls_mx_;
+            std::map<std::string, std::shared_ptr<cell::tools::call_token>> live_calls_;
+            std::atomic<unsigned long long> call_seq_{0};
+            // one approval question at a time (see runtime::approval_mx)
+            std::mutex approval_prompt_mx_;
         };
 
         void runner::install_runtime()
@@ -30317,6 +30653,9 @@ namespace cell
             // 走 cancel_requested() 而不是直接问 ev：Esc 被消费后仍要粘住
             tool_rt_.cancelled = [this]() -> bool
             { return cancel_requested(); };
+            // Ask tools share one approval card in every frontend: parallel exec
+            // calls queue here instead of overwriting each other's question
+            tool_rt_.approval_mx = &approval_prompt_mx_;
             tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action) -> std::string
             { return autoallow_check(tool, action); };
             tool_rt_.approval_required = [](const std::string &tool, const std::string &operation) -> bool
@@ -31058,21 +31397,39 @@ namespace cell
                 {
                     struct tresult
                     {
-                        std::string name, args, policy, status, output;
+                        std::string call, name, args, policy, status, output;
                         double sec = 0;
                         bool blocked = false;
                         cell::tools::rejection_reason rejected_for = cell::tools::rejection_reason::none;
                         std::vector<cell::ContentBlock> multimodal_blocks;
                     };
-                    std::vector<tresult> res(tool_calls.size());
-                    tool_calls_ += tool_calls.size();
-                    turn_tool_calls += (long long)tool_calls.size();
+                    const size_t n_calls = tool_calls.size();
+                    std::vector<tresult> res(n_calls);
+                    // one token per call: the tool list's stop button flips exactly one
+                    std::vector<std::shared_ptr<cell::tools::call_token>> tokens(n_calls);
+                    std::vector<std::string> lanes(n_calls); // conflict lane ("" = its own)
+                    std::vector<size_t> par, ser;            // parallel / serial pass
+                    tool_calls_ += n_calls;
+                    turn_tool_calls += (long long)n_calls;
+                    // the ids are live only while this batch runs: a frontend that
+                    // sends a stale one must not terminate a later, unrelated call
+                    struct live_calls_guard
+                    {
+                        std::mutex &mx;
+                        std::map<std::string, std::shared_ptr<cell::tools::call_token>> &m;
+                        ~live_calls_guard()
+                        {
+                            std::lock_guard<std::mutex> lk(mx);
+                            m.clear();
+                        }
+                    } calls_guard{calls_mx_, live_calls_};
                     // frontends see every call as soon as its policy is known
                     auto emit_begin = [&](size_t i)
                     {
                         if (!ev.on_tool_begin)
                             return;
                         tool_view tvb;
+                        tvb.call = res[i].call;
                         tvb.seq = i + 1;
                         tvb.name = res[i].name;
                         tvb.args = trunc_str(res[i].args, kToolArgsDisplayMax);
@@ -31085,6 +31442,20 @@ namespace cell
                     auto record = [&](size_t i, cell::tools::tool *t, cell::ToolOutput o, double sec)
                     {
                         (void)t;
+                        // A call the user terminated reports the fixed marker instead
+                        // of whatever the tool managed to produce before it was
+                        // killed: the model has to learn that the USER ended this
+                        // one, not that the command merely failed.
+                        if (tokens[i] && tokens[i]->requested())
+                        {
+                            res[i].output = kToolTerminated;
+                            res[i].status = "terminated";
+                            res[i].blocked = false;
+                            res[i].rejected_for = cell::tools::rejection_reason::none;
+                            res[i].multimodal_blocks.clear();
+                            res[i].sec = sec;
+                            return;
+                        }
                         if (o.ok)
                         {
                             res[i].output = std::move(o.text);
@@ -31092,7 +31463,7 @@ namespace cell
                         }
                         else if (o.blocked)
                         {
-                            // pass-1 tools run concurrently on one shared tool
+                            // parallel tools run concurrently on one shared tool
                             // instance: the verdict has to come from THIS result
                             res[i].blocked = true;
                             res[i].rejected_for = (cell::tools::rejection_reason)o.reject_reason;
@@ -31107,14 +31478,20 @@ namespace cell
                         res[i].multimodal_blocks = std::move(o.blocks);
                         res[i].sec = sec;
                     };
-                    // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
-                    // run concurrently on the shared worker pool (max_threads); Deferred
-                    // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
-                    auto allow_batch = std::make_shared<cell::sys::pool_batch>();
-                    size_t allow_count = 0;
-                    for (size_t i = 0; i < tool_calls.size(); i++)
+                    // ---- classify: policy, conflict lane, which pass ----------
+                    // Phase decides the pass, Policy only the gating:
+                    //   Concurrent + Allow (ls/read/rg/find/write/edit) → parallel
+                    //   Concurrent + Ask   (exec)                       → parallel, own thread
+                    //   Deferred   + *     (tw, host tools)             → serial, in order
+                    for (size_t i = 0; i < n_calls; i++)
                     {
                         auto &tc = tool_calls[i];
+                        res[i].call = std::format("c{}", call_seq_.fetch_add(1, std::memory_order_relaxed) + 1);
+                        tokens[i] = std::make_shared<cell::tools::call_token>();
+                        {
+                            std::lock_guard<std::mutex> lk(calls_mx_);
+                            live_calls_[res[i].call] = tokens[i];
+                        }
                         res[i].name = tc["function"].value("name", "");
                         res[i].args = tc["function"].value("arguments", "");
                         res[i].policy = "?";
@@ -31127,60 +31504,164 @@ namespace cell
                             res[i].status = "unknown";
                             cell::sys::logger::instance().warn("tool", std::format("call_unknown name={} args={}", res[i].name, trunc_str(res[i].args, 200)));
                             emit_begin(i);
+                            continue;
                         }
-                        else if (it->second->policy() == cell::tools::Policy::Allow)
+                        const cell::tools::Policy pol = it->second->policy();
+                        const bool parallel_phase = it->second->schedule() == cell::tools::Phase::Concurrent;
+                        res[i].policy = pol == cell::tools::Policy::Ask       ? "ask"
+                                        : pol == cell::tools::Policy::Allow   ? (parallel_phase ? "allow" : "defer")
+                                                                              : "deny";
+                        emit_begin(i);
+                        if (pol == cell::tools::Policy::Deny)
+                            continue; // a policy verdict: nothing runs, nothing is queued
+                        if (!parallel_phase)
                         {
-                            // Allow tools scheduled as Phase::Deferred (write/edit)
-                            // run sequentially in pass 2: every read in the
-                            // same message must finish first (read-before-edit rule).
-                            // Concurrent Allow
-                            // tools (read-only) run on the shared worker pool now.
-                            if (it->second->schedule() == cell::tools::Phase::Deferred)
+                            ser.push_back(i);
+                            continue;
+                        }
+                        // Call-order conflict lane: calls that name the same file
+                        // share one lane and run in submission order — a read
+                        // followed by an edit of that file still lands in order,
+                        // and two edits of one file cannot lose each other's
+                        // write (edit is read-modify-write). Everything else,
+                        // exec included, gets its own lane and overlaps freely.
+                        lanes[i] = cell::tools::conflict_lane(res[i].name, res[i].args, tool_rt_.cwd);
+                        par.push_back(i);
+                    }
+                    // ---- parallel pass ---------------------------------------
+                    // Allow tools run on the shared pool. Ask tools (exec) run on a
+                    // thread of their own: an approval prompt — and a shell command
+                    // that may live for minutes — must never occupy a pool worker,
+                    // or a message full of parallel execs would starve the very
+                    // reads it also asked for.
+                    if (!par.empty())
+                    {
+                        // "my lane predecessor finished" latch. A job only ever
+                        // waits for one submitted BEFORE it, so even a saturated
+                        // pool cannot deadlock on itself.
+                        struct lane_gate
+                        {
+                            std::mutex mx;
+                            std::condition_variable cv;
+                            bool done = false;
+                            void finish()
                             {
-                                res[i].policy = "defer"; // sequential, no prompt
-                                emit_begin(i);
-                                continue;
+                                {
+                                    std::lock_guard<std::mutex> lk(mx);
+                                    done = true;
+                                }
+                                cv.notify_all();
                             }
-                            res[i].policy = "allow";
-                            allow_count++;
-                            emit_begin(i);
-                            cell::sys::pool().submit([&res, &record, this, it, i]
-                                                     {
-                            auto t0 = cell::sys::detail::clock::now();
-                            cell::ToolOutput o;
+                        };
+                        std::map<std::string, std::shared_ptr<lane_gate>> lane_tail;
+                        auto run_call = [&](size_t i, std::shared_ptr<lane_gate> prev,
+                                            std::shared_ptr<lane_gate> mine,
+                                            std::shared_ptr<cell::tools::call_token> tok,
+                                            std::shared_ptr<cell::tools::tool> tp)
+                        {
+                            // whatever happens, the next call of this lane must
+                            // be released — a throwing tool would otherwise hang
+                            // the whole lane
+                            struct gate_guard
+                            {
+                                std::shared_ptr<lane_gate> g;
+                                ~gate_guard()
+                                {
+                                    if (g)
+                                        g->finish();
+                                }
+                            } gate{mine};
                             try
                             {
-                                o = it->second->execute(tool_rt_, res[i].args);
+                                if (prev)
+                                {
+                                    // a terminated call stops waiting: it reports
+                                    // and lets the next call of its lane through
+                                    std::unique_lock<std::mutex> lk(prev->mx);
+                                    while (!prev->done)
+                                    {
+                                        if (tok->requested() || cancel_requested())
+                                            break;
+                                        prev->cv.wait_for(lk, std::chrono::milliseconds(50));
+                                    }
+                                }
+                                auto t0 = cell::sys::detail::clock::now();
+                                if (tok->requested())
+                                {
+                                    res[i].output = kToolTerminated;
+                                    res[i].status = "terminated";
+                                }
+                                else if (cancel_requested())
+                                {
+                                    // 停止/ Esc 已命中：不再执行（exec 在这里根本不会
+                                    // 起进程；已经在跑的由它自己的等待循环收尾）
+                                    res[i].output = "[cancelled: the user stopped this turn before the tool ran]";
+                                    res[i].status = "cancelled";
+                                }
+                                else
+                                {
+                                    cell::tools::call_scope scope(tok);
+                                    cell::ToolOutput o;
+                                    try
+                                    {
+                                        o = tp->execute(tool_rt_, res[i].args);
+                                    }
+                                    catch (const std::exception &e)
+                                    {
+                                        o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
+                                        res[i].status = "exception";
+                                    }
+                                    record(i, tp.get(), std::move(o), cell::sys::elapsed_ms(t0) / 1000.0);
+                                }
                             }
                             catch (const std::exception &e)
                             {
-                                o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
+                                res[i].output = std::format("[tool error: {}]", e.what());
                                 res[i].status = "exception";
                             }
-                            record(i, it->second.get(), std::move(o), cell::sys::elapsed_ms(t0) / 1000.0); }, allow_batch);
-                        }
-                        else
+                        };
+                        auto par_batch = std::make_shared<cell::sys::pool_batch>();
+                        std::vector<std::thread> own_threads;
+                        for (size_t i : par)
                         {
-                            res[i].policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny" : "ask";
-                            emit_begin(i);
+                            std::shared_ptr<lane_gate> prev, mine;
+                            if (!lanes[i].empty())
+                            {
+                                mine = std::make_shared<lane_gate>();
+                                if (auto tail = lane_tail.find(lanes[i]); tail != lane_tail.end())
+                                    prev = tail->second;
+                                lane_tail[lanes[i]] = mine;
+                            }
+                            auto tok = tokens[i];
+                            auto tp = tool_list_->find(res[i].name)->second;
+                            if (res[i].policy == "ask")
+                                own_threads.emplace_back([&run_call, i, prev, mine, tok, tp]
+                                                         { run_call(i, prev, mine, tok, tp); });
+                            else
+                                cell::sys::pool().submit([&run_call, i, prev, mine, tok, tp]
+                                                         { run_call(i, prev, mine, tok, tp); },
+                                                         par_batch);
                         }
+                        par_batch->wait();
+                        for (auto &th : own_threads)
+                            if (th.joinable())
+                                th.join();
                     }
-                    if (allow_count)
-                        allow_batch->wait();
-                    // pass 2: Phase::Deferred tools (write/edit — no prompt) and
-                    // confirm-required tools (exec) run sequentially, in order
-                    for (size_t i = 0; i < tool_calls.size(); i++)
+                    // ---- serial pass -----------------------------------------
+                    // Deferred tools (tw, host tools that drive one UI surface)
+                    // run one at a time, after every parallel call has finished
+                    for (size_t i : ser)
                     {
-                        // "deny" is a policy verdict, not a queue entry: pass 1
-                        // already marked it rejected, pass 2 must not run it
-                        if (res[i].policy != "defer" && res[i].policy != "ask")
+                        if (tokens[i]->requested())
+                        {
+                            res[i].output = kToolTerminated;
+                            res[i].status = "terminated";
                             continue;
+                        }
                         if (cancel_requested())
                         {
-                            // 停止/ Esc 已命中：不再执行任何后续工具（exec 在这里
-                            // 根本不会起进程；已经在跑的由它自己的等待循环收尾）
-                            cell::ToolOutput o = cell::ToolOutput::fail("[cancelled: the user stopped this turn before the tool ran]");
-                            record(i, nullptr, std::move(o), 0.0);
+                            // 停止/ Esc 已命中：不再执行任何后续工具
+                            res[i].output = "[cancelled: the user stopped this turn before the tool ran]";
                             res[i].status = "cancelled";
                             continue;
                         }
@@ -31190,6 +31671,7 @@ namespace cell
                         cell::ToolOutput o;
                         try
                         {
+                            cell::tools::call_scope scope(tokens[i]);
                             if (t)
                                 o = t->execute(tool_rt_, res[i].args);
                             else
@@ -31226,6 +31708,7 @@ namespace cell
                         if (ev.on_tool_end)
                         {
                             tool_view tve;
+                            tve.call = res[i].call;
                             tve.seq = tc_seq;
                             tve.name = res[i].name;
                             tve.args = trunc_str(res[i].args, kToolArgsDisplayMax);
@@ -31433,8 +31916,9 @@ namespace cell
 // =============================================================================
 //  repl — the agent session loop. main() parses the CLI, then hands the loaded
 //  configuration over; the request machinery, the slash-command dispatcher, the
-//  agent turn (pass 1 concurrent read-only tools, pass 2 sequential write/edit
-//  + confirmed exec) and the graceful exit guard all live here.
+//  agent turn (parallel pass for everything that may overlap — reads, writes,
+//  edits and shell commands — then a serial pass for stateful tools) and the
+//  graceful exit guard all live here.
 // =============================================================================
 class repl
 {

@@ -980,12 +980,27 @@ cell::teamwork   Teamwork job store (cached in memory), child-agent scheduler (s
 ## The agent loop
 
 ```
-user message ──▶ LLM (stream) ──▶ tool_calls? ──▶ pass 1: read-only tools, concurrent
-                    │                              pass 2: write/edit (sequential), exec (confirm)
+user message ──▶ LLM (stream) ──▶ tool_calls? ──▶ parallel pass: read/write/edit/exec, one lane per file
+                    │                             serial pass: tw and other stateful tools
                     │                                   │
                     │      results sanitized + wrapped ──▶ appended to transcript ──▶ next round
                     └──▶ no tool calls ──▶ final answer ──▶ session persisted
 ```
+
+**Tool scheduling.** Everything a turn can overlap runs at the same time: reads on the shared worker
+pool, `write`/`edit` too, and `exec` on a thread of its own (an approval question or a shell command
+must never occupy a pool worker). Calls that name the same file share a *conflict lane* and run in
+submission order, so `read a.cpp` + `edit a.cpp` in one message stay ordered and two edits of one file
+cannot lose each other's write; different files — and every exec, whose command is opaque — overlap
+freely. `Phase::Deferred` tools (`tw`, host tools that drive one UI surface) still run one at a time,
+after the parallel pass.
+
+**Terminating one call.** A frontend may terminate a single running call (`tool.cancel` with the
+`call` id `tool_begin` carried) without stopping the turn: the call's token flips, `exec` kills its
+process tree, and the result the model sees is the fixed text `User terminated this toolcall`. A
+background `exec` task the user kills from the task panel reports back as a notice
+(`from=user`, topic `bg-task-terminated`) instead of an ordinary exit, so the model knows not to wait
+for it or retry it.
 
 There is no fixed round cap: the loop continues until the model answers without tool calls, a call is
 blocked/rejected, the user cancels, or an error occurs. Each round logs `round=`, context size, token
