@@ -26768,6 +26768,17 @@ static int run_selftest()
         for (auto n : expected)
             all_present = all_present && tool_list.find(n) != tool_list.end();
         R.expect(all_present, "build_tools registers ls/read/write/edit/rg/exec/find");
+        // Q&A mode exposes exactly the ToolKind::Read tools; assert the kind
+        // classification the QA schema filter relies on (read_only_defs).
+        {
+            std::vector<std::string> reads;
+            for (auto &[n, t] : tool_list)
+                if (t->tool_kind() == cell::tools::ToolKind::Read)
+                    reads.push_back(n);
+            std::sort(reads.begin(), reads.end());
+            R.expect(reads == std::vector<std::string>{"find", "ls", "read", "rg"},
+                     "QA read-only tools are exactly find/ls/read/rg");
+        }
         R.expect(tool_list["read"]->policy() == cell::tools::Policy::Allow &&
                      tool_list["rg"]->policy() == cell::tools::Policy::Allow &&
                      tool_list["find"]->policy() == cell::tools::Policy::Allow &&
@@ -30044,6 +30055,30 @@ namespace cell
                 tool_defs_openai_ = std::move(tools_o.second);
                 tool_defs_anthropic_ = std::move(tools_a.second);
                 tool_defs_responses_ = std::move(tools_r.second);
+                // Derived read-only schema sets for Q&A-only sessions: keep only
+                // defs whose tool is declared ToolKind::Read. Filter by name via
+                // tool_list_ so every schema dialect is handled uniformly.
+                auto read_only_defs = [this](const nlohmann::json &defs)
+                {
+                    nlohmann::json out = nlohmann::json::array();
+                    for (const auto &def : defs)
+                    {
+                        if (!def.is_object())
+                            continue;
+                        std::string name;
+                        if (def.contains("function") && def["function"].is_object())
+                            name = def["function"].value("name", "");
+                        else
+                            name = def.value("name", "");
+                        auto it = tool_list_->find(name);
+                        if (it != tool_list_->end() && it->second->tool_kind() == cell::tools::ToolKind::Read)
+                            out.push_back(def);
+                    }
+                    return out;
+                };
+                qa_defs_openai_ = read_only_defs(tool_defs_openai_);
+                qa_defs_anthropic_ = read_only_defs(tool_defs_anthropic_);
+                qa_defs_responses_ = read_only_defs(tool_defs_responses_);
             }
 
             cell::tools::runtime &tools_rt() { return tool_rt_; }
@@ -30142,12 +30177,13 @@ namespace cell
                          nlohmann::json &tc, nlohmann::json &usage, std::string &err,
                          bool with_tools = true, int think_level = 0,
                          cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr,
-                         long *http_status = nullptr)
+                         long *http_status = nullptr, bool read_only = false)
             {
                 nlohmann::json no_tools = nlohmann::json::array();
                 if (p.api_style == "anthropic")
                 {
-                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_anthropic_ : no_tools);
+                    const nlohmann::json &selected = read_only ? qa_defs_anthropic_ : tool_defs_anthropic_;
+                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? selected : no_tools);
                     auto &client = cache_.a(p.base);
                     client.set_proxy(p.proxy);
                     if (stream)
@@ -30156,7 +30192,8 @@ namespace cell
                 }
                 if (p.api_style == "openai-responses")
                 {
-                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_responses_ : no_tools);
+                    const nlohmann::json &selected = read_only ? qa_defs_responses_ : tool_defs_responses_;
+                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? selected : no_tools);
                     auto &client = cache_.r(p.base);
                     client.set_proxy(p.proxy);
                     if (stream)
@@ -30164,7 +30201,8 @@ namespace cell
                     return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
                 }
                 // default: openai-chat (Chat Completions)
-                const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_openai_ : no_tools);
+                const nlohmann::json &selected = read_only ? qa_defs_openai_ : tool_defs_openai_;
+                const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? selected : no_tools);
                 auto &client = cache_.o(p.base);
                 client.set_proxy(p.proxy);
                 client.set_extra_body(p.extra_body);
@@ -30244,6 +30282,10 @@ namespace cell
             std::function<nlohmann::json()> remote_cells_;
             std::function<nlohmann::json(const std::string &, const nlohmann::json &)> remote_work_;
             nlohmann::json tool_defs_openai_, tool_defs_anthropic_, tool_defs_responses_;
+            // Q&A-only sessions get a read-only tool set (ToolKind::Read:
+            // ls/read/rg/find), built from the same defs so each dialect stays
+            // valid. Regenerated alongside the full sets in rebuild_tools().
+            nlohmann::json qa_defs_openai_, qa_defs_anthropic_, qa_defs_responses_;
             cell::tools::runtime tool_rt_;
             cell::teamwork::runtime_context team_rt_;
             // act 的动作表变了（换模型 / 模型报回新清单）：下一回合开头重建工具定义
@@ -30832,9 +30874,10 @@ namespace cell
                     if (cell::chat::fold_system_messages(h_.now().msg()))
                         h_.now().note_rewrite();
                     http_status = 0;
-                    // Q&A-only session: send no tool schema and ignore any tool
-                    // calls the model still emits (with_tools=false yields no_tools).
-                    ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools && !h_.now().qa(), cfg_.think_level, &xfer_poll, &xc, &http_status);
+                    // Q&A-only session: send only the read-only tool schema
+                    // (ToolKind::Read) so the model can look files up but cannot
+                    // write/edit/exec. Non-read calls are still dropped below.
+                    ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools, cfg_.think_level, &xfer_poll, &xc, &http_status, h_.now().qa());
                     // the reply now exists on every path (success, cancel, error):
                     // stamp it before the overflow retry below may reset it
                     tag_reply();
@@ -30984,15 +31027,32 @@ namespace cell
                     for (auto &b : reply["content"])
                         if (b.is_object() && (b.value("type", "") == "reasoning" || b.value("type", "") == "thinking"))
                             turn_thinking_entries++;
-                // Q&A-only session: the model was sent no tool schema, but a
-                // stubborn model may still emit calls. Drop them (do not execute)
-                // so the session stays answer-only; tell the user via status.
+                // Q&A-only session: only read tools (ls/read/rg/find) are allowed.
+                // The model already saw just the read-only schema, but a stubborn
+                // model may still emit a write/exec call — drop those here and
+                // keep the read ones, so the session stays answer-only for writes.
                 if (h_.now().qa() && !tool_calls.empty())
                 {
-                    log.info("llm", std::format("qa session dropped tool_calls={}", tool_calls.size()));
-                    if (ev.on_status)
-                        ev.on_status("[Q&A mode] tool calls are disabled for this session");
-                    tool_calls = nlohmann::json::array();
+                    nlohmann::json kept = nlohmann::json::array();
+                    size_t dropped = 0;
+                    for (auto &tc : tool_calls)
+                    {
+                        const std::string name = (tc.contains("function") && tc["function"].is_object())
+                                                     ? tc["function"].value("name", "")
+                                                     : tc.value("name", "");
+                        auto it = tool_list_->find(name);
+                        if (it != tool_list_->end() && it->second->tool_kind() == cell::tools::ToolKind::Read)
+                            kept.push_back(tc);
+                        else
+                            dropped++;
+                    }
+                    if (dropped)
+                    {
+                        log.info("llm", std::format("qa session dropped non-read tool_calls={}", dropped));
+                        if (ev.on_status)
+                            ev.on_status(std::format("[Q&A mode] only read tools are allowed; blocked {} call(s)", dropped));
+                    }
+                    tool_calls = std::move(kept);
                 }
                 if (!tool_calls.empty())
                 {
