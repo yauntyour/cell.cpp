@@ -96,7 +96,7 @@ I could also demonstrate by listing the current directory to show what I can do.
 ## 执行 / 协作类
 | 工具 | 用途 |
 |---|---|
-| `exec` | 执行 shell 命令（默认超时 30 秒，最长 300 秒；高风险命令需二次确认） |
+| `exec` | 执行 shell 命令（默认超时 30 秒，最长 300 秒；必须带 `reason` 说明理由；高风险命令需二次确认） |
 | `tw` | 管理 Teamwork 子代理任务：支持串行 / 并行 / 多阶段 workflow，可复用之前的子任务 |
 | `notice` | 会话间消息总线：发送、列出、等待、清空通知 |
 
@@ -296,7 +296,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/think [off\|low\|med\|high\|max]` | Set the chain-of-thought level (persisted; an unknown level prints the usage and keeps the previous one); levels: off (default), low (1024 tokens), med (2048), high (4096), max (8192); bare `/think` shows the current level and budget |
 | `/tool [on\|off]` | Toggle tool calling — off means no tool definitions are sent at all |
 | `/sandbox [mode]` | Show or set the exec sandbox mode (persisted); valid values are `read-only`/`readonly`, `edit-only`/`edit`, `full-access`/`full` — anything else is refused with a usage error |
-| `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation |
+| `/autoallow [on\|off]` | Toggle autoallow mode (persisted, full-access only) — when enabled, the LLM decides whether exec commands run without user confirmation. Every call that needs approval must carry a `reason` (one sentence on WHY); the gate judges that note together with the command, and ordinary work in the workspace — including `rm` of project paths — is allowed |
 | `/sessions` | List saved sessions grouped by working directory (`>` = current cwd, `*` = current session) |
 | `/session ID` | Switch to a saved session; **the process cwd follows the session's directory** |
 | `/session rm ID` | Delete a session (folder with transcript, Teamwork data, archives) and its usage record |
@@ -466,9 +466,9 @@ schemas emitted for the active API style
 | `write` | Allow | `path`, `content` | Creates a **new** file only — refuses overwrites (points at `edit`) and refuses when the parent directory is missing (points at `exec: mkdir -p`); seeds the edit cache |
 | `edit` | Allow | `path` (required), `mode`, `search`, `content`, `from`, `to` | `replace` (unique SEARCH block → content), `insert` (after the block, or after line `from`), `append`, `delete` (block or line range), `query` (read-only locate). A non-unique `search` aborts and reports every match with context; an identical replace is a no-op; a `search` that ends with a newline the file does not have is retried without it (and the replacement drops its own trailing newline) |
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; follows a symlink only when it resolves inside the walk root; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines (overlapping context is printed once), file extension filtering, and count-only mode; 8M-line scan budget; exponential-backtracking shapes (`(a+)+`, `(a | b){3}`,`a{2}{3}`) and patterns over 200 chars are rejected |
-| `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately and bounded at 16 MiB each (further output is drained and dropped, never buffered); the child gets a NUL stdin handle (a windowed shell has no console stdin); wide-character `CreateProcess` keeps non-ASCII paths intact; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
+| `exec` | **Ask** | `cmd` (required), `reason` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); `reason` is one sentence on WHY the command is needed — shown in the approval card and read by the autoallow gate, and a call without it is refused before any prompt; the sandbox gate runs *before* the approval card, so a refused command (traversal, protected path, catastrophic delete) never reaches the user or the judge; stdout and stderr are captured separately and bounded at 16 MiB each (further output is drained and dropped, never buffered); the child gets a NUL stdin handle (a windowed shell has no console stdin); wide-character `CreateProcess` keeps non-ASCII paths intact; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata (a symlink is followed only when it resolves inside `path`; `name` is case-insensitive on Windows; a future `mtime` is never "recent"). When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Returns `path  size bytes  mtime (UTC)` per match |
-| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `editable`, `edit_rules`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
+| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `editable`, `edit_rules`, `limit`, `full`, `all`, `reason` (required for `run`) | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
 | `notice` | Allow | `operation` (send/list/drain/wait/clear), `session`, `from`, `topic`, `body`, `timeout`, `from_filter`, `topic_filter` | Cross-session message bus — see [Notices](#notices) |
 
 The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
@@ -621,8 +621,8 @@ across all its rounds, so parallel children never share a curl handle.
 | `report` | `id` + `worker` | prints one child's report |
 | `reports` | `id`, `worker`, `limit`, `full`, `all` | prints many child reports, newest first |
 
-`run` is the only `tw` operation that needs confirmation (`/autoallow` can waive it); the read-only
-queries are auto-approved.
+`run` is the only `tw` operation that needs confirmation (`/autoallow` can waive it), and it is the
+only one that must carry a `reason`; the read-only queries are auto-approved.
 
 ### Reports
 
@@ -780,14 +780,32 @@ deletes (`rm -rf`, `rm -r -f`, `del /s`, `rmdir /s`, …), permission changes (`
 (`commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `checkout`, `switch`, `stash`, `clean`,
 `reset`, `restore`).
 
+One deliberate exception to the path-only rule is the **catastrophic-delete floor**
+(`box::is_catastrophic_delete`): a delete whose target is a filesystem root, a drive root, the
+user's home directory, an OS directory (`/etc`, `/usr`, `C:\Windows`, …) or an OS-owned subtree is
+refused outright in every mode — no confirmation can approve it and autoallow never gets the chance
+to. It only looks at the command word of a delete (`rm`, `del`, `rmdir`, `rd`, `remove`, `unlink`,
+also behind `sudo`/`env`/`xargs` or after a shell operator) and at path-like targets; a quoted
+`"rm -rf /"` inside `git commit -m …` is not a delete. Everything else about deletion is left to
+the human or the autoallow gate.
+
 ### 4. Human confirmation
 
-`exec` is the only `Ask` tool: `allow exec({…})? [y/N]` — the argument is printed through
-`display_safe`, so injected JSON cannot erase the prompt or fake an approval. When **autoallow mode**
-is enabled (`/autoallow on`, full-access sandbox only), the LLM alone decides whether exec commands
-run without user confirmation — sandbox checks (sensitive paths) still apply. Approval refusals
-(from the user or autoallow) end the current agent run; sandbox security refusals are returned to
-the model as normal feedback.
+`exec` is the only `Ask` tool, and every call that reaches it must carry a `reason`: one short
+sentence on WHY the command is needed (`{"cmd":"rm -rf build","reason":"drop stale build output
+before a clean rebuild"}`). The note is what the approval card shows above the arguments, it is
+stripped from the JSON the command actually runs with, and it is what the autoallow gate judges
+intent by. A call without it is refused with a retryable `missing 'reason'` message instead of
+showing a card.
+
+`allow exec({…})? [y/N]` — the argument is printed through `display_safe`, so injected JSON cannot
+erase the prompt or fake an approval, and the reason is printed on its own line before it. When
+**autoallow mode** is enabled (`/autoallow on`, full-access sandbox only), an LLM gate decides
+whether exec commands run without user confirmation, reading the same note: ordinary project work —
+writes, deletes, builds, tests, git — is allowed, while catastrophic deletes, credentials, history
+rewrites, permission changes and paths outside the project are denied. Sandbox path checks and the
+catastrophic-delete floor still apply on top of it. Approval refusals (from the user or autoallow)
+end the current agent run; sandbox security refusals are returned to the model as normal feedback.
 
 ### 5. Output hardening
 
@@ -1158,7 +1176,8 @@ intentionally simpler than it looks:
   decode encoded payloads, or block network egress by binary name — they only reject path traversal
   and sensitive paths. Network egress is "denied" in the sense that there is no whitelist of allowed
   commands; `exec` is gated instead by the sandbox mode, a human confirmation (or autoallow), and the
-  high-risk second-confirmation list.
+  high-risk second-confirmation list. The one command-name rule is the catastrophic-delete floor
+  (`is_catastrophic_delete`), which refuses deletes of roots / home / OS trees in every mode.
 - Switching providers resets the model name: `--provider NAME` (existing provider), `/provide NAME`
   and `/provide add` all route through `config::select_provider`, which clears `current_model` when
   the selection actually changes. Re-selecting the already-active provider keeps its model, and an

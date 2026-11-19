@@ -3909,6 +3909,166 @@ namespace cell
             }
             return toks;
         }
+        // Hard floor under the autoallow relaxation: a delete aimed at a
+        // filesystem root, the user's home directory or an OS directory is
+        // refused outright — no confirmation can approve it and the LLM gate
+        // never gets the chance to allow it. Everything else about deletion is
+        // left to the path gate and (in autoallow mode) the judge: this is a
+        // short table of catastrophic targets, not a general command parser.
+        static bool is_catastrophic_delete(std::string_view call)
+        {
+            // exact targets that must never be deleted, already normalized
+            // (lowercase, '/' separators, no trailing separator or '*')
+            static constexpr std::string_view kRoots[] = {
+                "/", "~", "$home", "${home}", "%userprofile%", "%homedrive%%homepath%",
+                "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+                "/boot", "/dev", "/proc", "/sys", "/var", "/opt", "/root", "/home", "/users",
+                "/system", "/library", "/applications", "/private",
+                "c:/windows", "c:/program files", "c:/program files (x86)", "c:/programdata",
+                "c:/users", "c:/$recycle.bin",
+            };
+            // OS-owned trees: the whole subtree is off limits. /var, /opt and
+            // the home roots are deliberately absent — projects legitimately
+            // live under them, and a plain "rm -rf /var/www/app" is not
+            // catastrophic the way "rm -rf /var" is.
+            static constexpr std::string_view kTrees[] = {
+                "/etc/", "/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/boot/",
+                "/dev/", "/proc/", "/sys/", "/system/", "/library/", "/private/",
+                "c:/windows/", "c:/program files/", "c:/program files (x86)/",
+                "c:/programdata/",
+            };
+            auto lower = [](std::string_view s)
+            {
+                std::string r;
+                r.reserve(s.size());
+                for (char c : s)
+                    r += (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
+                return r;
+            };
+            // unquote, fold separators, drop a trailing separator / '*' so
+            // "C:\*" and "/*" name the same root as "C:\" and "/"
+            auto normalize = [&](std::string_view raw)
+            {
+                std::string s(raw);
+                if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') ||
+                                      (s.front() == '\'' && s.back() == '\'')))
+                    s = s.substr(1, s.size() - 2);
+                s = lower(s);
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s)
+                {
+                    if (c == '\\')
+                        c = '/';
+                    if (c == '/' && !out.empty() && out.back() == '/')
+                        continue;
+                    out += c;
+                }
+                while (!out.empty() && (out.back() == '/' || out.back() == '*'))
+                    out.pop_back();
+                // "/*" and "\\*" normalize to nothing: they name the root
+                if (out.empty())
+                    out = "/";
+                return out;
+            };
+            // a token is a delete target when it names a path; bare switches
+            // ("-r", "/s", "/q") and shell operators are not
+            auto target_like = [](std::string_view tok)
+            {
+                if (tok.empty() || tok.front() == '-')
+                    return false;
+                if (tok == "/" || tok == "\\")
+                    return true;
+                // "/s" / "/q" / "/c": a Windows-style switch, not a path —
+                // "/*" stays a target
+                if (tok.front() == '/' && tok.size() <= 2 &&
+                    ((tok[1] >= 'a' && tok[1] <= 'z') || (tok[1] >= 'A' && tok[1] <= 'Z') ||
+                     (tok[1] >= '0' && tok[1] <= '9')))
+                    return false;
+                return tok.find_first_of("/\\") != std::string_view::npos ||
+                       tok.front() == '~' || tok.front() == '$' || tok.front() == '%' ||
+                       tok.find(':') != std::string_view::npos;
+            };
+            size_t i = 0;
+            bool cmd_pos = true;   // the next token is a command word
+            bool deleting = false; // inside an rm-style argument list
+            while (i < call.size())
+            {
+                while (i < call.size() && (call[i] == ' ' || call[i] == '\t'))
+                    i++;
+                if (i >= call.size())
+                    break;
+                const size_t start = i;
+                while (i < call.size() && call[i] != ' ' && call[i] != '\t')
+                    i++;
+                std::string_view tok = call.substr(start, i - start);
+                // a token that ends in a shell operator starts a new command
+                // word ("rm -rf x; ls", "x && rm -rf y", "x | rm -rf y")
+                bool next_cmd = false;
+                while (!tok.empty() && (tok.back() == ';' || tok.back() == '&' ||
+                                        tok.back() == '|' || tok.back() == '('))
+                {
+                    next_cmd = true;
+                    tok.remove_suffix(1);
+                }
+                if (tok.empty())
+                {
+                    cmd_pos = next_cmd;
+                    deleting = false;
+                    continue;
+                }
+                const std::string low = lower(tok);
+                if (cmd_pos)
+                {
+                    if (low == "rm" || low == "del" || low == "rmdir" || low == "rd" ||
+                        low == "remove" || low == "unlink")
+                    {
+                        deleting = true;
+                        cmd_pos = false;
+                    }
+                    // wrappers keep the next word in command position
+                    else if (low != "sudo" && low != "doas" && low != "env" && low != "xargs" &&
+                             low != "nohup" && low != "time")
+                        cmd_pos = false;
+                    if (next_cmd)
+                    {
+                        cmd_pos = true;
+                        deleting = false;
+                    }
+                    continue;
+                }
+                if (deleting && target_like(tok))
+                {
+                    const std::string t = normalize(tok);
+                    for (auto r : kRoots)
+                        if (t == r)
+                            return true;
+                    // drive root: "c:" / "c:/"
+                    if (t.size() == 2 && t[1] == ':' && t[0] >= 'a' && t[0] <= 'z')
+                        return true;
+                    for (auto pre : kTrees)
+                        if (t.size() >= pre.size() && t.compare(0, pre.size(), pre) == 0)
+                            return true;
+                    // a home directory itself ("/home/u", "/users/u",
+                    // "c:/users/u"), but not what lives inside one
+                    for (auto pre : {"/home/", "/users/", "c:/users/"})
+                    {
+                        const std::string_view p{pre};
+                        if (t.size() < p.size() || t.compare(0, p.size(), p) != 0)
+                            continue;
+                        const std::string rest = t.substr(p.size());
+                        if (!rest.empty() && rest.find('/') == std::string::npos)
+                            return true;
+                    }
+                }
+                if (next_cmd)
+                {
+                    cmd_pos = true;
+                    deleting = false;
+                }
+            }
+            return false;
+        }
         // exec gate: path restrictions only. The old sensitive-word list (any
         // token containing "/config.json", "/logs/", "/sessions/"…) produced
         // endless false positives on ordinary commands; it is gone. What stays
@@ -3918,6 +4078,9 @@ namespace cell
         {
             // Check for path traversal (a real ".." path component)
             if (has_path_traversal(call))
+                return false;
+            // Catastrophic deletes never pass, whatever mode would approve them
+            if (is_catastrophic_delete(call))
                 return false;
             // Host-protected roots and the runtime root are read-only to the
             // agent: exec cannot name them. Canonically resolved, so a sibling
@@ -9200,7 +9363,8 @@ namespace cell
                 return true;
             }
 
-            inline std::string query(std::uint16_t id, std::string_view name, std::uint16_t type)
+            inline std::string query(std::uint16_t id, std::string_view name, std::uint16_t type,
+                                     bool unicast = false)
             {
                 std::string out;
                 put_u16(out, id);
@@ -9212,7 +9376,9 @@ namespace cell
                 if (!put_name(out, name))
                     return {};
                 put_u16(out, type);
-                put_u16(out, c_in);
+                // QU bit (RFC 6762 §5.4): ask for a unicast answer, the only kind
+                // that gets back over a link that swallows multicast (WSL mirrored)
+                put_u16(out, (std::uint16_t)(c_in | (unicast ? 0x8000 : 0)));
                 return out;
             }
 
@@ -9290,6 +9456,162 @@ namespace cell
             std::stable_partition(out.begin(), out.end(), [](const local_addr &a)
                                   { return !a.loopback; });
             return out;
+        }
+
+        // Interface prefixes (address + on-link length) for scope classification.
+        // The hostname resolve above carries no masks, so ask the OS directly.
+        struct local_prefix
+        {
+            asio::ip::address addr;
+            unsigned len = 0;
+        };
+        inline std::vector<local_prefix> local_prefixes()
+        {
+            std::vector<local_prefix> out;
+#ifdef _WIN32
+            ULONG sz = 16 * 1024;
+            std::vector<unsigned char> buf(sz);
+            auto *aa = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buf.data());
+            if (GetAdaptersAddresses(AF_UNSPEC,
+                                     GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                     nullptr, aa, &sz) != ERROR_SUCCESS)
+                return out;
+            for (auto *a = aa; a; a = a->Next)
+                for (auto *u = a->FirstUnicastAddress; u; u = u->Next)
+                {
+                    if (!u->Address.lpSockaddr)
+                        continue;
+                    const auto &sa = *u->Address.lpSockaddr;
+                    if (sa.sa_family == AF_INET)
+                    {
+                        const auto *s4 = reinterpret_cast<const sockaddr_in *>(&sa);
+                        out.push_back({asio::ip::address_v4(ntohl(s4->sin_addr.s_addr)), u->OnLinkPrefixLength});
+                    }
+                    else if (sa.sa_family == AF_INET6)
+                    {
+                        const auto *s6 = reinterpret_cast<const sockaddr_in6 *>(&sa);
+                        asio::ip::address_v6::bytes_type b;
+                        std::memcpy(b.data(), s6->sin6_addr.s6_addr, 16);
+                        out.push_back({asio::ip::address_v6(b, s6->sin6_scope_id), u->OnLinkPrefixLength});
+                    }
+                }
+#else
+            ifaddrs *ifs = nullptr;
+            if (getifaddrs(&ifs) != 0)
+                return out;
+            for (auto *i = ifs; i; i = i->ifa_next)
+            {
+                if (!i->ifa_addr || !i->ifa_netmask)
+                    continue;
+                if (i->ifa_addr->sa_family == AF_INET)
+                {
+                    const auto *a4 = reinterpret_cast<const sockaddr_in *>(i->ifa_addr);
+                    const auto *m4 = reinterpret_cast<const sockaddr_in *>(i->ifa_netmask);
+                    unsigned len = 0;
+                    for (std::uint32_t m = ntohl(m4->sin_addr.s_addr); m & 0x80000000u; m <<= 1)
+                        ++len;
+                    out.push_back({asio::ip::address_v4(ntohl(a4->sin_addr.s_addr)), len});
+                }
+                else if (i->ifa_addr->sa_family == AF_INET6)
+                {
+                    const auto *a6 = reinterpret_cast<const sockaddr_in6 *>(i->ifa_addr);
+                    const auto *m6 = reinterpret_cast<const sockaddr_in6 *>(i->ifa_netmask);
+                    unsigned len = 0;
+                    for (int b = 0; b < 16; b++)
+                    {
+                        unsigned char m = m6->sin6_addr.s6_addr[b];
+                        while (m & 0x80)
+                        {
+                            ++len;
+                            m = (unsigned char)(m << 1);
+                        }
+                        if (m)
+                            break;
+                    }
+                    asio::ip::address_v6::bytes_type b;
+                    std::memcpy(b.data(), a6->sin6_addr.s6_addr, 16);
+                    out.push_back({asio::ip::address_v6(b, a6->sin6_scope_id), len});
+                }
+            }
+            freeifaddrs(ifs);
+#endif
+            return out;
+        }
+
+        // host = this machine (loopback or one of our own addresses), lan = on a
+        // subnet we sit on, routed = everything else (VPN / Tailscale / internet).
+        inline std::string scope_for_addr(const std::string &text,
+                                          const std::vector<local_addr> &locals,
+                                          const std::vector<local_prefix> &prefixes)
+        {
+            boost::system::error_code ec;
+            const auto a = asio::ip::make_address(text, ec);
+            if (ec)
+                return "routed";
+            if (a.is_loopback())
+                return "host";
+            for (const auto &la : locals)
+                if (la.addr == text)
+                    return "host";
+            if (a.is_v6() && a.to_v6().is_link_local())
+                return "lan";
+            for (const auto &p : prefixes)
+            {
+                if (p.len == 0 || p.addr.is_v4() != a.is_v4())
+                    continue;
+                if (p.addr.is_v4())
+                {
+                    if (p.len > 32)
+                        continue;
+                    const std::uint32_t m = p.len == 32 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - p.len));
+                    if ((a.to_v4().to_uint() & m) == (p.addr.to_v4().to_uint() & m))
+                        return "lan";
+                }
+                else
+                {
+                    const auto ab = a.to_v6().to_bytes();
+                    const auto pb = p.addr.to_v6().to_bytes();
+                    unsigned bits = std::min(p.len, 128u);
+                    bool same = true;
+                    for (unsigned i = 0; i < 16 && bits; i++)
+                    {
+                        const unsigned take = std::min(bits, 8u);
+                        const auto mask = (unsigned char)(0xFFu << (8 - take));
+                        if ((ab[i] & mask) != (pb[i] & mask))
+                        {
+                            same = false;
+                            break;
+                        }
+                        bits -= take;
+                    }
+                    if (same)
+                        return "lan";
+                }
+            }
+            return "routed";
+        }
+        inline std::string classify_scope(const std::string &addr)
+        {
+            return scope_for_addr(addr, local_addresses(), local_prefixes());
+        }
+
+        // Same-host rendezvous directory: a fixed place both Windows and WSL can
+        // read and write with zero configuration (WSL reaches it through the
+        // drvfs automount). Cells drop a small JSON beacon here; peers on the
+        // same machine find each other without any network discovery at all.
+        inline std::filesystem::path host_beacon_dir()
+        {
+#ifdef _WIN32
+            const char *pub = std::getenv("PUBLIC");
+            const std::filesystem::path base = pub && *pub ? std::filesystem::path(pub)
+                                                           : std::filesystem::path("C:\\Users\\Public");
+#else
+            const std::filesystem::path base = "/mnt/c/Users/Public";
+            std::error_code ec;
+            if (!std::filesystem::is_directory(base, ec))
+                return {}; // not WSL (or automount disabled): mDNS only
+#endif
+            return base / "cell" / "beacons";
         }
 
         // "10.0.0.5" / "[fe80::1%12]:47822" / "fe80::1" / "1.2.3.4:5353"
@@ -10447,6 +10769,9 @@ namespace cell
                 // user-configured extra discovery targets ("ip[:port]"): the way
                 // through a NAT/VPN/firewall that also blocks multicast
                 std::vector<std::string> extra_targets;
+                // same-host beacon directory override (smoke runs use a throwaway
+                // dir); empty = the fixed Windows/WSL shared location
+                std::filesystem::path beacon_dir;
                 std::function<void(const json &)> on_event;
                 std::function<void(const std::string &, const std::string &)> on_log;
                 // methods this module does not implement itself (fs.*, tw.*, ws.*):
@@ -10596,12 +10921,16 @@ namespace cell
             std::string mdns_tx_key;
             std::vector<local_addr> locals;
             long long locals_at = 0;
+            std::vector<local_prefix> prefixes;
             long long sweep_at = 0;             // last unicast /24 sweep (see unicast_sweep)
             asio::steady_timer mdns_timer{io};  // periodic re-announce
             asio::steady_timer query_timer{io}; // periodic browse query
             asio::steady_timer burst_timer{io}; // initial announce/query burst
             asio::steady_timer sweep_timer{io};
             asio::steady_timer pair_timer{io};
+            asio::steady_timer beacon_timer{io}; // same-host beacon heartbeat + scan
+            std::filesystem::path beacon_dir;
+            long long beacon_write_at = 0;
             int burst_left = 0;
             int burst_kind = 0; // 1 = announce, 2 = query
             std::uint32_t seq = 0;
@@ -10627,6 +10956,8 @@ namespace cell
                 bool pairing_open = false;
                 long long seen = 0;
                 long long expires = 0;
+                std::string scope = "lan"; // host | lan | routed
+                std::string via;           // beacon | mdns
             };
             std::map<std::string, presence> present; // client_id -> last mDNS records
             std::map<std::string, std::shared_ptr<conn>> sessions;
@@ -10688,6 +11019,12 @@ namespace cell
             // ---- discovery ----------------------------------------------------
             void refresh_locals(bool force = false);
             void rebuild_tx();
+            // ---- same-host beacons --------------------------------------------
+            void beacon_start();
+            void beacon_stop();
+            void beacon_write();
+            void beacon_loop();
+            void beacon_scan();
             void open_discovery(std::string &err);
             void close_discovery();
             bool set_discovery(bool on, std::string &err);
@@ -11144,6 +11481,8 @@ namespace cell
             const std::string their_id = jstr(j, "id");
             if (!is_hex_id(their_id, 32))
                 return fail("bad client id");
+            if (their_id == svc->client_id)
+                return fail("refusing a connection from ourselves");
             peer_id = their_id;
             peer_name = clean_name(jstr(j, "name"));
             peer_port = (std::uint16_t)std::clamp(jint(j, "port"), 0LL, 65535LL);
@@ -11723,6 +12062,7 @@ namespace cell
                 if (!set_discovery(true, derr))
                     log("warn", "discovery is off: " + derr);
             }
+            beacon_start();
             log("info", std::format("flowlink started: id={} transport={} (v6={}) mdns={} instance={} name={}",
                                     client_id, bound_port, acceptor && acceptor->local_endpoint(ec).protocol() == tcp::v6(),
                                     discovery_on.load() ? std::to_string(opt.mdns_port) : std::string("off"),
@@ -11742,6 +12082,7 @@ namespace cell
                     send_multicast(pkt);
             }
             close_discovery();
+            beacon_stop();
             boost::system::error_code ec;
             if (acceptor)
             {
@@ -11796,6 +12137,7 @@ namespace cell
                         break;
                     }
             locals = std::move(next);
+            prefixes = local_prefixes();
             locals_at = now;
             if (changed && discovery_on.load())
             {
@@ -12083,6 +12425,9 @@ namespace cell
 
         inline void impl::announce(int times)
         {
+            // the beacon carries the same public state (port, pairing window):
+            // refresh it even when mDNS discovery is off
+            beacon_write();
             if (!discovery_on.load() || times <= 0)
                 return;
             auto self = shared_from_this();
@@ -12120,7 +12465,7 @@ namespace cell
             if (now - sweep_at < 15)
                 return; // a scan button cannot be used as a packet amplifier
             sweep_at = now;
-            auto pkt = dns::query(0, kServiceType, dns::t_ptr);
+            auto pkt = dns::query(0, kServiceType, dns::t_ptr, true);
             if (pkt.empty())
                 return;
             std::set<std::uint32_t> nets;
@@ -12141,10 +12486,161 @@ namespace cell
                 {
                     const std::uint32_t ip = (self & 0xFFFFFF00u) | i;
                     if (ip == self)
-                        continue;
+                        continue; // same-host peers use the beacon drop-box, not probes
                     send_unicast(pkt, udp::endpoint(asio::ip::address_v4(ip), opt.mdns_port));
                     ++tx_query;
                 }
+            }
+        }
+
+        // ---- same-host beacons ------------------------------------------------
+        // A file drop-box both OSes of a WSL pair can read/write. No multicast,
+        // no port negotiation: the beacon carries the real transport port, and
+        // loopback TCP (always alive in mirrored and NAT mode) does the rest.
+        inline void impl::beacon_start()
+        {
+            beacon_dir = opt.beacon_dir.empty() ? host_beacon_dir() : opt.beacon_dir;
+            if (beacon_dir.empty())
+                return;
+            std::error_code ec;
+            std::filesystem::create_directories(beacon_dir, ec);
+            if (ec)
+            {
+                log("warn", "host beacons unavailable: " + ec.message());
+                beacon_dir.clear();
+                return;
+            }
+            refresh_locals(true);
+            beacon_write();
+            beacon_loop();
+            log("info", "host beacons: " + beacon_dir.string());
+        }
+
+        inline void impl::beacon_stop()
+        {
+            beacon_timer.cancel();
+            if (!beacon_dir.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove(beacon_dir / (client_id + ".json"), ec);
+                beacon_dir.clear();
+            }
+        }
+
+        inline void impl::beacon_write()
+        {
+            if (beacon_dir.empty() || !alive.load())
+                return;
+            // fresh snapshot: beacon_write also runs on caller threads (pairing
+            // events), while `locals` is only safe to read on the io thread
+            json addrs = json::array();
+            for (const auto &la : local_addresses())
+                if (!la.loopback)
+                    addrs.push_back(la.addr);
+            const json doc{{"v", 1},
+                           {"id", client_id},
+                           {"name", name},
+                           {"os", os_name()},
+                           {"host", host_name},
+                           {"port", bound_port},
+                           {"pair", is_pairing_open() ? 1 : 0},
+                           {"addrs", addrs},
+                           {"ts", (long long)std::time(nullptr)}};
+            std::ofstream f(beacon_dir / (client_id + ".json"), std::ios::trunc);
+            if (f)
+                f << doc.dump();
+        }
+
+        inline void impl::beacon_loop()
+        {
+            if (!alive.load() || beacon_dir.empty())
+                return;
+            auto self = shared_from_this();
+            beacon_timer.expires_after(std::chrono::seconds(5));
+            beacon_timer.async_wait([self](const boost::system::error_code &ec)
+                                    {
+                if (ec || !self->alive.load())
+                    return;
+                const long long now = (long long)std::time(nullptr);
+                if (now - self->beacon_write_at >= 10)
+                {
+                    self->beacon_write_at = now;
+                    self->beacon_write();
+                }
+                self->beacon_scan();
+                self->beacon_loop(); });
+        }
+
+        inline void impl::beacon_scan()
+        {
+            std::error_code ec;
+            const long long now = (long long)std::time(nullptr);
+            for (const auto &e : std::filesystem::directory_iterator(beacon_dir, ec))
+            {
+                if (ec)
+                    break;
+                if (!e.is_regular_file(ec) || e.path().extension() != ".json")
+                    continue;
+                const std::string stem = e.path().stem().string();
+                if (stem == client_id || !is_hex_id(stem, 32))
+                    continue;
+                std::ifstream f(e.path());
+                if (!f)
+                    continue;
+                const json doc = json::parse(f, nullptr, false);
+                if (!doc.is_object() || jstr(doc, "id") != stem)
+                    continue;
+                const long long ts = jint(doc, "ts");
+                const long long port = jint(doc, "port");
+                // stale (peer crashed / stopped) or clock-skewed: ignore
+                if (ts <= 0 || now - ts > 45 || ts - now > 5 || port <= 0 || port > 65535)
+                {
+                    // reap long-dead beacons (crashed cells never delete their
+                    // own file) so the drop-box does not accumulate
+                    if (ts > 0 && now - ts > 600)
+                    {
+                        std::error_code rec;
+                        std::filesystem::remove(e.path(), rec);
+                    }
+                    continue;
+                }
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    auto &p = present[stem];
+                    fresh = p.seen == 0;
+                    p.id = stem;
+                    if (!jstr(doc, "name").empty())
+                        p.name = clean_name(jstr(doc, "name"));
+                    p.os = clean_name(jstr(doc, "os"), 24);
+                    p.host = jstr(doc, "host");
+                    p.port = (std::uint16_t)port;
+                    p.via = "beacon";
+                    p.scope = "host";
+                    p.pairing_open = jint(doc, "pair") == 1;
+                    // loopback first: it is the one dial that always works
+                    // between the two OSes of a WSL pair
+                    std::vector<std::string> addrs{"127.0.0.1"};
+                    if (doc.contains("addrs") && doc["addrs"].is_array())
+                        for (const auto &a : doc["addrs"])
+                            if (a.is_string() &&
+                                std::ranges::find(addrs, a.get<std::string>()) == addrs.end())
+                                addrs.push_back(a.get<std::string>());
+                    if (addrs.size() > 6)
+                        addrs.resize(6);
+                    p.addrs = std::move(addrs);
+                    p.seen = now;
+                    p.expires = now + 45;
+                }
+                if (fresh)
+                    emit({{"type", "discovered"},
+                          {"client_id", stem},
+                          {"name", jstr(doc, "name")},
+                          {"addr", "127.0.0.1"},
+                          {"port", port},
+                          {"os", jstr(doc, "os")},
+                          {"scope", "host"},
+                          {"pairing", jint(doc, "pair") == 1}});
             }
         }
 
@@ -12375,8 +12871,11 @@ namespace cell
         {
             const std::string inst = instance + "." + std::string(kServiceType);
             bool want = false;
+            bool qu = false;
             for (const auto &q : m.qs)
             {
+                if ((q.cls & 0x8000) != 0)
+                    qu = true;
                 if (q.type == dns::t_any &&
                     (dns::name_is(q.name, kServiceType) || dns::name_is(q.name, inst) ||
                      dns::name_is(q.name, host_name)))
@@ -12397,7 +12896,9 @@ namespace cell
                 return true;
             const bool legacy = from.port() != (mdns_bound4 ? mdns_bound4 : opt.mdns_port) &&
                                 from.port() != (mdns_bound6 ? mdns_bound6 : opt.mdns_port);
-            if (legacy)
+            // a QU query gets a unicast answer even from the DNS-SD port: on a
+            // mirrored-mode WSL link the multicast answer would never arrive
+            if (legacy || qu)
                 send_unicast(pkt, from);
             else
                 send_multicast(pkt);
@@ -12505,6 +13006,10 @@ namespace cell
                 {
                     std::lock_guard<std::mutex> lk(mx);
                     auto &p = present[f.id];
+                    // the beacon drop-box owns same-host entries while fresh:
+                    // mDNS must not downgrade them to a lan/routed view
+                    if (p.via == "beacon" && now <= p.expires)
+                        continue;
                     fresh = p.seen == 0;
                     p.id = f.id;
                     if (!f.name.empty())
@@ -12524,6 +13029,8 @@ namespace cell
                     if (merged.size() > 6)
                         merged.resize(6);
                     p.addrs = std::move(merged);
+                    p.via = "mdns";
+                    p.scope = scope_for_addr(src, locals, prefixes);
                     if (f.port != 0)
                         p.port = f.port;
                     if (!f.os.empty())
@@ -12589,7 +13096,7 @@ namespace cell
                 json addrs = json::array();
                 for (const auto &a : p.addrs)
                     addrs.push_back(a);
-                out.push_back({{"client_id", id}, {"name", p.name}, {"addr", p.addrs.empty() ? "" : p.addrs.front()}, {"addrs", addrs}, {"port", p.port}, {"os", p.os}, {"tz", p.tz}, {"lang", p.lang}, {"accept", p.accept}, {"pairing", p.pairing_open}, {"last_seen", p.seen}, {"expires", p.expires}});
+                out.push_back({{"client_id", id}, {"name", p.name}, {"addr", p.addrs.empty() ? "" : p.addrs.front()}, {"addrs", addrs}, {"port", p.port}, {"os", p.os}, {"tz", p.tz}, {"lang", p.lang}, {"accept", p.accept}, {"pairing", p.pairing_open}, {"last_seen", p.seen}, {"expires", p.expires}, {"scope", p.scope}, {"via", p.via}});
             }
             return out;
         }
@@ -12937,6 +13444,37 @@ namespace cell
                 discovery_query(1);
                 std::this_thread::sleep_for(std::chrono::milliseconds(400));
                 (void)collect();
+            }
+            // A peer living at one of our own addresses shares this machine —
+            // WSL mirrored mode mirrors the host's IPs onto the VM, where both
+            // multicast discovery and dialing the shared IP can fail. Loopback
+            // TCP always works there, so put it in front of every address.
+            {
+                const auto mine = local_addresses();
+                bool same_host = false;
+                for (const auto &[a, p] : unique)
+                {
+                    for (const auto &la : mine)
+                        if (la.addr == a)
+                        {
+                            same_host = true;
+                            break;
+                        }
+                    if (same_host)
+                        break;
+                }
+                if (same_host)
+                {
+                    std::set<std::uint16_t> ports{kDefaultPort};
+                    for (const auto &[a, p] : unique)
+                        ports.insert(p);
+                    std::vector<std::pair<std::string, std::uint16_t>> front;
+                    for (auto p : ports)
+                        front.emplace_back("127.0.0.1", p);
+                    if (front.size() > 3)
+                        front.resize(3);
+                    unique.insert(unique.begin(), front.begin(), front.end());
+                }
             }
             if (unique.empty())
             {
@@ -13403,7 +13941,8 @@ namespace cell
                        {"lang", m.lang.empty() && it != disc.end() ? it->second.lang : m.lang},
                        {"trusted", st.has_key(m.id)},
                        {"discovered", it != disc.end()},
-                       {"pairing", it != disc.end() && it->second.pairing_open}};
+                       {"pairing", it != disc.end() && it->second.pairing_open},
+                       {"scope", it != disc.end() ? it->second.scope : classify_scope(m.addr)}};
                 out.push_back(std::move(e));
             }
             for (auto &[id, p] : disc)
@@ -13429,7 +13968,9 @@ namespace cell
                                {"lang", p.lang},
                                {"trusted", false},
                                {"discovered", true},
-                               {"pairing", p.pairing_open}});
+                               {"pairing", p.pairing_open},
+                               {"scope", p.scope},
+                               {"via", p.via}});
             }
             return out;
         }
@@ -13577,6 +14118,7 @@ namespace cell
                 // the TXT record carries the flag; announce the change so a peer
                 // browsing right now sees the window without waiting for a TTL
                 p_->announce(2);
+                p_->beacon_write();
                 return json{{"ok", true}, {"code", ps.display}, {"raw", ps.code}, {"expires", ps.expires}, {"client_id", p_->client_id}, {"name", p_->name}};
             }
 
@@ -13596,6 +14138,7 @@ namespace cell
                     asio::post(c->strand, [c]
                                { c->close("pairing cancelled"); });
                 p_->announce(1);
+                p_->beacon_write();
                 return json{{"ok", true}, {"was_open", was}};
             }
 
@@ -13723,6 +14266,7 @@ namespace cell
                     for (int i = 0; i < 24 && targets.empty(); ++i)
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                        p_->beacon_scan(); // read-through: a just-opened window must not wait for the 5s tick
                         add_known({}, true);
                         if (i == 6 || i == 14)
                             p_->discovery_query(1); // one lost datagram must not end pairing
@@ -15085,8 +15629,10 @@ namespace cell
             // （std::any），宿主工具自己 any_cast 取回。核心不认识里面的任何语义。
             std::any host_ctx;
             // returns empty string = allow; non-empty = deny reason (fail-closed
-            // while unset); args: (tool_name, arguments_json)
-            std::function<std::string(const std::string &, const std::string &)> autoallow_validator;
+            // while unset); args: (tool_name, arguments_json, note) — note is the
+            // model's own one-sentence reason for the call, so the gate can judge
+            // intent as well as the command
+            std::function<std::string(const std::string &, const std::string &, const std::string &)> autoallow_validator;
             // false = run a Policy::Ask tool without prompting (a multi-operation
             // tool gates only its dangerous verb this way, tw run for example)
             std::function<bool(const std::string &, const std::string &)> approval_required;
@@ -15095,7 +15641,9 @@ namespace cell
             // directly: on a piped/non-interactive run the prompt would hit an
             // already-exhausted stdin and report "rejected by user" for every
             // exec, and a worker thread would race the main thread for input.
-            std::function<bool(const std::string &tool, const std::string &args, std::string &reason)> approval_prompt;
+            // `note` is the model's reason for the call, shown next to the
+            // question; `reason` receives the refusal text.
+            std::function<bool(const std::string &tool, const std::string &args, const std::string &note, std::string &reason)> approval_prompt;
             // Serializes approval prompts. Ask tools now run in the parallel pass
             // (exec keeps its process off the tool pool), so two of them can reach
             // the prompt at the same time — while every frontend shows one card at
@@ -15253,9 +15801,12 @@ namespace cell
                 return out;
             }
             // The sandbox / policy / approval gates, applied before the handler
-            // runs. Returns false (with output.ok=false and blocked_ /
+            // runs. `note` is the model's own reason for this call (already
+            // stripped from `parsed`), required once the approval gate is hit.
+            // Returns false (with output.ok=false and blocked_ /
             // rejected_for_ set) when the call must not run.
-            bool check_action(const runtime &rt, const std::string &input, const nlohmann::json &parsed, ToolOutput &output)
+            bool check_action(const runtime &rt, const std::string &input, const nlohmann::json &parsed,
+                              const std::string &note, ToolOutput &output)
             {
                 const bool parsed_ok = !parsed.is_discarded();
                 // Check if this tool is allowed in the current sandbox mode
@@ -15288,6 +15839,53 @@ namespace cell
                         cell::sys::logger::instance().debug("tool", std::format("approved name={} by=operation_rule", name()));
                         return true;
                     }
+                    // The exec command gate runs BEFORE anyone is asked: a command
+                    // the sandbox refuses must never put a card on screen and must
+                    // never reach the auto-approval judge (the catastrophic-delete
+                    // floor lives in check_exec).
+                    std::string exec_cmd;
+                    if (name() == "exec")
+                    {
+                        if (parsed_ok && parsed.is_object() && parsed.contains("cmd") && parsed["cmd"].is_string())
+                            exec_cmd = parsed["cmd"].get<std::string>();
+                        else
+                            exec_cmd = input; // fallback to raw input if not JSON
+                        if (!box::check_exec(exec_cmd))
+                        {
+                            output = deny(rejection_reason::sandbox,
+                                          std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode())),
+                                          std::format("sandbox mode={} args={}", box::mode_name(box::sandbox_mode()), exec_cmd));
+                            return false;
+                        }
+                        // also sandbox-check the working directory if provided
+                        std::string wd_val;
+                        if (parsed_ok && parsed.is_object() && parsed.contains("wd") && parsed["wd"].is_string())
+                            wd_val = parsed["wd"].get<std::string>();
+                        if (!wd_val.empty() && !box::check_write_path(wd_val))
+                        {
+                            output = deny(rejection_reason::sandbox,
+                                          std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val),
+                                          std::format("wd_sandbox wd={} args={}", wd_val, input));
+                            return false;
+                        }
+                    }
+                    // A call that reaches the approval gate must say WHY: the
+                    // note is what the user reads before allowing it and what
+                    // the auto-approval gate judges intent by. Read-only and
+                    // notice tools never get here, so they never need one.
+                    // Missing = a retryable refusal (sandbox), not an abort.
+                    // Unparsable JSON is left to the invalid-arguments failure
+                    // below: there is nothing to attach a note to.
+                    if (note.empty() && parsed_ok)
+                    {
+                        output = deny(rejection_reason::sandbox,
+                                      std::format("[{}] missing 'reason': add one short sentence saying WHY this call is needed — it is shown to the user before approval and read by the auto-approval gate — then retry", name()),
+                                      "missing_reason");
+                        return false;
+                    }
+                    // json of the action as it will run (paths absolutized, the
+                    // note removed): shown in the approval card and judged
+                    const std::string action_json = parsed_ok ? parsed.dump() : input;
                     // autoallow mode: ask a context-free LLM safety check before
                     // running exec without user confirmation (FullAccess only)
                     std::string tool_operation;
@@ -15321,7 +15919,7 @@ namespace cell
                                           "terminated_before_approval");
                             return false;
                         }
-                        bool approved = prompt && prompt(name(), input, reason);
+                        bool approved = prompt && prompt(name(), action_json, note, reason);
                         if (!approved)
                         {
                             output = deny(rejection_reason::user,
@@ -15329,15 +15927,15 @@ namespace cell
                                           std::format("{}", reason.empty() ? "rejected_by_user" : reason));
                             return false;
                         }
-                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user", name()));
+                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=user note={}", name(), cell::text::display_safe(note)));
                     }
                     else
                     {
-                        std::string action_json = parsed_ok ? parsed.dump() : input;
+                        std::string judged_json = action_json;
                         // the enricher expands action context (tw run -> full job config)
                         if (rt.action_enricher)
-                            action_json = rt.action_enricher(name(), action_json);
-                        std::string deny_reason = rt.autoallow_validator ? rt.autoallow_validator(name(), action_json) : "";
+                            judged_json = rt.action_enricher(name(), judged_json);
+                        std::string deny_reason = rt.autoallow_validator ? rt.autoallow_validator(name(), judged_json, note) : "";
                         if (!deny_reason.empty())
                         {
                             output = deny(rejection_reason::autoallow,
@@ -15345,36 +15943,11 @@ namespace cell
                                           std::format("autoallow_rejected args={}", input));
                             return false;
                         }
-                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={}", name(), cell::text::display_safe(input)));
-                        cell::sys::println("[autoallow] {}({})", name(), cell::text::display_safe(input));
+                        cell::sys::logger::instance().debug("tool", std::format("approved name={} by=autoallow args={} note={}", name(), cell::text::display_safe(input), cell::text::display_safe(note)));
+                        cell::sys::println("[autoallow] {}({}) [reason: {}]", name(), cell::text::display_safe(input), cell::text::display_safe(note));
                     }
                     if (name() == "exec")
                     {
-                        // Extract the actual command string from JSON before sandbox checks
-                        std::string exec_cmd;
-                        if (parsed_ok && parsed.is_object() && parsed.contains("cmd") && parsed["cmd"].is_string())
-                            exec_cmd = parsed["cmd"].get<std::string>();
-                        else
-                            exec_cmd = input; // fallback to raw input if not JSON
-
-                        if (!box::check_exec(exec_cmd))
-                        {
-                            output = deny(rejection_reason::sandbox,
-                                          std::format("[{}] exec blocked by sandbox (mode={}) — network egress and non-whitelisted commands are denied. /sandbox to change.", name(), box::mode_name(box::sandbox_mode())),
-                                          std::format("sandbox mode={} args={}", box::mode_name(box::sandbox_mode()), exec_cmd));
-                            return false;
-                        }
-                        // also sandbox-check the working directory if provided
-                        std::string wd_val;
-                        if (parsed_ok && parsed.is_object() && parsed.contains("wd") && parsed["wd"].is_string())
-                            wd_val = parsed["wd"].get<std::string>();
-                        if (!wd_val.empty() && !box::check_write_path(wd_val))
-                        {
-                            output = deny(rejection_reason::sandbox,
-                                          std::format("[{}] working directory blocked by sandbox: {}", name(), wd_val),
-                                          std::format("wd_sandbox wd={} args={}", wd_val, input));
-                            return false;
-                        }
                         if (box::is_high_risk(exec_cmd))
                         {
                             if (!autoallow)
@@ -15478,6 +16051,20 @@ namespace cell
                 // so every consumer sees the same absolute path
                 if (!rt.cwd.empty() && parsed.is_object())
                     box::absolutize_path_args(parsed, rt.cwd, name());
+                // the model's own reason for a call that needs approval: taken
+                // out of the arguments here so handlers (and the action JSON
+                // shown or judged) never carry it. Bounded: it ends up in a
+                // prompt and a UI card, not in a transcript.
+                std::string note;
+                if (parsed.is_object())
+                {
+                    if (auto it = parsed.find("reason"); it != parsed.end())
+                    {
+                        if (it->is_string())
+                            note = cell::text::utf8_safe(cell::text::trim(it->get<std::string>()), 600);
+                        parsed.erase(it);
+                    }
+                }
                 // cross-session edit claims: writing or editing a file that
                 // another session's agent loop is working on is refused with a
                 // clear message (first come, first served). Reads never claim;
@@ -15498,7 +16085,7 @@ namespace cell
                     }
                 }
                 ToolOutput output;
-                if (!check_action(rt, input, parsed, output))
+                if (!check_action(rt, input, parsed, note, output))
                     return output;
                 if (parsed.is_discarded())
                     return ToolOutput::fail(std::format("[{}] invalid JSON arguments: {}", name(), input.size() > 200 ? input.substr(0, 200) + "..." : input));
@@ -25093,7 +25680,7 @@ static void print_help()
     cell::sys::println("  /think [off|low|med|high|max]  show or set chain-of-thought level (default off)");
     cell::sys::println("  /tool [on|off]              toggle tool calls (off = plain chat, no tools sent)");
     cell::sys::println("  /sandbox [mode]             exec sandbox mode: read-only | edit-only | full-access (default)");
-    cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands (full-access only)");
+    cell::sys::println("  /autoallow [on|off]         autoallow mode: LLM decides exec commands by the model's own reason (full-access only)");
     cell::sys::println("  /sessions                   list saved sessions, grouped by working directory");
     cell::sys::println("  /saved [list]               list compaction archives of the current session");
     cell::sys::println("  /saved show NAME            display an archived transcript (written by /compact)");
@@ -25186,11 +25773,22 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "number"}, {"description", desc}}; };
     auto bool_prop = [](const std::string &desc)
     { return nlohmann::json{{"type", "boolean"}, {"description", desc}}; };
-    auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
+    // Every tool that needs approval carries the model's one-sentence reason:
+    // it is shown to the user before the call runs and read by the
+    // auto-approval gate. Injected here so built-in and host tools agree on one
+    // field name; the gate (callable_tool::check_action) refuses a call that
+    // reaches approval without one, and read-only / notice tools never do.
+    const nlohmann::json reason_prop = {
+        {"type", "string"},
+        {"description", "WHY this call is needed: one short sentence in the user's language (e.g. 'remove the stale build output so the rebuild starts clean'). It is shown in the approval prompt and read by the auto-approval gate; a call that needs approval without it is refused."}};
+    auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props_in,
                    const std::vector<std::string> &required, Policy policy, ToolKind kind,
                    std::move_only_function<cell::ToolOutput(const nlohmann::json &, const cell::tools::runtime &)> fn,
                    Phase phase = Phase::Concurrent)
     {
+        nlohmann::json props = props_in.is_object() ? props_in : nlohmann::json::object();
+        if (policy == Policy::Ask && !props.contains("reason"))
+            props["reason"] = reason_prop;
         list[name] = std::make_shared<cell::tools::callable_tool>(
             id++, name, kind, policy,
             [name, fn = std::move(fn)](const nlohmann::json &j, const cell::tools::runtime &rt) mutable -> cell::ToolOutput
@@ -25323,14 +25921,17 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                                    j.value("file_type", ""), j.value("count_only", false));
             return out;
         });
-    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input. High-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) require a second confirmation.\n"
+    add("exec", "Run a shell command (blocking; default timeout 30s, max 300s). The result always ends with a line 'exitcode=N' — judge success by that value, never assume. Use 'wd' to set the working directory for the command. The command gate is path-only: it rejects path traversal and references to credential/runtime files, but it does NOT block network egress, decode encoded payloads, or filter shell operators, so treat the command string as untrusted input.\n"
+                "Always pass 'reason': one short sentence on WHY this command is needed. The user reads it in the approval card, and in autoallow mode it is what the safety gate judges — a command that needs approval without a reason is refused.\n"
+                "There is no separate delete tool: remove files with the shell (rm / del / rmdir). In autoallow mode deleting paths inside the workspace runs without asking, and recursive/forced deletes of workspace paths are the normal way to clean build output — only a delete aimed at a filesystem root, a home directory or an OS directory is refused outright. Without autoallow, high-risk commands (rm -rf, chmod, sudo, git history rewrite, ...) take a second confirmation.\n"
                 "Several exec calls issued in ONE message run concurrently (each on its own thread) — issue independent commands together. Commands are opaque, so the engine cannot order them: never put commands that depend on each other's result or touch the same tree into one message, split them across messages instead. Every exec asks for approval unless autoallow is on; the questions are asked one at a time.\n"
                 "background=true mounts the process on its own thread instead: the call returns immediately with a task id (t1, t2, ...) and the command keeps running while you continue — use it for dev servers, watchers, long builds and anything else that would otherwise block the turn. A background task has no timeout ('timeout' is ignored) and is NOT a thread-pool job, so it never starves the tool pool; list the running ones with /tasks, read its output with /task show ID, stop it with /task kill ID (the whole process tree dies). When the task finishes you receive a notice automatically on your next turn with its exit code and output tail — do NOT poll /tasks or call the notice wait tool to wait for it; just continue your work or tell the user it is running and the result will arrive. If the USER stops that task from the task panel you get a notice saying so — it will never finish, so do not wait for it.",
         {{"cmd", str_prop("shell command to execute")},
+         {"reason", str_prop("WHY this command is needed: one short sentence in the user's language. Shown in the approval prompt and read by the auto-approval gate; exec without it is refused")},
          {"timeout", num_prop("timeout in seconds, default 30, max 300 (ignored when background=true)")},
          {"wd", str_prop("working directory for the command (optional, defaults to cwd)")},
          {"background", bool_prop("run as a background task on its own thread and return immediately with a task id (default false = block until the command exits)")}},
-        {"cmd"}, Policy::Ask, ToolKind::Exec,
+        {"cmd", "reason"}, Policy::Ask, ToolKind::Exec,
         [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
         {
             cell::ToolOutput out;
@@ -25437,7 +26038,8 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                   "  3. Configuration may be given inline and/or via 'path' (inline wins); passing config fields to run/edit replaces the whole job configuration — refused while the job is running or completed.\n"
                   "  4. new only creates a job — reports exist only after run; for a long job use background=true and collect progress with the notice tool (wait consumes no tokens). Children run without a round cap and auto-compact their own context (each compaction is reported via a notice).\n"
                   "  5. Every tw call may require user approval; a declined call comes back rejected with the reason — adjust the request or ask the user instead of retrying the same call.\n"
-                  "  6. Remote cells: operation=cells lists them; cell=<client_id> on new/run/workflow ships the job to that cell, which runs it with its own providers and keys and sends back only the report. The returned job id lives on the remote cell — pass it back together with the same cell to continue a gated job. The remote cell must have FlowLink enabled and remote work accepted.\n",
+                  "  6. Remote cells: operation=cells lists them; cell=<client_id> on new/run/workflow ships the job to that cell, which runs it with its own providers and keys and sends back only the report. The returned job id lives on the remote cell — pass it back together with the same cell to continue a gated job. The remote cell must have FlowLink enabled and remote work accepted.\n"
+                  "  7. run needs 'reason': one short sentence on WHY this job is being run — it is shown in the approval prompt and read by the auto-approval gate, and a run without it is refused. Other operations never ask, so they never need one.\n",
             props, {"operation"}, Policy::Ask, ToolKind::Teamwork, [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
             {
                 cell::ToolOutput out;
@@ -25972,6 +26574,31 @@ static int run_selftest()
             std::filesystem::remove_all(sibling, pec);
         }
         cell::box::sandbox_mode() = saved;
+    }
+
+    // autoallow relaxation floor: ordinary deletes pass the gate (the LLM judge
+    // and the user decide), catastrophic targets never do — no prompt can
+    // approve them and the judge never gets to allow them.
+    {
+        R.expect(cell::box::check_exec("rm -rf build"), "delete: workspace build dir passes");
+        R.expect(cell::box::check_exec("rm -rf ./build/ Release"), "delete: several relative targets pass");
+        R.expect(cell::box::check_exec("rm -rf /home/u/proj/build"), "delete: absolute path inside a project passes");
+        R.expect(cell::box::check_exec("rm -rf /var/www/app/cache"), "delete: project under /var passes");
+        R.expect(cell::box::check_exec("del /s /q build\\*"), "delete: windows recursive delete of build passes");
+        R.expect(cell::box::check_exec("git commit -m \"rm -rf /\""), "delete: a quoted command string is not a delete");
+        R.expect(cell::box::check_exec("echo rm -rf /"), "delete: echo of a delete is not a delete");
+        R.expect(!cell::box::check_exec("rm -rf /"), "delete: filesystem root is refused");
+        R.expect(!cell::box::check_exec("RM -RF /*"), "delete: root glob is refused (case folded)");
+        R.expect(!cell::box::check_exec("rm -rf C:\\"), "delete: drive root is refused");
+        R.expect(!cell::box::check_exec("rm -rf C:\\*"), "delete: drive-root glob is refused");
+        R.expect(!cell::box::check_exec("rm -rf ~"), "delete: home is refused");
+        R.expect(!cell::box::check_exec("rm -rf $HOME"), "delete: $HOME is refused");
+        R.expect(!cell::box::check_exec("rm -rf /etc"), "delete: /etc is refused");
+        R.expect(!cell::box::check_exec("rm -rf /usr/local"), "delete: a subtree of /usr is refused");
+        R.expect(!cell::box::check_exec("rm -rf /home/u"), "delete: the home dir itself is refused");
+        R.expect(!cell::box::check_exec("del /s /q C:\\Users\\me"), "delete: windows home dir is refused");
+        R.expect(!cell::box::check_exec("cd /tmp && sudo rm -rf /"), "delete: operator + sudo keep the command word found");
+        R.expect(cell::box::check_exec("rm -rf build && echo done"), "delete: a following command is not a target");
     }
 
     // host-protected roots: the agent may read a character's own data tree but
@@ -26677,12 +27304,12 @@ static int run_selftest()
             cell::tools::runtime wrt;
             wrt.cwd = wa;
             wrt.box_ctx = &cta;
-            wrt.approval_prompt = [](const std::string &, const std::string &, std::string &) -> bool
+            wrt.approval_prompt = [](const std::string &, const std::string &, const std::string &, std::string &) -> bool
             { return true; };
 #ifdef _WIN32
-            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"cd"})");
+            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"cd","reason":"probe the workspace cwd"})");
 #else
-            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"pwd"})");
+            auto run = wtools.at("exec")->execute(wrt, R"({"cmd":"pwd","reason":"probe the workspace cwd"})");
 #endif
             R.expect(run.ok && run.text.contains("ctx_ws_a") && run.text.contains("exitcode=0"),
                      "exec defaults to the context workspace directory");
@@ -26972,6 +27599,43 @@ static int run_selftest()
             R.expect(d.contains("name") ? d.contains("description")
                                         : (d.contains("function") && d["function"].contains("name") && d["function"].contains("description")),
                      "tool schema carries name+description");
+        // the approval gate's reason field is declared exactly where approval is
+        // asked: exec requires it, tw declares it (required for run only, which
+        // the runtime enforces), read-only tools never mention it
+        {
+            auto find_def = [&](const std::string &n) -> const nlohmann::json *
+            {
+                for (auto &d : tool_defs)
+                {
+                    const nlohmann::json &fn = d.contains("function") ? d["function"] : d;
+                    if (fn.value("name", "") == n)
+                        return &fn;
+                }
+                return nullptr;
+            };
+            auto has_prop = [](const nlohmann::json &fn)
+            {
+                return fn.contains("parameters") && fn["parameters"].contains("properties") &&
+                       fn["parameters"]["properties"].contains("reason");
+            };
+            auto requires_reason = [](const nlohmann::json &fn)
+            {
+                if (!fn.contains("parameters") || !fn["parameters"].contains("required"))
+                    return false;
+                for (auto &v : fn["parameters"]["required"])
+                    if (v.is_string() && v.get<std::string>() == "reason")
+                        return true;
+                return false;
+            };
+            const nlohmann::json *ex = find_def("exec");
+            R.expect(ex && has_prop(*ex) && requires_reason(*ex),
+                     "exec declares 'reason' and requires it");
+            const nlohmann::json *twd = find_def("tw");
+            R.expect(twd && has_prop(*twd) && !requires_reason(*twd),
+                     "tw declares 'reason' but requires it only for run");
+            const nlohmann::json *lsd = find_def("ls");
+            R.expect(lsd && !has_prop(*lsd), "read-only tools carry no 'reason' field");
+        }
     }
 
     {
@@ -27104,21 +27768,98 @@ static int run_selftest()
             rt.cancelled = []() -> bool
             { return false; };
             rt.approval_mx = &ap_mx;
-            rt.approval_prompt = [&asked](const std::string &, const std::string &, std::string &) -> bool
+            rt.approval_prompt = [&asked](const std::string &, const std::string &, const std::string &, std::string &) -> bool
             { ++asked; return false; }; // deny: nothing is ever executed here
             auto tok = std::make_shared<cell::tools::call_token>();
             cell::tools::call_scope scope(tok);
 
-            (void)it->second->execute(rt, R"({"cmd":"echo hi"})");
+            (void)it->second->execute(rt, R"({"cmd":"echo hi","reason":"smoke the approval gate"})");
             R.expect(asked == 1, "a live call still asks before it runs");
 
             tok->request();
             asked = 0;
-            cell::ToolOutput out = it->second->execute(rt, R"({"cmd":"echo hi"})");
+            cell::ToolOutput out = it->second->execute(rt, R"({"cmd":"echo hi","reason":"smoke the approval gate"})");
             R.expect(asked == 0, "a terminated call never shows an approval card");
             R.expect(out.blocked, "it comes back blocked instead of running");
             R.expect(out.text.find("terminated") != std::string::npos,
                      "the reason names the user's termination");
+        }
+    }
+
+    {
+        // a call that needs approval must say WHY: the note reaches the approval
+        // prompt but never the executed arguments, and a call without one is
+        // refused with a retryable reason instead of being shown as a card
+        auto [tools, defs] = build_tools(false);
+        (void)defs;
+        auto ex = tools.find("exec");
+        R.expect(ex != tools.end(), "precondition: the exec tool is registered");
+        if (ex != tools.end())
+        {
+            std::string seen_note, seen_action;
+            bool prompted = false;
+            cell::tools::runtime rt;
+            rt.cancelled = []() -> bool
+            { return false; };
+            rt.approval_prompt = [&](const std::string &, const std::string &args, const std::string &note, std::string &reason) -> bool
+            {
+                prompted = true;
+                seen_action = args;
+                seen_note = note;
+                reason = "no thanks";
+                return false;
+            };
+            auto out = ex->second->execute(rt, R"({"cmd":"echo hi"})");
+            R.expect(!out.ok && out.blocked, "a call without a reason comes back blocked");
+            R.expect(out.text.find("missing 'reason'") != std::string::npos,
+                     "the refusal says the reason is what is missing");
+            R.expect(!prompted, "no approval card is shown for a call that forgot its reason");
+
+            out = ex->second->execute(rt, R"({"cmd":"echo hi","reason":"  smoke the gate  "})");
+            R.expect(prompted && seen_note == "smoke the gate",
+                     "the trimmed reason reaches the approval prompt");
+            R.expect(seen_action.find("reason") == std::string::npos,
+                     "the note is stripped from the action JSON the user approves");
+            R.expect(out.text.find("no thanks") != std::string::npos,
+                     "the user's refusal text comes back to the model");
+        }
+    }
+
+    {
+        // autoallow: the same note goes to the LLM gate; its refusal aborts the
+        // run (autoallow), its allow runs the command without any card
+        auto [tools, defs] = build_tools(false);
+        (void)defs;
+        auto ex = tools.find("exec");
+        if (ex != tools.end())
+        {
+            const cell::box::SandboxMode saved_mode = cell::box::sandbox_mode();
+            const bool saved_auto = cell::box::autoallow_enabled();
+            cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+            cell::box::autoallow_enabled() = true;
+            int prompted = 0;
+            std::string seen_note;
+            cell::tools::runtime rt;
+            rt.cancelled = []() -> bool
+            { return false; };
+            rt.approval_prompt = [&](const std::string &, const std::string &, const std::string &, std::string &) -> bool
+            { ++prompted; return true; };
+            rt.autoallow_validator = [&](const std::string &, const std::string &, const std::string &note) -> std::string
+            { seen_note = note; return "touches something outside the project"; };
+            auto out = ex->second->execute(rt, R"({"cmd":"echo hi","reason":"clean the stale build"})");
+            R.expect(prompted == 0, "autoallow never opens an approval card");
+            R.expect(seen_note == "clean the stale build", "the auto-approval gate sees the model's reason");
+            R.expect(out.reject_reason == (unsigned char)cell::tools::rejection_reason::autoallow,
+                     "an autoallow refusal carries its own reason code (aborts the run)");
+            R.expect(out.text.find("autoallow rejected") != std::string::npos,
+                     "the gate's denial text reaches the model");
+            rt.autoallow_validator = [](const std::string &, const std::string &, const std::string &) -> std::string
+            { return ""; };
+            out = ex->second->execute(rt, R"({"cmd":"echo hi","reason":"smoke the gate"})");
+            R.expect(out.ok && out.text.find("exitcode=0") != std::string::npos,
+                     "an allowed exec runs and reports its exit code");
+            cell::box::autoallow_enabled() = saved_auto;
+            cell::box::sandbox_mode() = saved_mode;
         }
     }
 
@@ -29923,6 +30664,27 @@ static int run_selftest()
             R.expect(!m.is_response() && m.qs.size() == 1 && m.qs[0].type == dn::t_ptr &&
                          dn::name_is(m.qs[0].name, fl::kServiceType),
                      "dns: query carries the service question");
+            dn::message qm;
+            R.expect(dn::parse(dn::query(0, fl::kServiceType, dn::t_ptr, true), qm) &&
+                         (qm.qs[0].cls & 0x8000) != 0 && (qm.qs[0].cls & 0x7fff) == dn::c_in,
+                     "dns: unicast-response (QU) bit survives");
+        }
+
+        // scope classification: host / lan / routed
+        {
+            namespace fl = cell::flowlink;
+            std::vector<fl::local_addr> locals;
+            fl::local_addr la;
+            la.addr = "192.168.1.7";
+            locals.push_back(la);
+            std::vector<fl::local_prefix> prefs;
+            prefs.push_back({boost::asio::ip::make_address("192.168.1.7"), 24});
+            prefs.push_back({boost::asio::ip::make_address("100.2.51.64"), 18});
+            R.expect(fl::scope_for_addr("127.0.0.1", locals, prefs) == "host", "scope: loopback is host");
+            R.expect(fl::scope_for_addr("192.168.1.7", locals, prefs) == "host", "scope: own address is host");
+            R.expect(fl::scope_for_addr("192.168.1.99", locals, prefs) == "lan", "scope: same /24 is lan");
+            R.expect(fl::scope_for_addr("100.2.60.1", locals, prefs) == "lan", "scope: same /18 is lan");
+            R.expect(fl::scope_for_addr("100.96.1.2", locals, prefs) == "routed", "scope: off-subnet is routed");
 
             std::vector<dn::rr> recs;
             dn::rr ptr;
@@ -30150,9 +30912,11 @@ namespace cell
             std::function<void(const round_view &)> on_round_end;
             std::function<void(const tool_view &)> on_tool_begin; // about to execute
             std::function<void(const tool_view &)> on_tool_end;   // executed (echo + marker)
-            // Blocks the calling thread until the user answers. reason is set on
-            // refusal; an unset/false channel denies with a generic reason.
-            std::function<bool(const std::string &tool, const std::string &args, std::string &reason)> on_approval;
+            // Blocks the calling thread until the user answers. `note` is the
+            // model's one-sentence reason for the call (empty when the tool has
+            // no reason field); reason is set on refusal; an unset/false channel
+            // denies with a generic reason.
+            std::function<bool(const std::string &tool, const std::string &args, const std::string &note, std::string &reason)> on_approval;
             // Polled frequently during a transfer (must be cheap + thread-safe).
             std::function<bool()> cancelled;
             // Live "interject": polled at each round boundary of a running turn.
@@ -30539,7 +31303,11 @@ namespace cell
 
             // autoallow asks the model to evaluate only this action, not the session,
             // prior tool output, or the user's system prompt. The check is fail-closed.
-            std::string autoallow_check(const std::string &tool_name, const std::string &action)
+            // `note` is the model's own one-sentence reason for the call — the
+            // gate gets to judge intent, not just the command string, and
+            // ordinary work in the workspace (deletes included) is what the
+            // user opted into when they switched autoallow on.
+            std::string autoallow_check(const std::string &tool_name, const std::string &action, const std::string &note)
             {
                 const cell::config::provider_entry *p = cfg_.current_provider_entry();
                 if (!p || cfg_.current_model.empty())
@@ -30547,9 +31315,36 @@ namespace cell
                 cell::encrypt::secure_string key = resolve_provider_key(*p, vault_);
                 if (key.empty())
                     return "internal error: no API key";
+                std::filesystem::path ws = h_.explicit_cwd();
+                const std::string workspace = ws.empty() ? cell::exec_cwd().string() : ws.lexically_normal().string();
+                // built by concatenation: the prompt names braces-free prose
+                // only, and every inserted value is user/model data
+                std::string rules =
+                    "You are the auto-approval gate of a coding agent working in the user's project. The user "
+                    "switched auto-approval ON, which means ordinary work in the project — creating, editing, "
+                    "moving and DELETING files, running builds, tests and git commands — is expected and must be "
+                    "ALLOWED.\n\n"
+                    "Deleting files is a normal operation: rm, del, rmdir and friends are allowed whenever the "
+                    "target is inside the project (or a build/temp directory the project owns) and the stated "
+                    "reason explains why it is no longer needed. Never deny a command merely because it deletes, "
+                    "overwrites or cannot be undone.\n\n"
+                    "Working directory: ";
+                rules += workspace;
+                rules +=
+                    "\n\nDENY only when the action is clearly catastrophic or hostile:\n"
+                    "- it deletes or overwrites a filesystem root, the user's home directory, an OS directory "
+                    "(/, ~, C:\\, C:\\Windows, C:\\Users, /etc, /usr, ...) or a disk/device;\n"
+                    "- it targets credentials or the agent's own runtime (API keys, vault, .ssh, "
+                    ".git-credentials, token stores, another project's .env);\n"
+                    "- it reaches outside the project into unrelated data that the stated reason does not justify;\n"
+                    "- it rewrites git history, force-pushes, installs a service, or changes permissions/ownership;\n"
+                    "- it uploads credentials or project contents to a remote endpoint;\n"
+                    "- the stated reason is empty, or does not match the action.\n\n"
+                    "Answer with exactly one word: ALLOW. Otherwise answer with one short sentence saying why it "
+                    "is denied.";
                 const nlohmann::json messages = nlohmann::json::array({
-                    {{"role", "system"}, {"content", "You are an action safety gate. Determine whether this tool action is safe and legal to execute. If ALLOW, reply with exactly one word: ALLOW. If DENY, reply with a short explanation of why this action is unsafe (1-2 sentences)."}},
-                    {{"role", "user"}, {"content", std::format("Tool: {}\nArguments JSON:\n{}\n\nIs this action safe and legal to execute? ALLOW or explain why DENY.", tool_name, action)}},
+                    {{"role", "system"}, {"content", rules}},
+                    {{"role", "user"}, {"content", std::format("Tool: {}\nStated reason: {}\nArguments JSON:\n{}\n\nIs this action allowed under the rules above? Answer ALLOW or a short denial reason.", tool_name, note.empty() ? std::string("(none given)") : note, action)}},
                 });
                 nlohmann::json reply, tc, usage;
                 std::string err;
@@ -30562,6 +31357,10 @@ namespace cell
                 }
                 std::string answer = cell::text::trim(reply_text(reply));
                 cell::lower_ascii(answer);
+                // "ALLOW." / "ALLOW!" is still an allow: a stray punctuation
+                // mark must not turn a verdict into a denial
+                while (!answer.empty() && (answer.back() == '.' || answer.back() == '!' || answer.back() == ' '))
+                    answer.pop_back();
                 if (answer == "allow")
                     return "";
                 return answer;
@@ -30656,8 +31455,8 @@ namespace cell
             // Ask tools share one approval card in every frontend: parallel exec
             // calls queue here instead of overwriting each other's question
             tool_rt_.approval_mx = &approval_prompt_mx_;
-            tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action) -> std::string
-            { return autoallow_check(tool, action); };
+            tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action, const std::string &note) -> std::string
+            { return autoallow_check(tool, action, note); };
             tool_rt_.approval_required = [](const std::string &tool, const std::string &operation) -> bool
             {
                 return !(tool == "tw" && operation != "run");
@@ -30694,7 +31493,7 @@ namespace cell
             // on_approval. The thread-affinity policy (the REPL denies approvals
             // from worker threads because its prompt reads stdin) belongs to the
             // frontend — a GUI can serve worker-thread approvals naturally.
-            tool_rt_.approval_prompt = [this](const std::string &tool, const std::string &args, std::string &reason) -> bool
+            tool_rt_.approval_prompt = [this](const std::string &tool, const std::string &args, const std::string &note, std::string &reason) -> bool
             {
                 const events *ev = current_events_.load(std::memory_order_acquire);
                 if (!ev || !ev->on_approval)
@@ -30702,7 +31501,7 @@ namespace cell
                     reason = "needs approval but no interactive approval channel is available";
                     return false;
                 }
-                return ev->on_approval(tool, args, reason);
+                return ev->on_approval(tool, args, note, reason);
             };
             tool_rt_.live_session = [this]() -> cell::chat::session *
             { return &h_.now(); };
@@ -32817,7 +33616,7 @@ int repl::run()
     // the only approval channel a Policy::Ask tool can use. The thread-affinity
     // policy belongs to the frontend: approvals from worker threads are denied
     // because this prompt reads stdin.
-    ev.on_approval = [&interactive, main_thread](const std::string &tool, const std::string &args, std::string &reason) -> bool
+    ev.on_approval = [&interactive, main_thread](const std::string &tool, const std::string &args, const std::string &note, std::string &reason) -> bool
     {
         if (std::this_thread::get_id() != main_thread)
         {
@@ -32829,6 +33628,10 @@ int repl::run()
             reason = "needs your approval, but stdin is not a terminal \xe2\x80\x94 rerun interactively or enable /autoallow (full-access only)";
             return false;
         }
+        // the model's own reason for the call, on its own line so a long JSON
+        // argument line cannot bury it
+        if (!note.empty())
+            std::cout << "reason: " << cell::text::display_safe(note) << "\n";
         std::cout << "allow " << tool << "(" << cell::text::display_safe(args) << ")? [y/N] " << std::flush;
         std::string answer;
         std::getline(std::cin, answer);
